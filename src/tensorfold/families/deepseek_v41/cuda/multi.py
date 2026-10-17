@@ -21,7 +21,8 @@ verify window in one forward a round, each reply exactly its solo run.
   lane (``_device_fault``: out of memory, a CUDA or NCCL error): a sample syncs with the device, so a CUDA error of
   the forward can first show there. If one rank ends a stream alone, the next step fails on every rank: a follower
   that has no live stream, or another draft depth, still takes part in the digest check (``_differs``). Any other
-  failed step breaks the lane.
+  failed step breaks the lane. One rank has no ``Watchdog`` and no collective, so a host error of a step keeps
+  the lane up there; but a device fault poisons the CUDA context, so it ends that process too (``_exit_soon``).
 - **Kept prompts** (``TF_DS_KEEP``). A finished stream's prompt stays in the window (``Kept``): its extent's rows up
   to its last kept chunk boundary, and its slot's rings at its kept boundaries (the window keys and compressor inputs
   are a slot's, not an extent's). A later prompt that starts the same continues from the longest boundary they share:
@@ -41,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 
 import torch
@@ -107,8 +109,8 @@ CONF_LOG = os.environ.get("TF_DS_CONF_LOG", "0") == "1"
 STEP_TIMEOUT = float(os.environ.get("TF_DS_STEP_TIMEOUT") or 900.0)
 # TF_DS_EXIT_ON_BREAK=1 (default): a broken lane ends its process with EXIT_CODE TF_DS_EXIT_GRACE seconds after the
 # break (time for the live requests to get their error), so a supervisor (a container restart policy, systemd)
-# restarts the ranks. A broken lane cannot serve again: NCCL is aborted. 0: the process stays up and every step
-# fails, as before
+# restarts the ranks. A broken lane cannot serve again: NCCL is aborted. A device fault ends a one-rank process
+# the same way: its CUDA context is poisoned. 0: the process stays up and every step fails, as before
 EXIT_ON_BREAK = os.environ.get("TF_DS_EXIT_ON_BREAK", "1") == "1"
 EXIT_GRACE = float(os.environ.get("TF_DS_EXIT_GRACE") or 5.0)
 EXIT_CODE = 75                   # EX_TEMPFAIL: a restart can serve again
@@ -202,6 +204,33 @@ def _device_fault(exc: BaseException) -> bool:
     return False
 
 
+_exit_lock = threading.Lock()
+_exit_armed = False
+
+
+def _exit_soon(rank: int, why: str) -> None:
+    """With EXIT_ON_BREAK, end this process with EXIT_CODE after EXIT_GRACE seconds (time for the live requests to
+    get their error). The watchdog (a broken lane) and the decoder (a device fault on one rank) both call it. The
+    first call starts the timer; a later call does nothing, so one process has one exit."""
+
+    global _exit_armed
+    if not EXIT_ON_BREAK:
+        return
+    with _exit_lock:
+        if _exit_armed:
+            return
+        _exit_armed = True
+    timer = threading.Timer(EXIT_GRACE, _exit_now, args=(rank, why))
+    timer.daemon = True
+    timer.start()
+
+
+def _exit_now(rank: int, why: str) -> None:
+    print(f"[tensorfold] rank {rank}: the process exits ({why}) so that its supervisor restarts the ranks "
+          "(TF_DS_EXIT_ON_BREAK=0 keeps it up)", flush=True)
+    os._exit(EXIT_CODE)
+
+
 class Link:
     """Rank 0's steps to every follower, in order, over one TCP connection each (port through the rendezvous store);
     a follower waits on its socket between steps, never inside a collective."""
@@ -273,7 +302,6 @@ class Watchdog:
     def __init__(self, comm, store, *, rank: int, world: int, host: str, timeout: float = 30.0,
                  every: float = 1.0) -> None:
         import socket
-        import threading
         from datetime import timedelta
 
         self.comm, self.rank, self.world, self.timeout, self.every = comm, rank, world, timeout, every
@@ -361,17 +389,7 @@ class Watchdog:
                     sock.sendall(b"A")
                 except OSError:
                     pass
-        if EXIT_ON_BREAK:
-            import threading
-
-            timer = threading.Timer(EXIT_GRACE, self._exit, args=(why,))
-            timer.daemon = True
-            timer.start()
-
-    def _exit(self, why: str) -> None:
-        print(f"[tensorfold] rank {self.rank}: the process exits ({why}) so that its supervisor restarts the ranks "
-              "(TF_DS_EXIT_ON_BREAK=0 keeps it up)", flush=True)
-        os._exit(EXIT_CODE)
+        _exit_soon(self.rank, why)
 
 
 def _pack(sampling) -> list | None:
@@ -553,10 +571,20 @@ class MultiDecoder:
         another rank inside a collective: the lane breaks on every rank (and each process exits, TF_DS_EXIT_ON_BREAK)
         instead of the next step's collectives pairing with the wrong ones. OutOfStep and NoRoom happen on every rank
         at the same point. A stream's own host work does not get here (``_stream_failed``), unless it is a device
-        fault (``_device_fault``)."""
+        fault (``_device_fault``).
 
-        if self.watch is not None and not isinstance(exc, (OutOfStep, NoRoom)):
-            self.watch.abort(f"a step failed on rank {self.e.rank} ({type(exc).__name__}: {str(exc)[:160]})")
+        One rank has no watchdog and no collective to pair wrongly, so a host error of a step leaves the lane up.
+        A device fault poisons the CUDA context: the process ends as on a broken lane (``_exit_soon``), once, and
+        not at all with TF_DS_EXIT_ON_BREAK=0."""
+
+        if isinstance(exc, (OutOfStep, NoRoom)):
+            return
+        why = f"a step failed on rank {self.e.rank} ({type(exc).__name__}: {str(exc)[:160]})"
+        if self.watch is not None:
+            self.watch.abort(why)
+        elif _device_fault(exc):
+            print(f"[tensorfold] rank {self.e.rank}: a device fault poisons this lane ({why})", flush=True)
+            _exit_soon(self.e.rank, why)
 
     def _alive(self) -> None:
         if self.watch is not None and self.watch.broken is not None:

@@ -1,8 +1,9 @@
 """DeepSeek-V4.1 --parallel faults: a stream whose own host work raises (its grammar, its samples, its reply's
 callback) ends alone with the error and the lane serves on; a device fault (an out-of-memory, CUDA or NCCL error, also
 one that first shows in a sample) and any other failed step break the lane, and a broken lane ends its process so
-that a supervisor restarts the ranks; a follower that has no live stream, or another draft depth, still takes part in
-rank 0's round check. The real MultiDecoder admission, fill and round paths on CPU stand-ins (no GPU, kernels or
+that a supervisor restarts the ranks (one rank has no watchdog: a device fault ends its process too, a host error
+does not); a follower that has no live stream, or another draft depth, still takes part in rank 0's round check.
+The real MultiDecoder admission, fill and round paths on CPU stand-ins (no GPU, kernels or
 checkpoint)."""
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ def multi(monkeypatch):
     """multi.py with the CUDA model and engine modules stubbed, kept prompts off."""
 
     monkeypatch.setenv("TF_DS_KEEP", "0")
+    monkeypatch.setenv("TF_DS_EXIT_ON_BREAK", "0")      # (a test that wants the exit turns it on and patches os._exit)
     model = ModuleType("tensorfold.families.deepseek_v41.cuda.model")
     model.RAW = 4
     engine = ModuleType("tensorfold.families.deepseek_v41.cuda.engine")
@@ -418,6 +420,88 @@ def test_exit_on_break_off_keeps_the_process(multi, monkeypatch):
     wd.abort("NCCL error 3")
     threading.Event().wait(0.2)
     assert codes == [] and wd.broken == "NCCL error 3"
+
+
+@pytest.fixture
+def exits(multi, monkeypatch):
+    """The process exit, patched (a 0.05 s grace): the exit codes, and an event that each exit sets. A timer that
+    fires after the patch is gone would end pytest, so a test waits on the event or for longer than the grace."""
+
+    codes, gone = [], threading.Event()
+
+    def exit_(code):
+        codes.append(code)
+        gone.set()
+
+    monkeypatch.setattr(multi, "EXIT_ON_BREAK", True)
+    monkeypatch.setattr(multi, "EXIT_GRACE", 0.05)
+    monkeypatch.setattr(multi.os, "_exit", exit_)
+    return SimpleNamespace(codes=codes, gone=gone)
+
+
+def single_rank(multi, sample=None):
+    """A one-rank decoder: no watchdog, two live streams."""
+
+    md = decoder(multi, sampler() if sample is None else sample)
+    md.watch = None
+    return md, admitted(multi, md, stream(multi, 13), stream(multi, 14))
+
+
+def test_a_device_fault_of_a_forward_without_a_watchdog_ends_the_process_once(multi, exits, capsys):
+    md, _ = single_rank(multi)
+    md.runner.fail = RuntimeError("CUDA error: an illegal memory access was encountered")
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        md.round()
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        md.round()                                          # a second fault: no second timer
+    assert exits.gone.wait(5.0)
+    threading.Event().wait(0.3)                             # (a second exit would show by now)
+    assert exits.codes == [multi.EXIT_CODE] == [75]
+    out = capsys.readouterr().out
+    assert "a device fault poisons this lane" in out and "the process exits" in out
+
+
+@pytest.mark.parametrize("exc", DEVICE_FAULTS, ids=lambda e: type(e).__name__ + ":" + str(e)[:24])
+def test_a_device_fault_in_a_sample_without_a_watchdog_ends_the_process(multi, exits, exc):
+    md, _ = single_rank(multi)
+    md.e._sample = sampler(13, exc)
+    with pytest.raises(type(exc)):
+        md.round()
+    assert exits.gone.wait(5.0)
+    assert exits.codes == [75]
+
+
+def test_a_device_fault_in_the_first_token_without_a_watchdog_ends_the_process(multi, exits):
+    md = decoder(multi, sampler(13, RuntimeError("CUDA error: an illegal memory access was encountered")))
+    md.watch = None
+    a = stream(multi, 13)
+    md.admit(a)
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        md._fill(a)
+    assert exits.gone.wait(5.0)
+    assert exits.codes == [75]
+
+
+def test_a_host_error_of_a_step_without_a_watchdog_keeps_the_process(multi, exits):
+    md, _ = single_rank(multi)
+    md.runner.fail = RuntimeError("the forward's host code has a bug")
+    with pytest.raises(RuntimeError, match="host code"):
+        md.round()
+    assert not exits.gone.wait(0.3) and exits.codes == []   # (no collective to pair wrongly: the lane serves on)
+    md.runner.fail = None
+    assert len(md.drop()) == 2                              # (the scheduler fails the live requests)
+    (c,) = admitted(multi, md, stream(multi, 15))
+    assert md.round() == [] and c.got == [7, 7]
+
+
+def test_a_device_fault_without_a_watchdog_keeps_the_process_with_exit_on_break_off(multi, exits, monkeypatch):
+    monkeypatch.setattr(multi, "EXIT_ON_BREAK", False)
+    monkeypatch.setattr(multi, "EXIT_GRACE", 0.0)
+    md, _ = single_rank(multi)
+    md.runner.fail = RuntimeError("CUDA error: an illegal memory access was encountered")
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        md.round()
+    assert not exits.gone.wait(0.3) and exits.codes == []
 
 
 class OneToken:
