@@ -34,3 +34,16 @@ def test_json_formats_keep_the_grammar_and_add_the_template_block(rf):
 def test_a_clients_own_template_input_stays():
     body = {**CHAT, "response_format": SCHEMA, "chat_template_kwargs": {"response_format": {"mine": True}}}
     assert DsApp._response_format(body, True)["chat_template_kwargs"] == {"response_format": {"mine": True}}
+
+
+@pytest.mark.parametrize("kwargs", [False, [], "x", 3])
+def test_a_non_object_template_input_is_a_400(kwargs):
+    from tensorfold.server.errors import RequestError
+
+    with pytest.raises(RequestError, match="chat_template_kwargs must be a JSON object"):
+        DsApp._response_format({**CHAT, "response_format": SCHEMA, "chat_template_kwargs": kwargs}, True)
+
+
+def test_null_template_kwargs_count_as_none():
+    out = DsApp._response_format({**CHAT, "response_format": SCHEMA, "chat_template_kwargs": None}, True)
+    assert out["chat_template_kwargs"] == {"response_format": SCHEMA}

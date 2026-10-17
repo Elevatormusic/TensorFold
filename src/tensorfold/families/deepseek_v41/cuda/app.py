@@ -48,7 +48,9 @@ class DsApp(App):
         if not chat or not isinstance(rf, dict) or rf.get("type") not in ("json_object", "json_schema"):
             return body
         kwargs = body.get("chat_template_kwargs")
-        kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
+        if kwargs is not None and not isinstance(kwargs, dict):
+            raise RequestError("chat_template_kwargs must be a JSON object or null")
+        kwargs = dict(kwargs or {})
         kwargs.setdefault("response_format", rf)        # a client's own template input stays
         return {**body, "chat_template_kwargs": kwargs}
 
