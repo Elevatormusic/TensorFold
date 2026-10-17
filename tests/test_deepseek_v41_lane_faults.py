@@ -1,7 +1,9 @@
 """DeepSeek-V4.1 --parallel faults: a stream whose own host work raises (its grammar, its samples, its reply's
-callback) ends alone with the error and the lane serves on; any other failed step still breaks the lane, and a broken
-lane ends its process so that a supervisor restarts the ranks. The real MultiDecoder admission, fill and round paths
-on CPU stand-ins (no GPU, kernels or checkpoint)."""
+callback) ends alone with the error and the lane serves on; a device fault (an out-of-memory, CUDA or NCCL error, also
+one that first shows in a sample) and any other failed step break the lane, and a broken lane ends its process so
+that a supervisor restarts the ranks; a follower that has no live stream, or another draft depth, still takes part in
+rank 0's round check. The real MultiDecoder admission, fill and round paths on CPU stand-ins (no GPU, kernels or
+checkpoint)."""
 
 from __future__ import annotations
 
@@ -184,6 +186,204 @@ def test_a_failed_forward_still_breaks_the_lane(multi):
     with pytest.raises(RuntimeError, match="illegal memory access"):
         md.round()
     assert len(md.watch.aborts) == 1 and "a step failed on rank 0" in md.watch.aborts[0]
+
+
+class DeviceMask(BadMask):
+    """A grammar whose mask hits an asynchronous CUDA error (its GPU ops are the first sync after the forward)."""
+
+    def mask(self, logits, window=None, offset=0):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+
+class DeviceWindow(BadMask):
+    def window(self, tokens, parents):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+
+DEVICE_FAULTS = [
+    RuntimeError("CUDA error: an illegal memory access was encountered"),
+    RuntimeError("an illegal memory access was encountered"),
+    RuntimeError("CUBLAS_STATUS_EXECUTION_FAILED when calling cublasGemmEx"),
+    RuntimeError("cuDNN error: CUDNN_STATUS_INTERNAL_ERROR"),
+    RuntimeError("NCCL error: unhandled cuda error"),
+    RuntimeError("device-side assert triggered"),
+    torch.cuda.OutOfMemoryError("Tried to allocate 2.00 GiB"),
+]
+
+
+@pytest.mark.parametrize("exc", DEVICE_FAULTS, ids=lambda e: type(e).__name__ + ":" + str(e)[:24])
+def test_a_device_fault_in_a_sample_breaks_the_lane(multi, exc):
+    md = decoder(multi, sampler())
+    admitted(multi, md, stream(multi, 13), stream(multi, 14))
+    md.e._sample = sampler(13, exc)
+    with pytest.raises(type(exc)):
+        md.round()
+    assert len(md.watch.aborts) == 1 and "a step failed on rank 0" in md.watch.aborts[0]
+
+
+def test_after_a_device_fault_every_live_stream_gets_the_error_from_drop(multi):
+    md = decoder(multi, sampler())
+    a, b = admitted(multi, md, stream(multi, 13), stream(multi, 14))
+    md.e._sample = sampler(13, RuntimeError("CUDA error: an illegal memory access was encountered"))
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        md.round()
+    assert len(md.watch.aborts) == 1 and a.error is None and not b.done     # nobody ends alone: the lane is broken
+    assert md.drop() == [a, b]                                              # and every live request gets the error
+
+
+@pytest.mark.parametrize("grammar", [DeviceMask, DeviceWindow])
+def test_a_device_fault_in_a_grammar_breaks_the_lane(multi, grammar):
+    md = decoder(multi, sampler())
+    a, _ = admitted(multi, md, stream(multi, 13), stream(multi, 14))
+    a.constraint = grammar()
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        md.round()
+    assert len(md.watch.aborts) == 1
+
+
+def test_a_device_fault_in_the_first_token_breaks_the_lane(multi):
+    md = decoder(multi, sampler(13, RuntimeError("CUDA error: an illegal memory access was encountered")))
+    a = stream(multi, 13)
+    md.admit(a)
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        md._fill(a)
+    assert len(md.watch.aborts) == 1
+    assert md.drop() == [a]                                 # the stream is not lost: its request gets the error
+
+
+def test_an_accelerator_error_breaks_the_lane(multi, monkeypatch):
+    class Accelerator(RuntimeError):
+        pass
+
+    monkeypatch.setattr(torch, "AcceleratorError", Accelerator, raising=False)
+    md = decoder(multi, sampler())
+    admitted(multi, md, stream(multi, 13), stream(multi, 14))
+    md.e._sample = sampler(13, Accelerator("a kernel failed"))
+    with pytest.raises(Accelerator):
+        md.round()
+    assert len(md.watch.aborts) == 1
+
+
+def test_a_failed_synchronize_makes_a_host_looking_fault_a_device_fault(multi, monkeypatch):
+    """The fault's message names no CUDA call, but the device does not sync: the lane is poisoned."""
+
+    def fails():
+        raise RuntimeError("an earlier kernel failed")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", fails)
+    md = decoder(multi, sampler())
+    admitted(multi, md, stream(multi, 13), stream(multi, 14))
+    md.e._sample = sampler(13, RuntimeError("Inplace update to inference tensor outside InferenceMode is not allowed"))
+    with pytest.raises(RuntimeError, match="inference tensor"):
+        md.round()
+    assert len(md.watch.aborts) == 1
+
+
+def test_a_host_fault_stays_with_its_stream_when_the_device_syncs(multi, monkeypatch):
+    synced = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: synced.append(1))
+    md = decoder(multi, sampler())
+    a, b = admitted(multi, md, stream(multi, 13), stream(multi, 14))
+    md.e._sample = sampler(13, RuntimeError("Inplace update to inference tensor outside InferenceMode is not allowed"))
+    assert md.round() == [a] and isinstance(a.error, RuntimeError) and b.got == [7, 7]
+    assert synced and md.watch.aborts == []
+
+
+class Ranks:
+    """The model's all-gather on two ranks: this rank's row, and rank 0's (another row, unless ``same``)."""
+
+    def __init__(self, same=False):
+        self.calls, self.same = 0, same
+
+    def gather(self, mine):
+        self.calls += 1
+        return torch.stack([mine if self.same else mine + 1.0, mine])
+
+
+def ranked(monkeypatch, md, rank, same=False):
+    """Make ``md`` a rank of two; its digest check gathers through ``Ranks`` (on CPU its tensors take no device)."""
+
+    real = torch.tensor
+
+    def tensor(data, **kwargs):
+        kwargs.pop("device", None)
+        return real(data, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", tensor)
+    md.e.rank, md.e.world = rank, 2
+    md.m.comm = Ranks(same)
+    return md.m.comm
+
+
+def test_a_follower_without_a_live_stream_takes_part_in_the_round_check(multi, monkeypatch):
+    md = decoder(multi, sampler())
+    (a,) = admitted(multi, md, stream(multi, 13))
+    ranks = ranked(monkeypatch, md, 1)
+    md._stream_failed(a, ValueError("bad sampling row"))        # it ended on this rank alone: nothing is live here
+    with pytest.raises(multi.OutOfStep):
+        md.round(told=["round", 0])
+    assert ranks.calls == 1 and md.runner.calls == [] and md.watch.aborts == []    # rank 0 got its gather: no hang
+
+
+@pytest.fixture
+def depths(multi, monkeypatch):
+    """Rank 0's draft depths by live streams (the default table), up to five drafts."""
+
+    monkeypatch.setattr(multi, "DEPTH_BY", [5, 5, 3, 3])
+
+
+@pytest.mark.usefixtures("depths")
+def test_a_follower_with_another_draft_depth_takes_part_in_the_round_check(multi, monkeypatch):
+    md = decoder(multi, sampler())
+    md.depth_most = 5
+    c = admitted(multi, md, stream(multi, 13), stream(multi, 14), stream(multi, 15))[2]
+    ranks = ranked(monkeypatch, md, 1)
+    md._stream_failed(c, ValueError("bad sampling row"))        # rank 0 has three live streams (depth 3), this rank two
+    with pytest.raises(multi.OutOfStep):
+        md.round(told=["round", 3])
+    assert ranks.calls == 1 and md.runner.calls == [] and md.watch.aborts == []
+
+
+@pytest.mark.usefixtures("depths")
+def test_a_follower_check_that_passes_still_fails_the_step(multi, monkeypatch):
+    md = decoder(multi, sampler())
+    md.depth_most = 5
+    admitted(multi, md, stream(multi, 13), stream(multi, 14))
+    ranks = ranked(monkeypatch, md, 1, same=True)
+    with pytest.raises(multi.OutOfStep, match="different live streams"):
+        md.round(told=["round", 3])                             # (equal shapes with other depths: no step runs on it)
+    assert ranks.calls == 1 and md.runner.calls == []
+
+
+@pytest.mark.usefixtures("depths")
+def test_a_follower_with_rank_0s_depth_runs_the_round_after_one_check(multi, monkeypatch):
+    md = decoder(multi, sampler())
+    md.depth_most = 5
+    b = admitted(multi, md, stream(multi, 13), stream(multi, 14))[1]
+    ranks = ranked(monkeypatch, md, 1, same=True)
+    assert md.round(told=["round", 5]) == []
+    assert ranks.calls == 1 and len(md.runner.calls) == 1 and b.got == [7, 7]
+
+
+def test_rank_0_without_a_live_stream_sends_no_round_and_waits_for_nobody(multi, monkeypatch):
+    md = decoder(multi, sampler())
+    ranks = ranked(monkeypatch, md, 0)
+    assert md.round() == [] and ranks.calls == 0
+
+
+@pytest.mark.usefixtures("depths")
+def test_a_follower_drops_its_streams_when_the_round_check_fails(multi, monkeypatch):
+    md = decoder(multi, sampler())
+    md.depth_most = 5
+    c = admitted(multi, md, stream(multi, 13), stream(multi, 14), stream(multi, 15))[2]
+    ranks = ranked(monkeypatch, md, 1)
+    md._stream_failed(c, ValueError("bad sampling row"))
+    ops = iter([["round", 3]])
+    with pytest.raises(RuntimeError, match="step link closed"):     # (the loop runs on until the link closes)
+        md.follow(SimpleNamespace(receive=lambda: next(ops, None)))
+    assert ranks.calls == 1 and md.streams == {} and md.free == [0, 1, 2, 3] and md.watch.aborts == []
 
 
 def watchdog(multi):

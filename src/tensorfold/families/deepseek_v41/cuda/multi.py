@@ -17,8 +17,11 @@ verify window in one forward a round, each reply exactly its solo run.
   lane on every rank instead of hanging it, and a broken lane ends its process so a supervisor restarts the ranks
   (``TF_DS_EXIT_ON_BREAK``).
 - **Faults.** A stream's own host work (its grammar, its samples, its reply's callback) runs no collective: when it
-  raises, only that stream ends with the error and the lane goes on (``_stream_failed``). Any other failed step
-  breaks the lane.
+  raises, only that stream ends with the error and the lane goes on (``_stream_failed``). A device fault breaks the
+  lane (``_device_fault``: out of memory, a CUDA or NCCL error): a sample syncs with the device, so a CUDA error of
+  the forward can first show there. If one rank ends a stream alone, the next step fails on every rank: a follower
+  that has no live stream, or another draft depth, still takes part in the digest check (``_differs``). Any other
+  failed step breaks the lane.
 - **Kept prompts** (``TF_DS_KEEP``). A finished stream's prompt stays in the window (``Kept``): its extent's rows up
   to its last kept chunk boundary, and its slot's rings at its kept boundaries (the window keys and compressor inputs
   are a slot's, not an extent's). A later prompt that starts the same continues from the longest boundary they share:
@@ -176,6 +179,27 @@ class Extents:
 
 class OutOfStep(RuntimeError):
     """The ranks planned a different step: it fails on every rank before its collectives."""
+
+
+# what a RuntimeError says when the device or NCCL failed (and not the stream's own host work): see ``_device_fault``
+DEVICE_MARKS = ("CUDA error", "CUBLAS_STATUS", "cuDNN", "NCCL", "illegal memory access", "device-side assert")
+
+
+def _device_fault(exc: BaseException) -> bool:
+    """Whether ``exc`` is a fault of the device (out of memory, a CUDA or NCCL error) and not of one stream's host
+    work. A CUDA error is asynchronous: an error of the forward can first show at a later sync, such as a sample's
+    ``.cpu()``, with a message that names no CUDA call. So a synchronize that fails counts as a device fault too."""
+
+    if isinstance(exc, (torch.cuda.OutOfMemoryError, getattr(torch, "AcceleratorError", ()))):
+        return True
+    if isinstance(exc, RuntimeError) and any(mark in str(exc) for mark in DEVICE_MARKS):
+        return True
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:                                # noqa: BLE001  (a sync that raises: the device is in error)
+            return True
+    return False
 
 
 class Link:
@@ -528,7 +552,8 @@ class MultiDecoder:
         """A step that raised past its digest check (out of memory under the allocator ceiling, a bug) may have left
         another rank inside a collective: the lane breaks on every rank (and each process exits, TF_DS_EXIT_ON_BREAK)
         instead of the next step's collectives pairing with the wrong ones. OutOfStep and NoRoom happen on every rank
-        at the same point. A stream's own host work does not get here (``_stream_failed``)."""
+        at the same point. A stream's own host work does not get here (``_stream_failed``), unless it is a device
+        fault (``_device_fault``)."""
 
         if self.watch is not None and not isinstance(exc, (OutOfStep, NoRoom)):
             self.watch.abort(f"a step failed on rank {self.e.rank} ({type(exc).__name__}: {str(exc)[:160]})")
@@ -933,6 +958,7 @@ class MultiDecoder:
                 return []
             self.filling.remove(s)
             s.steps = None
+            self.streams[s.sid] = s                   # (a raise below leaves it to ``drop``)
             try:
                 first = self._first(s, last)
             except Exception as exc:                 # noqa: BLE001  (this stream's own host work: only it fails)
@@ -940,7 +966,6 @@ class MultiDecoder:
                 self._stream_failed(s, exc)
             s.started = time.perf_counter()
             s.pending = first
-            self.streams[s.sid] = s
             if first is not None:
                 try:
                     s.take([first], self._ends(s))
@@ -978,8 +1003,12 @@ class MultiDecoder:
         """A stream whose own host work raised (its grammar, its samples, its reply's callback) ends now with that
         error; the other streams go on. That work runs no collective, so the ranks stay in step. A rank that raised
         where the others did not ends the stream alone: rank 0's finish then ends it on every rank, or the next
-        step's digest check fails that step on every rank (``OutOfStep``), and the lane serves on."""
+        step's digest check fails that step on every rank (``OutOfStep``), and the lane serves on. A device fault
+        (``_device_fault``) is not the stream's: the forward may have failed and the lane may be poisoned, so it is
+        raised again to the step's own handler, which breaks the lane."""
 
+        if _device_fault(exc):
+            raise exc
         s.error, s.constraint = exc, None
         if not s.done:
             s.done, s.finished = True, time.perf_counter()
@@ -1072,17 +1101,33 @@ class MultiDecoder:
             if not live or self._quick(s) or self.since_fill >= owed:
                 self._send(["fill", s.sid])
                 return self._fill(s)
-        if not live:
+        if not live and told is None:
             return []
         k = self._depth(len(live))
         if told is None:
             self._send(["round", k])
-        elif told[1] != k:
-            raise OutOfStep("the ranks chose different draft depths")
+        elif not live or told[1] != k:
+            self._differs(told[1])
         t0 = time.perf_counter()
         done = self._round(live, k)
         self.since_fill += time.perf_counter() - t0
         return done
+
+    def _differs(self, k: int) -> None:
+        """A follower cannot run rank 0's round: a stream ended on this rank alone (``_stream_failed``), so it has no
+        live stream or another draft depth. Rank 0 already waits in the round's digest check, so this rank takes part
+        in it with rank 0's depth: the shapes differ, the check fails on every rank, and each rank drops its streams.
+        Does not return."""
+
+        self._step(True)
+        try:
+            self._agree("round", [self._shape(), k])
+        except Exception as exc:
+            self._broken(exc)
+            raise
+        finally:
+            self._step(False)
+        raise OutOfStep("the ranks hold different live streams or draft depths")
 
     def _round(self, live: list[Stream], k: int) -> list[Stream]:
         e = self.e
