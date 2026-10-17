@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Sequence
 
-_ANSWER, _LEAD, _NAME, _DONE = range(4)
+_ANSWER, _LEAD, _NAME, _DONE, _OPEN = range(5)
+
+# DeepSeek-V4.x DSML: a calls block opens with a plain "<" and then this one token ("<｜DSML｜ calls>" in V4.1,
+# "<｜DSML｜tool_calls>" in V4), so the call starts one character before its opener token
+DSML = "｜DSML｜"
 
 
 def call_format(rendered: str, name: str, openers: Sequence[str]) -> tuple[str, str, str] | None:
@@ -19,6 +23,18 @@ def call_format(rendered: str, name: str, openers: Sequence[str]) -> tuple[str, 
     return opener, rendered[start + len(opener):at], rendered[end:end + 1] if end < len(rendered) else ""
 
 
+def dsml_format(rendered: str, name: str) -> tuple[str, str, str, str] | None:
+    """(head, opener, lead, tail) of a DSML call to ``name``: the "<" before the DSML token, the token, the text from
+    it to the name (the calls block's first invoke), and the mark that ends the name."""
+
+    at = rendered.rfind(name)
+    start = max(rendered.rfind(f"<{DSML}{kind}", 0, at) for kind in (" calls>", "tool_calls>"))
+    if at < 0 or start < 0:
+        return None
+    end = at + len(name)
+    return "<", DSML, rendered[start + 1 + len(DSML):at], rendered[end:end + 1] if end < len(rendered) else ""
+
+
 class CallGate:
     """Outside a think block the answer opens a call to an offered tool; each fix reads only earlier tokens."""
 
@@ -27,11 +43,13 @@ class CallGate:
     def __init__(self, opener: int, blank: Callable[[int], bool], *, think_open: int = -1, think_end: int = -1,
                  armed: bool = True, text: Callable[[int], str] | None = None,
                  encode: Callable[[str], list[int]] | None = None, lead: str = "", names: Sequence[str] = (),
-                 tail: str = "") -> None:
+                 tail: str = "", head: str = "") -> None:
         self.opener, self.blank = int(opener), blank
         self.think_open, self.think_end = int(think_open), int(think_end)
         self.text, self.encode = text, encode
         self.lead, self.names, self.tail = lead, [n for n in names if n], tail
+        # head: text a call writes before its opener token (DSML's "<"); it needs text and encode
+        self.head = head if text is not None and encode is not None else ""
         # (armed, phase, text of the lead or name so far); unarmed: the prompt left a think block open
         self.state: tuple[bool, int, str] = (bool(armed), _ANSWER, "")
 
@@ -53,7 +71,12 @@ class CallGate:
         """Whether the next token can be cut (the one-token paths read it only then)."""
 
         armed, phase, _ = self.state
-        return phase in (_LEAD, _NAME) or (phase == _ANSWER and armed)
+        return phase in (_OPEN, _LEAD, _NAME) or (phase == _ANSWER and armed)
+
+    def _lead(self) -> list[int]:
+        """The lead's tokens a fix forces after the opener (none when the template's call names are unknown)."""
+
+        return self.encode(self.lead) if self.encode is not None and self.names and self.lead else []
 
     def _ends(self, char: str) -> bool:
         return char.isspace() or (char == self.tail if self.tail else char in "<>{}\"'(),")
@@ -67,12 +90,18 @@ class CallGate:
                 return (token == self.think_end, _ANSWER, ""), None
             if token == self.think_open:
                 return (False, _ANSWER, ""), None
-            if token == self.opener:
+            if token == self.opener and not self.head:
                 return (True, _LEAD, ""), None
             if self.blank(token):
                 return state, None
-            fix = self.encode(self.lead) if self.encode is not None and self.names and self.lead else []
-            return state, [self.opener, *fix]
+            if self.head and self.text(token).strip() == self.head:      # the head alone: its opener comes next
+                return (True, _OPEN, ""), None
+            head = self.encode(self.head) if self.head else []
+            return state, [*head, self.opener, *self._lead()]
+        if phase == _OPEN:
+            if token == self.opener:
+                return (armed, _LEAD, ""), None
+            return state, [self.opener, *self._lead()]
         if phase == _DONE or self.text is None or not self.names:
             return (armed, _DONE, ""), None
         written, owed = seen + self.text(token), ""       # owed: the lead this token was due to finish
@@ -242,4 +271,4 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     return stats
 
 
-__all__ = ["CallGate", "ThinkBudget", "ThinkLoop", "call_format", "generate_gated"]
+__all__ = ["DSML", "CallGate", "ThinkBudget", "ThinkLoop", "call_format", "dsml_format", "generate_gated"]
