@@ -38,32 +38,19 @@ class DsApp(App):
 
         template.render = render_effort
 
-    def _check_fields(self, body: dict[str, Any]) -> str | None:
-        problem = super()._check_fields(body)
-        if problem is None and isinstance(body, dict):
-            try:
-                self._response_format(body, "messages" in body)
-            except RequestError as exc:
-                return str(exc)
-        return problem
-
     @staticmethod
     def _response_format(body: dict[str, Any], chat: bool) -> dict[str, Any]:
-        """json_object as DeepSeek's encoding serves it: a "## Response Format" block in the system turn, no
-        grammar. The engine has no constrained decoding, so a schema, regex, choice or grammar is HTTP 400."""
+        """A chat's response_format (json_object or json_schema) also reaches the model as DeepSeek's encoding writes
+        it: a "## Response Format" block in the system turn (the template's response_format input). The engine then
+        enforces it with the request's grammar, as it enforces regex, choice and grammar (``constrain``)."""
 
-        from tensorfold.engine.grammar import request_spec
-
-        spec = request_spec(body)
-        if spec is None:
+        rf = body.get("response_format")
+        if not chat or not isinstance(rf, dict) or rf.get("type") not in ("json_object", "json_schema"):
             return body
-        if spec.kind != "json" or not chat:
-            raise RequestError("the DeepSeek-V4.1 engine has no constrained decoding: it serves response_format "
-                               "json_object (as DeepSeek's API does), not json_schema, regex, choice or grammar")
         kwargs = body.get("chat_template_kwargs")
         kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
-        kwargs["response_format"] = {"type": "json_object"}
-        return {**{k: v for k, v in body.items() if k != "response_format"}, "chat_template_kwargs": kwargs}
+        kwargs.setdefault("response_format", rf)        # a client's own template input stays
+        return {**body, "chat_template_kwargs": kwargs}
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:

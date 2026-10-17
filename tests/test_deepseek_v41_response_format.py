@@ -1,6 +1,5 @@
-"""DeepSeek-V4.1 structured output as DeepSeek's API serves it: response_format json_object becomes the encoding's
-"## Response Format" block in the system turn (no grammar); a schema, regex, choice or grammar is HTTP 400, since the
-V4.1 engine has no constrained decoding."""
+"""DeepSeek-V4.1 response_format: json_object and json_schema also reach the model as DeepSeek's encoding writes them
+(the template's "## Response Format" block); the request's grammar still goes to the engine, which enforces it."""
 
 from __future__ import annotations
 
@@ -9,34 +8,29 @@ import pytest
 pytest.importorskip("torch")
 
 from tensorfold.families.deepseek_v41.cuda.app import DsApp
-from tensorfold.server.errors import RequestError
 
 CHAT = {"messages": [{"role": "user", "content": "Reply in JSON."}]}
+SCHEMA = {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}}
 
 
-def test_plain_requests_pass_unchanged():
+def test_plain_and_unhinted_requests_pass_unchanged():
     assert DsApp._response_format(CHAT, True) is CHAT
-    text = {**CHAT, "response_format": {"type": "text"}}
-    assert DsApp._response_format(text, True) is text
+    for extra in ({"response_format": {"type": "text"}}, {"guided_regex": "[0-9]+"}, {"guided_choice": ["a", "b"]}):
+        body = {**CHAT, **extra}
+        assert DsApp._response_format(body, True) is body
+    text = {"prompt": "x", "response_format": {"type": "json_object"}}
+    assert DsApp._response_format(text, False) is text                    # a text completion has no template
 
 
-def test_json_object_becomes_the_template_block():
-    body = {**CHAT, "response_format": {"type": "json_object"}, "chat_template_kwargs": {"x": 1}}
+@pytest.mark.parametrize("rf", [{"type": "json_object"}, SCHEMA])
+def test_json_formats_keep_the_grammar_and_add_the_template_block(rf):
+    body = {**CHAT, "response_format": rf, "chat_template_kwargs": {"x": 1}}
     out = DsApp._response_format(body, True)
-    assert "response_format" not in out and out["messages"] is CHAT["messages"]
-    assert out["chat_template_kwargs"] == {"x": 1, "response_format": {"type": "json_object"}}
-    assert body["chat_template_kwargs"] == {"x": 1}                       # the request is not changed in place
+    assert out["response_format"] is rf                                    # the engine still enforces it
+    assert out["chat_template_kwargs"] == {"x": 1, "response_format": rf}
+    assert body["chat_template_kwargs"] == {"x": 1}                        # the request is not changed in place
 
 
-@pytest.mark.parametrize("field", [
-    {"response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}}},
-    {"guided_regex": "[0-9]+"}, {"guided_choice": ["a", "b"]}, {"structured_outputs": {"json": {"type": "object"}}},
-])
-def test_enforced_formats_are_a_clear_400(field):
-    with pytest.raises(RequestError, match="no constrained decoding"):
-        DsApp._response_format({**CHAT, **field}, True)
-
-
-def test_json_object_needs_a_chat():
-    with pytest.raises(RequestError):
-        DsApp._response_format({"prompt": "x", "response_format": {"type": "json_object"}}, False)
+def test_a_clients_own_template_input_stays():
+    body = {**CHAT, "response_format": SCHEMA, "chat_template_kwargs": {"response_format": {"mine": True}}}
+    assert DsApp._response_format(body, True)["chat_template_kwargs"] == {"response_format": {"mine": True}}
