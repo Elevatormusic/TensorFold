@@ -418,3 +418,39 @@ def test_exit_on_break_off_keeps_the_process(multi, monkeypatch):
     wd.abort("NCCL error 3")
     threading.Event().wait(0.2)
     assert codes == [] and wd.broken == "NCCL error 3"
+
+
+class OneToken:
+    """A grammar that takes one token, then its stop token: finished after the first token it follows. The stand-in
+    logits are all zero, so the mask has nothing to show here."""
+
+    spec, think_end = SimpleNamespace(kind="regex", text="x"), None
+
+    def __init__(self):
+        self.finished = False
+
+    def window(self, tokens, parents):
+        return SimpleNamespace(tokens=list(tokens), rows=[])
+
+    def mask(self, logits, window=None, offset=0):
+        return logits
+
+    def advance(self, tokens):
+        self.finished = self.finished or bool(tokens)
+
+
+def test_a_reply_ends_at_its_grammar_stop_in_a_round_with_ignore_eos(multi):
+    md = decoder(multi, sampler())
+    a, b = admitted(multi, md, stream(multi, 13, count=10), stream(multi, 14, count=10))
+    a.constraint = OneToken()                               # stop_eos is off: only the grammar ends the reply
+    done = md.round()
+    assert done == [a] and a.done and a.error is None and a.got == [7, 7]
+    assert not b.done and b.got == [7, 7]
+
+
+def test_a_reply_ends_at_its_grammar_stop_on_its_first_token_with_ignore_eos(multi):
+    md = decoder(multi, sampler())
+    a = stream(multi, 13, count=10)
+    a.constraint = OneToken()
+    md.admit(a)
+    assert md._fill(a) == [a] and a.done and a.error is None and a.got == [7]
