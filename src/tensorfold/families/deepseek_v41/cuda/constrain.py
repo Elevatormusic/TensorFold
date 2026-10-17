@@ -35,14 +35,23 @@ def mask(constraint, logits, window) -> None:
     """The verify rows' tokens the grammar does not allow at -inf (``logits`` [rows, vocab], in place)."""
 
     if constraint is not None:
-        constraint.mask(logits, window)
+        _in_place(constraint, logits, window)
 
 
 def first(constraint, logits) -> None:
     """The prompt's last row: the reply's first token under the grammar (in place)."""
 
     if constraint is not None:
-        constraint.mask(logits)
+        _in_place(constraint, logits, None)
+
+
+def _in_place(constraint, logits, window) -> None:
+    # The model makes its logits under torch.inference_mode(), and the rounds run under torch.no_grad() only. An
+    # in-place write to an inference tensor outside inference mode raises, so the mask runs inside it.
+    import torch
+
+    with torch.inference_mode():
+        constraint.mask(logits, window)
 
 
 def advance(constraint, tokens: Sequence[int]) -> None:

@@ -92,3 +92,15 @@ def test_thinking_rows_are_free_until_the_think_end():
     assert not c.finished
     constrain.advance(c, ids("<eos>"))
     assert c.finished
+
+
+def test_logits_from_inference_mode_are_masked_outside_it():
+    c = constraint(Spec("regex", "ab+"))
+    with torch.inference_mode():                   # the model's forward makes the logits here
+        head, rows = torch.zeros(1, WIDTH), torch.zeros(2, WIDTH)
+    with torch.no_grad():                          # the rounds mask them here
+        constrain.first(c, head)
+        constrain.advance(c, ids("a"))
+        _, window = constrain.chain(c, ID["a"], ids("b"))
+        constrain.mask(c, rows, window)
+    assert allowed(head) == [["a"]] and allowed(rows) == [["b"], ["<eos>", "b"]]
