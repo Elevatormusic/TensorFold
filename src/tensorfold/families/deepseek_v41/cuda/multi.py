@@ -14,7 +14,11 @@ verify window in one forward a round, each reply exactly its solo run.
 - **Ranks.** Rank 0 schedules (``tensorfold.cuda.scheduler``) and sends each step to the followers over a TCP link
   (``Link``) before running it; every rank checks the step's digest with one small all-gather before its model
   collectives (``OutOfStep``: the step fails on every rank at the same point). ``Watchdog``: a lost rank breaks the
-  lane on every rank instead of hanging it.
+  lane on every rank instead of hanging it, and a broken lane ends its process so a supervisor restarts the ranks
+  (``TF_DS_EXIT_ON_BREAK``).
+- **Faults.** A stream's own host work (its grammar, its samples, its reply's callback) runs no collective: when it
+  raises, only that stream ends with the error and the lane goes on (``_stream_failed``). Any other failed step
+  breaks the lane.
 - **Kept prompts** (``TF_DS_KEEP``). A finished stream's prompt stays in the window (``Kept``): its extent's rows up
   to its last kept chunk boundary, and its slot's rings at its kept boundaries (the window keys and compressor inputs
   are a slot's, not an extent's). A later prompt that starts the same continues from the longest boundary they share:
@@ -98,6 +102,13 @@ EAGER_ABSORB = os.environ.get("TF_DS_EAGER_ABSORB", "1") == "1"
 # 200 rounds (the DSpark acceptance report)
 CONF_LOG = os.environ.get("TF_DS_CONF_LOG", "0") == "1"
 STEP_TIMEOUT = float(os.environ.get("TF_DS_STEP_TIMEOUT") or 900.0)
+# TF_DS_EXIT_ON_BREAK=1 (default): a broken lane ends its process with EXIT_CODE TF_DS_EXIT_GRACE seconds after the
+# break (time for the live requests to get their error), so a supervisor (a container restart policy, systemd)
+# restarts the ranks. A broken lane cannot serve again: NCCL is aborted. 0: the process stays up and every step
+# fails, as before
+EXIT_ON_BREAK = os.environ.get("TF_DS_EXIT_ON_BREAK", "1") == "1"
+EXIT_GRACE = float(os.environ.get("TF_DS_EXIT_GRACE") or 5.0)
+EXIT_CODE = 75                   # EX_TEMPFAIL: a restart can serve again
 # TF_DS_KEEP=1 (default): finished prompts stay in the window for later prompts that start the same (``Kept``), at
 # most KEEP_ENTRIES of them, each with its rings at KEEP_MARKS chunk boundaries at most (the doubling ones from the first
 # chunk, the prompt's last two, the ones it continued from)
@@ -326,6 +337,17 @@ class Watchdog:
                     sock.sendall(b"A")
                 except OSError:
                     pass
+        if EXIT_ON_BREAK:
+            import threading
+
+            timer = threading.Timer(EXIT_GRACE, self._exit, args=(why,))
+            timer.daemon = True
+            timer.start()
+
+    def _exit(self, why: str) -> None:
+        print(f"[tensorfold] rank {self.rank}: the process exits ({why}) so that its supervisor restarts the ranks "
+              "(TF_DS_EXIT_ON_BREAK=0 keeps it up)", flush=True)
+        os._exit(EXIT_CODE)
 
 
 def _pack(sampling) -> list | None:
@@ -504,8 +526,9 @@ class MultiDecoder:
 
     def _broken(self, exc: BaseException) -> None:
         """A step that raised past its digest check (out of memory under the allocator ceiling, a bug) may have left
-        another rank inside a collective: the lane breaks on every rank (the watchdog restarts it) instead of the next
-        step's collectives pairing with the wrong ones. OutOfStep and NoRoom happen on every rank at the same point."""
+        another rank inside a collective: the lane breaks on every rank (and each process exits, TF_DS_EXIT_ON_BREAK)
+        instead of the next step's collectives pairing with the wrong ones. OutOfStep and NoRoom happen on every rank
+        at the same point. A stream's own host work does not get here (``_stream_failed``)."""
 
         if self.watch is not None and not isinstance(exc, (OutOfStep, NoRoom)):
             self.watch.abort(f"a step failed on rank {self.e.rank} ({type(exc).__name__}: {str(exc)[:160]})")
@@ -910,11 +933,19 @@ class MultiDecoder:
                 return []
             self.filling.remove(s)
             s.steps = None
-            first = self._first(s, last)
+            try:
+                first = self._first(s, last)
+            except Exception as exc:                 # noqa: BLE001  (this stream's own host work: only it fails)
+                first = None
+                self._stream_failed(s, exc)
             s.started = time.perf_counter()
             s.pending = first
             self.streams[s.sid] = s
-            s.take([first], self._ends(s))
+            if first is not None:
+                try:
+                    s.take([first], self._ends(s))
+                except Exception as exc:             # noqa: BLE001  (its reply's callback: only it fails)
+                    self._stream_failed(s, exc)
             return [s] if s.done else []
         except Exception as exc:
             self._broken(exc)
@@ -942,6 +973,18 @@ class MultiDecoder:
         over the same tokens, so every rank ends it at the same round); the other streams go on."""
 
         s.error, s.constraint = exc, None
+
+    def _stream_failed(self, s: Stream, exc: Exception) -> None:
+        """A stream whose own host work raised (its grammar, its samples, its reply's callback) ends now with that
+        error; the other streams go on. That work runs no collective, so the ranks stay in step. A rank that raised
+        where the others did not ends the stream alone: rank 0's finish then ends it on every rank, or the next
+        step's digest check fails that step on every rank (``OutOfStep``), and the lane serves on."""
+
+        s.error, s.constraint = exc, None
+        if not s.done:
+            s.done, s.finished = True, time.perf_counter()
+        print(f"[tensorfold] rank {self.e.rank}: stream {s.sid} failed ({type(exc).__name__}: {str(exc)[:160]}); "
+              "the other streams go on", flush=True)
 
     def _absorb_eager(self, items: list):
         """absorb_many of ``items`` on the side stream once the forward (on the current stream) has run; returns the
@@ -1099,6 +1142,8 @@ class MultiDecoder:
                         drafts, grammars[s.sid] = constrain.chain(s.constraint, s.pending, drafts)
                     except GrammarError as exc:
                         self._grammar_failed(s, exc)
+                    except Exception as exc:             # noqa: BLE001  (it keeps its rows this round, no tokens)
+                        self._stream_failed(s, exc)
                 window = [s.pending] + drafts
                 sc.host.set(P, window)
                 windows.append((s.st.index, s.base, s.size, P, window, sc.host.view()))
@@ -1121,49 +1166,53 @@ class MultiDecoder:
             absorbs = []
             for (s, P, drafts), (_, _, _, _, window, _) in zip(kept, windows):
                 n = len(window)
-                if s.constraint is not None and s.sid in grammars:
+                if not s.done:                           # (a stream that failed before the forward: its rows, no tokens)
                     try:
-                        constrain.mask(s.constraint, logits[r0:r0 + n], grammars[s.sid])
-                    except GrammarError as exc:
-                        self._grammar_failed(s, exc)
-                target = e._sample(logits[r0:r0 + n], [P + 1 + i for i in range(n)], s.sampling)
-                a = 0
-                while a < len(drafts) and drafts[a] == target[a]:
-                    a += 1
-                if CONF_LOG and drafts:
-                    import math
+                        if s.constraint is not None and s.sid in grammars:
+                            try:
+                                constrain.mask(s.constraint, logits[r0:r0 + n], grammars[s.sid])
+                            except GrammarError as exc:
+                                self._grammar_failed(s, exc)
+                        target = e._sample(logits[r0:r0 + n], [P + 1 + i for i in range(n)], s.sampling)
+                        a = 0
+                        while a < len(drafts) and drafts[a] == target[a]:
+                            a += 1
+                        if CONF_LOG and drafts:
+                            import math
 
-                    cf = confs.get(s.sid, [])
-                    for j in range(min(len(drafts), a + 1)):          # drafts reached: the first miss included
-                        self.conf_depth[j][0] += 1
-                        self.conf_depth[j][1] += int(j < a)
-                        if j < len(cf):
-                            b = min(9, int(10 / (1 + math.exp(-cf[j]))))
-                            self.conf_bins[b][0] += 1
-                            self.conf_bins[b][1] += int(j < a)
-                new = drafts[:a] + [target[a]]
-                s.st.sc.length = P + a + 1
-                if s.draft and taps is not None:
-                    if absorb_done is not None:
-                        self.dpool.views[s.st.index].absorbed = P + a + 1
-                    else:
-                        absorbs.append((s.st.index, taps[r0:r0 + a + 1], P))
-                s.counted(n)
-                ends = self._ends(s)
-                for i, t in enumerate(new):
-                    if t in ends:
-                        new = new[:i + 1]
-                        break
-                new = new[:s.count - len(s.out)]
-                if s.constraint is not None:
-                    try:
-                        constrain.advance(s.constraint, new)
-                    except GrammarError as exc:
-                        self._grammar_failed(s, exc)
-                s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
-                s.pending = new[-1]
-                s.take(new, ends)
-                tokens += len(new)
+                            cf = confs.get(s.sid, [])
+                            for j in range(min(len(drafts), a + 1)):          # drafts reached: the first miss included
+                                self.conf_depth[j][0] += 1
+                                self.conf_depth[j][1] += int(j < a)
+                                if j < len(cf):
+                                    b = min(9, int(10 / (1 + math.exp(-cf[j]))))
+                                    self.conf_bins[b][0] += 1
+                                    self.conf_bins[b][1] += int(j < a)
+                        new = drafts[:a] + [target[a]]
+                        s.st.sc.length = P + a + 1
+                        if s.draft and taps is not None:
+                            if absorb_done is not None:
+                                self.dpool.views[s.st.index].absorbed = P + a + 1
+                            else:
+                                absorbs.append((s.st.index, taps[r0:r0 + a + 1], P))
+                        s.counted(n)
+                        ends = self._ends(s)
+                        for i, t in enumerate(new):
+                            if t in ends:
+                                new = new[:i + 1]
+                                break
+                        new = new[:s.count - len(s.out)]
+                        if s.constraint is not None:
+                            try:
+                                constrain.advance(s.constraint, new)
+                            except GrammarError as exc:
+                                self._grammar_failed(s, exc)
+                        s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
+                        s.pending = new[-1]
+                        s.take(new, ends)
+                        tokens += len(new)
+                    except Exception as exc:             # noqa: BLE001  (this stream's own host work: only it fails)
+                        self._stream_failed(s, exc)
                 r0 += n
                 if s.done:
                     done.append(s)
