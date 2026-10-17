@@ -915,6 +915,7 @@ class MultiDecoder:
             s.pending = first
             self.streams[s.sid] = s
             s.take([first], self._ends(s))
+            self._grammar_end(s)
             return [s] if s.done else []
         except Exception as exc:
             self._broken(exc)
@@ -942,6 +943,14 @@ class MultiDecoder:
         over the same tokens, so every rank ends it at the same round); the other streams go on."""
 
         s.error, s.constraint = exc, None
+
+    @staticmethod
+    def _grammar_end(s: Stream) -> None:
+        """A reply whose grammar has taken its stop token ends there, also with ignore_eos (``_ends`` is empty then).
+        Every rank walks the same grammar over the same tokens, so every rank ends it at the same round."""
+
+        if not s.done and constrain.ended(s.constraint):
+            s.done, s.finished = True, time.perf_counter()
 
     def _absorb_eager(self, items: list):
         """absorb_many of ``items`` on the side stream once the forward (on the current stream) has run; returns the
@@ -1163,6 +1172,7 @@ class MultiDecoder:
                 s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
                 s.pending = new[-1]
                 s.take(new, ends)
+                self._grammar_end(s)
                 tokens += len(new)
                 r0 += n
                 if s.done:

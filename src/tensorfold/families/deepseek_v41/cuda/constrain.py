@@ -59,3 +59,10 @@ def advance(constraint, tokens: Sequence[int]) -> None:
 
     if constraint is not None and tokens:
         constraint.advance(tokens)
+
+
+def ended(constraint) -> bool:
+    """The grammar has taken its stop token: the reply is complete, also when the request ignores the end token (then
+    the engine's own end tokens are empty and only this stops the reply)."""
+
+    return constraint is not None and constraint.finished

@@ -505,7 +505,7 @@ class DsEngine:
         out = [first]
         on_tokens([first])
         tok = first
-        while len(out) < max_tokens and tok not in eos:
+        while len(out) < max_tokens and tok not in eos and not constrain.ended(constraint):
             p = sc.length
             if self.runner is not None:
                 lg, _ = self.runner.forward(sc, [tok], p, False)
@@ -540,7 +540,8 @@ class DsEngine:
 
     def _spec(self, sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint=None):
         """Drafts verified k at a time against the target's keyed samples (the serial rule); ``constraint`` cuts the
-        drafts its grammar cannot keep and masks the verify rows (``constrain``)."""
+        drafts its grammar cannot keep and masks the verify rows (``constrain``). The grammar never keeps a draft that
+        is its stop token, so a round ends at that token at most."""
         from . import constrain
 
         m, d = self.model, self.drafter
@@ -549,7 +550,7 @@ class DsEngine:
         tok = first
         rounds = drafted = accepted = 0
         t_draft = t_verify = t_absorb = 0.0
-        while len(out) < max_tokens and tok not in eos:
+        while len(out) < max_tokens and tok not in eos and not constrain.ended(constraint):
             P = sc.length
             ta = time.perf_counter()
             if self.runner is not None:
