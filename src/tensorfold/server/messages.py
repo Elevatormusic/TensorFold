@@ -33,8 +33,11 @@ _VISUAL = ("image_url", "image", "video_url", "video")      # a video part reach
 
 
 def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "system",
-                       allow_images: bool = False) -> list[dict[str, Any]]:
-    """Merge leading instructions as system text and retain later instructions as ``late_system`` so earlier conversation tokens stay unchanged."""
+                       allow_images: bool = False, merge_leading: bool = True) -> list[dict[str, Any]]:
+    """Merge leading instructions as system text and retain later instructions as ``late_system`` so earlier conversation tokens stay unchanged.
+
+    With ``merge_leading`` off, only the first leading instruction is the system message and the next ones are
+    later instructions (DeepSeek-V4.1's encoding: a second system message is its own <｜System｜> turn)."""
 
     if not isinstance(messages, list) or not messages:
         raise RequestError("messages must be a non-empty list")
@@ -75,7 +78,7 @@ def normalize_messages(messages: list[dict[str, Any]], *, late_system: str = "sy
             raise RequestError("message content must be text or an array of text parts")
         item = message if content is message.get("content") else {**message, "content": content}
         if role in ("system", "developer"):
-            if not out:
+            if not out and (merge_leading or not instructions):
                 instructions.append(item)
                 continue
             if role != late_system:

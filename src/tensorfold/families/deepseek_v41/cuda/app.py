@@ -24,6 +24,9 @@ class DsApp(App):
         super().__init__(*args, **kwargs)
         template = self.template
         template.efforts = frozenset(EFFORT_VALUES)     # the server passes every name through unchanged
+        # DeepSeek's encoding keeps a second leading system message (Codex's developer turn, say) as its own
+        # <｜System｜> turn after the tools block: not merged into the first
+        template.merge_leading = False
         render = template.render
 
         def render_effort(messages, *, enable_thinking: bool, extra: dict[str, Any] | None = None, **kw: Any) -> str:
@@ -35,6 +38,33 @@ class DsApp(App):
 
         template.render = render_effort
 
+    def _check_fields(self, body: dict[str, Any]) -> str | None:
+        problem = super()._check_fields(body)
+        if problem is None and isinstance(body, dict):
+            try:
+                self._response_format(body, "messages" in body)
+            except RequestError as exc:
+                return str(exc)
+        return problem
+
+    @staticmethod
+    def _response_format(body: dict[str, Any], chat: bool) -> dict[str, Any]:
+        """json_object as DeepSeek's encoding serves it: a "## Response Format" block in the system turn, no
+        grammar. The engine has no constrained decoding, so a schema, regex, choice or grammar is HTTP 400."""
+
+        from tensorfold.engine.grammar import request_spec
+
+        spec = request_spec(body)
+        if spec is None:
+            return body
+        if spec.kind != "json" or not chat:
+            raise RequestError("the DeepSeek-V4.1 engine has no constrained decoding: it serves response_format "
+                               "json_object (as DeepSeek's API does), not json_schema, regex, choice or grammar")
+        kwargs = body.get("chat_template_kwargs")
+        kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
+        kwargs["response_format"] = {"type": "json_object"}
+        return {**{k: v for k, v in body.items() if k != "response_format"}, "chat_template_kwargs": kwargs}
+
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
@@ -44,6 +74,7 @@ class DsApp(App):
         """A chat with image_url parts (user turns and tool results): each image becomes DeepSeek's placeholder
         block, the prompt renders as text, and each placeholder token grows into the image's span."""
 
+        body = self._response_format(body, chat)
         vision = getattr(self.engine, "vision", None)
         messages = body.get("messages") if chat else None
         if vision is None or not isinstance(messages, list) or not vision.has_images(messages):

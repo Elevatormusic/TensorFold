@@ -39,11 +39,13 @@ class ChatTemplate:
                          for k, v in cfg.items() if k in ("bos_token", "eos_token", "pad_token", "unk_token")}
         self.late_system = late_system_role(
             lambda messages: self.template.render(**self.specials, messages=messages, add_generation_prompt=False))
+        self.merge_leading = True                     # leading system messages as one (a family can turn it off)
 
     def render(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None,
                enable_thinking: bool, extra: dict[str, Any] | None = None, allow_images: bool = False) -> str:
         messages = _normalize_tool_call_arguments(normalize_messages(messages, late_system=self.late_system,
-                                                                     allow_images=allow_images))
+                                                                     allow_images=allow_images,
+                                                                     merge_leading=self.merge_leading))
         kwargs = dict(self.specials, messages=messages, tools=tools or None, add_generation_prompt=True,
                       enable_thinking=enable_thinking)
         kwargs.update(extra or {})

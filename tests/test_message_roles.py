@@ -44,3 +44,13 @@ def test_normalizing_twice_changes_nothing():
     once = normalize_messages(messages, late_system="user")
     assert normalize_messages(once, late_system="user") == once
     assert normalize_messages(normalize_messages(messages), late_system="user") == once
+
+
+def test_leading_instructions_merge_unless_the_family_keeps_them_apart():
+    messages = [{"role": "system", "content": "a"}, {"role": "developer", "content": "b"},
+                {"role": "user", "content": "c"}]
+    assert normalize_messages(messages) == [{"role": "system", "content": "a\n\nb"}, {"role": "user", "content": "c"}]
+    apart = normalize_messages(messages, merge_leading=False)       # DeepSeek-V4.1: b is its own system turn
+    assert apart == [{"role": "system", "content": "a"}, {"role": "system", "content": "b"},
+                     {"role": "user", "content": "c"}]
+    assert normalize_messages(apart, merge_leading=False) == apart
