@@ -1,18 +1,21 @@
 """Structured output on the DeepSeek-V4.1 engine (families/deepseek_v41/cuda/constrain.py): a reply's grammar over a
 DSpark draft chain cuts the drafts it cannot keep, masks the verify rows and follows the kept tokens, and a follower
-rank's copy (rank 0's ``pack``, compiled there) masks bit for bit the same (real xgrammar, a tiny vocabulary)."""
+rank's copy (rank 0's ``pack``, compiled there) masks bit for bit the same, and a reply ends at its grammar's stop
+token also when the request ignores the end token (real xgrammar, a tiny vocabulary)."""
 
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 xgr = pytest.importorskip("xgrammar")
 
+from tensorfold.cuda.streams import Stream
 from tensorfold.engine.grammar import Grammars, Spec, pack
-from tensorfold.families.deepseek_v41.cuda import constrain
+from tensorfold.families.deepseek_v41.cuda import constrain, engine, multi
 
 VOCAB = ["<eos>", "a", "b", "x", "</think>", "y", "e", "s", "n", "o", "{", "}", '"', ":", "1", " "]
 ID = {t: i for i, t in enumerate(VOCAB)}
@@ -104,3 +107,67 @@ def test_logits_from_inference_mode_are_masked_outside_it():
         _, window = constrain.chain(c, ID["a"], ids("b"))
         constrain.mask(c, rows, window)
     assert allowed(head) == [["a"]] and allowed(rows) == [["b"], ["<eos>", "b"]]
+
+
+def test_ended_is_true_once_the_grammar_has_taken_its_stop_token():
+    assert constrain.ended(None) is False
+    c = constraint(Spec("choice", json.dumps(["yes", "no"])))
+    constrain.advance(c, ids("y", "e", "s"))
+    assert constrain.ended(c) is False                                # the value is whole: the stop token is next
+    constrain.advance(c, ids("<eos>"))
+    assert constrain.ended(c) is True
+
+
+def first_allowed(logits, positions, sampling):                      # the engine's sampler: the lowest allowed token
+    return [next(i for i, v in enumerate(row) if v > float("-inf")) for row in logits.tolist()]
+
+
+def forward(sc, window, position, taps):                             # a model that gives every row the same logits
+    return torch.zeros(len(window), WIDTH), (torch.zeros(len(window), 4) if taps else None)
+
+
+def test_the_serial_loop_ends_at_the_grammars_stop_token_when_eos_is_off():
+    c = constraint(Spec("choice", json.dumps(["yes", "no"])))
+    head = torch.zeros(1, WIDTH)                                      # the first token, as ``_run`` makes it
+    constrain.first(c, head)
+    first = first_allowed(head, [0], None)[0]
+    constrain.advance(c, [first])
+    sent = []
+    this = SimpleNamespace(runner=SimpleNamespace(forward=forward), _sample=first_allowed)
+    out = engine.DsEngine._serial(this, SimpleNamespace(length=7), first, 30, None, (), sent.extend, c)
+    assert out == ids("y", "e", "s", "<eos>") and sent == out         # ignore_eos: eos is (), the grammar ends it
+
+
+def test_the_speculative_loop_ends_at_the_grammars_stop_token_when_eos_is_off(monkeypatch):
+    monkeypatch.setattr(engine, "ADAPTIVE", False)
+    c = constraint(Spec("choice", json.dumps(["yes", "no"])))
+    head = torch.zeros(1, WIDTH)
+    constrain.first(c, head)
+    first = first_allowed(head, [0], None)[0]
+    constrain.advance(c, [first])
+    proposed = ids("e", "s", "<eos>")                                 # the grammar cuts the stop token from the drafts
+    this = SimpleNamespace(
+        model=None, runner=SimpleNamespace(forward=forward), _sample=first_allowed, drafts=3,
+        drafter=SimpleNamespace(absorb=lambda dc, sc, taps, position: None),
+        _draft_graph=lambda sc, dc, tok, position: SimpleNamespace(run=lambda tok, position: (proposed, [0.0] * 3)))
+    sent = []
+    out, stats = engine.DsEngine._spec(this, SimpleNamespace(length=7), None, first, 30, None, (), sent.extend, c)
+    assert out == ids("y", "e", "s", "<eos>") and sent == out
+    assert stats == (1, 2, 2)                                         # one round: two drafts kept, the stop token apart
+
+
+def test_a_parallel_stream_whose_grammar_has_ended_is_done_with_eos_off():
+    c = constraint(Spec("choice", json.dumps(["yes", "no"])))
+    s = Stream([1], 30, stop_eos=False, constraint=c)
+    constrain.advance(c, ids("y", "e", "s"))
+    s.take(ids("y", "e", "s"), ())
+    multi.MultiDecoder._grammar_end(s)
+    assert not s.done and s.finished == 0.0                           # the stop token is still to come
+    constrain.advance(c, ids("<eos>"))
+    s.take(ids("<eos>"), ())
+    assert not s.done                                                 # ignore_eos: ``take`` does not end it
+    multi.MultiDecoder._grammar_end(s)
+    assert s.done and s.finished > 0.0
+    stamp = s.finished
+    multi.MultiDecoder._grammar_end(s)
+    assert s.finished == stamp                                        # an ended stream keeps its end time

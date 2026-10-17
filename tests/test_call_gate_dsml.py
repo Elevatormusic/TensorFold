@@ -44,7 +44,7 @@ def gate(names=("get_weather", "get_time")):
 
 def test_the_dsml_format_comes_from_the_rendered_call():
     assert dsml_format(V41_CALL, "tfprobe_fn") == ("<", DSML, V41_LEAD, '"')
-    assert dsml_format(V4_CALL, "tfprobe_fn") == ("<", DSML, f'tool_calls>\n<{DSML}invoke name="', '"')
+    assert dsml_format(V4_CALL, "tfprobe_fn") is None          # V4's form: cuda.reply_text cannot parse it
     assert dsml_format("no calls here", "tfprobe_fn") is None
     assert dsml_format(f'<{DSML} calls>', "tfprobe_fn") is None                 # no call to the probe
     assert call_format(V41_CALL, "tfprobe_fn", ["<tool_call>"]) is None         # why the old gate refused V4.1

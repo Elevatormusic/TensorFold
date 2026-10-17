@@ -971,6 +971,7 @@ class MultiDecoder:
                     s.take([first], self._ends(s))
                 except Exception as exc:             # noqa: BLE001  (its reply's callback: only it fails)
                     self._stream_failed(s, exc)
+                self._grammar_end(s)
             return [s] if s.done else []
         except Exception as exc:
             self._broken(exc)
@@ -1014,6 +1015,14 @@ class MultiDecoder:
             s.done, s.finished = True, time.perf_counter()
         print(f"[tensorfold] rank {self.e.rank}: stream {s.sid} failed ({type(exc).__name__}: {str(exc)[:160]}); "
               "the other streams go on", flush=True)
+
+    @staticmethod
+    def _grammar_end(s: Stream) -> None:
+        """A reply whose grammar has taken its stop token ends there, also with ignore_eos (``_ends`` is empty then).
+        Every rank walks the same grammar over the same tokens, so every rank ends it at the same round."""
+
+        if not s.done and constrain.ended(s.constraint):
+            s.done, s.finished = True, time.perf_counter()
 
     def _absorb_eager(self, items: list):
         """absorb_many of ``items`` on the side stream once the forward (on the current stream) has run; returns the
@@ -1255,6 +1264,7 @@ class MultiDecoder:
                         s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
                         s.pending = new[-1]
                         s.take(new, ends)
+                        self._grammar_end(s)
                         tokens += len(new)
                     except Exception as exc:             # noqa: BLE001  (this stream's own host work: only it fails)
                         self._stream_failed(s, exc)

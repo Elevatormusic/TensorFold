@@ -6,8 +6,9 @@ from typing import Any, Callable, Sequence
 
 _ANSWER, _LEAD, _NAME, _DONE, _OPEN = range(5)
 
-# DeepSeek-V4.x DSML: a calls block opens with a plain "<" and then this one token ("<｜DSML｜ calls>" in V4.1,
-# "<｜DSML｜tool_calls>" in V4), so the call starts one character before its opener token
+# DeepSeek-V4.1 DSML: a calls block opens with a plain "<" and then this one token ("<｜DSML｜ calls>"), so the call
+# starts one character before its opener token. Only this spaced form: it is the one cuda.reply_text parses into
+# tool_calls (V4's "<｜DSML｜tool_calls>" would stay assistant text)
 DSML = "｜DSML｜"
 
 
@@ -28,7 +29,7 @@ def dsml_format(rendered: str, name: str) -> tuple[str, str, str, str] | None:
     it to the name (the calls block's first invoke), and the mark that ends the name."""
 
     at = rendered.rfind(name)
-    start = max(rendered.rfind(f"<{DSML}{kind}", 0, at) for kind in (" calls>", "tool_calls>"))
+    start = rendered.rfind(f"<{DSML} calls>", 0, at)
     if at < 0 or start < 0:
         return None
     end = at + len(name)
