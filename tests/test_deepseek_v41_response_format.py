@@ -60,3 +60,36 @@ def test_null_template_kwargs_count_as_none():
     out = DsApp._response_format({**CHAT, "response_format": {"type": "json_object"}, "chat_template_kwargs": None},
                                  True)
     assert out["chat_template_kwargs"] == {"response_format": {"type": "json_object"}}
+
+
+JSON_OBJECT = {**CHAT, "response_format": {"type": "json_object"}}
+
+
+@pytest.mark.parametrize("field, named", [
+    ({"guided_regex": "[0-9]+"}, "guided_regex"),
+    ({"guided_choice": ["a", "b"]}, "guided_choice"),
+    ({"guided_json": {"type": "object"}}, "guided_json"),
+    ({"guided_grammar": 'root ::= "a"'}, "guided_grammar"),
+    ({"structured_outputs": {"regex": "[0-9]+"}}, "structured_outputs.regex"),
+    ({"structured_outputs": {"json_object": True, "choice": ["a"]}}, "structured_outputs.choice"),
+    ({"structured_outputs": "regex"}, "structured_outputs"),
+])
+def test_json_object_with_a_competing_control_is_a_clear_400(field, named):
+    with pytest.raises(RequestError, match="serves json_object only") as err:
+        DsApp._response_format({**JSON_OBJECT, **field}, True)
+    assert named in str(err.value)
+
+
+def test_json_object_alone_and_the_alias_alone_keep_the_template_block():
+    block = {"response_format": {"type": "json_object"}}
+    assert DsApp._response_format(JSON_OBJECT, True)["chat_template_kwargs"] == block
+    alias = {**CHAT, "structured_outputs": {"json_object": True}}
+    assert DsApp._response_format(alias, True)["chat_template_kwargs"] == block
+
+
+def test_unset_competing_controls_do_not_block_json_object():
+    body = {**JSON_OBJECT, "guided_regex": None, "structured_outputs": {"json_object": True, "regex": None,
+                                                                         "choice": False}}
+    out = DsApp._response_format(body, True)
+    assert out["chat_template_kwargs"] == {"response_format": {"type": "json_object"}}
+    assert "structured_outputs" not in out and "response_format" not in out

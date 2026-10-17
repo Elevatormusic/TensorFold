@@ -16,6 +16,9 @@ from tensorfold.server.errors import RequestError
 # OpenAI tier reaches the model as its own value (none or off: thinking off). No effort sent: high, as the reference.
 EFFORT_VALUES = {"minimal": 25, "low": 50, "medium": 62, "high": 75, "xhigh": 88, "max": 100}
 
+# The guided_* fields that request_spec reads. A json_object request that also has one of them is a conflict.
+GUIDED_FIELDS = ("guided_json", "guided_regex", "guided_choice", "guided_grammar")
+
 
 class DsApp(App):
     reads_ignore_eos = True
@@ -50,7 +53,9 @@ class DsApp(App):
     @staticmethod
     def _response_format(body: dict[str, Any], chat: bool) -> dict[str, Any]:
         """json_object as DeepSeek's encoding serves it: a "## Response Format" block in the system turn, no
-        grammar. The engine has no constrained decoding, so a schema, regex, choice or grammar is HTTP 400."""
+        grammar. The engine has no constrained decoding, so a schema, regex, choice or grammar is HTTP 400. So is
+        a json_object request that also has one of them: request_spec returns json_object first, and the other
+        field must not stay in the body."""
 
         from tensorfold.engine.grammar import request_spec
 
@@ -60,6 +65,10 @@ class DsApp(App):
         if spec.kind != "json" or not chat:
             raise RequestError("the DeepSeek-V4.1 engine has no constrained decoding: it serves response_format "
                                "json_object (as DeepSeek's API does), not json_schema, regex, choice or grammar")
+        competing = DsApp._competing_controls(body)
+        if competing:
+            raise RequestError("the DeepSeek-V4.1 engine has no constrained decoding: it serves json_object only, "
+                               f"so response_format json_object cannot go with {', '.join(competing)}")
         kwargs = body.get("chat_template_kwargs")
         if kwargs is not None and not isinstance(kwargs, dict):
             raise RequestError("chat_template_kwargs must be a JSON object or null")
@@ -67,6 +76,20 @@ class DsApp(App):
         # both json_object fields go (response_format, structured_outputs.json_object): the block replaces them
         drop = ("response_format", "structured_outputs")
         return {**{k: v for k, v in body.items() if k not in drop}, "chat_template_kwargs": kwargs}
+
+    @staticmethod
+    def _competing_controls(body: dict[str, Any]) -> list[str]:
+        """The set structured-output controls in the body other than json_object itself, by field name."""
+
+        names = [name for name in GUIDED_FIELDS if body.get(name) is not None]
+        so = body.get("structured_outputs")
+        if isinstance(so, dict):
+            # a key is set when it is not None and not False: the same test as request_spec
+            names += [f"structured_outputs.{key}" for key, value in sorted(so.items())
+                      if key != "json_object" and value is not None and value is not False]
+        elif so is not None:
+            names.append("structured_outputs")
+        return names
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
