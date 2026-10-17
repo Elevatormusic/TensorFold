@@ -40,3 +40,23 @@ def test_enforced_formats_are_a_clear_400(field):
 def test_json_object_needs_a_chat():
     with pytest.raises(RequestError):
         DsApp._response_format({"prompt": "x", "response_format": {"type": "json_object"}}, False)
+
+
+def test_the_structured_outputs_alias_goes_with_the_block():
+    body = {**CHAT, "structured_outputs": {"json_object": True}}
+    out = DsApp._response_format(body, True)
+    assert "structured_outputs" not in out and "response_format" not in out
+    assert out["chat_template_kwargs"] == {"response_format": {"type": "json_object"}}
+
+
+@pytest.mark.parametrize("kwargs", [False, [], "x", 3])
+def test_json_object_keeps_the_template_kwargs_check(kwargs):
+    with pytest.raises(RequestError, match="chat_template_kwargs must be a JSON object"):
+        DsApp._response_format({**CHAT, "response_format": {"type": "json_object"}, "chat_template_kwargs": kwargs},
+                               True)
+
+
+def test_null_template_kwargs_count_as_none():
+    out = DsApp._response_format({**CHAT, "response_format": {"type": "json_object"}, "chat_template_kwargs": None},
+                                 True)
+    assert out["chat_template_kwargs"] == {"response_format": {"type": "json_object"}}

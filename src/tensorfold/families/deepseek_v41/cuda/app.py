@@ -61,9 +61,12 @@ class DsApp(App):
             raise RequestError("the DeepSeek-V4.1 engine has no constrained decoding: it serves response_format "
                                "json_object (as DeepSeek's API does), not json_schema, regex, choice or grammar")
         kwargs = body.get("chat_template_kwargs")
-        kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
-        kwargs["response_format"] = {"type": "json_object"}
-        return {**{k: v for k, v in body.items() if k != "response_format"}, "chat_template_kwargs": kwargs}
+        if kwargs is not None and not isinstance(kwargs, dict):
+            raise RequestError("chat_template_kwargs must be a JSON object or null")
+        kwargs = {**(kwargs or {}), "response_format": {"type": "json_object"}}
+        # both json_object fields go (response_format, structured_outputs.json_object): the block replaces them
+        drop = ("response_format", "structured_outputs")
+        return {**{k: v for k, v in body.items() if k not in drop}, "chat_template_kwargs": kwargs}
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
