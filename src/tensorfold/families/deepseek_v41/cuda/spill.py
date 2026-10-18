@@ -55,6 +55,99 @@ IDENTITY_ENV = ("TF_DS_KV", "TF_DS_REPLAY", "TF_DS_REPLAY_FLOOR", "TF_DS_PREFILL
                 "TF_DS_ENGRAM", "TF_DS_VISION_EXTRA")
 
 
+# Spill files are written with O_DIRECT, past the page cache. Buffered writes made the kernel allocate large page-cache
+# folios (order 7-9); on a full GB10 node that meant direct compaction in the writing threads and in kcompactd, and page
+# migration stalls the GPU, which reads host memory through the SMMU: prompt chunks of another request took 1.5-2 s
+# instead of 1.0 s. TF_DS_SPILL_DIRECT=0 goes back to buffered writes.
+SPILL_DIRECT = os.environ.get("TF_DS_SPILL_DIRECT", "1") != "0"
+_ALIGN = 4096                    # O_DIRECT offset, size and buffer alignment (the logical block size or a multiple)
+_BUF = 16 << 20                  # the one staging buffer a file streams through
+_ST_DTYPE = {torch.float64: "F64", torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16",
+             torch.int64: "I64", torch.int32: "I32", torch.int16: "I16", torch.int8: "I8", torch.uint8: "U8",
+             torch.bool: "BOOL"}
+for _n, _s in (("float8_e4m3fn", "F8_E4M3"), ("float8_e5m2", "F8_E5M2")):
+    if hasattr(torch, _n):
+        _ST_DTYPE[getattr(torch, _n)] = _s
+
+
+def _open_direct(path: Path) -> tuple[int, bool]:
+    """``path`` for writing, O_DIRECT when the filesystem takes it (tmpfs and some others do not: buffered then)."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if SPILL_DIRECT and hasattr(os, "O_DIRECT"):
+        try:
+            return os.open(path, flags | os.O_DIRECT, 0o644), True
+        except OSError:
+            pass
+    return os.open(path, flags, 0o644), False
+
+
+def write_safetensors(path: Path, tensors: dict, meta: dict) -> None:
+    """A safetensors file of CPU ``tensors`` at ``path``, streamed through one aligned _BUF buffer (no copy of the
+    whole file in memory). Tensors go largest element first, so every tensor's offset is a multiple of its element size
+    (the header is padded to 8 bytes, as safetensors pads it). The file is padded to _ALIGN for the last O_DIRECT write
+    and truncated back to its exact size."""
+
+    import mmap
+
+    order = sorted(tensors, key=lambda k: (-tensors[k].element_size(), k))
+    header, off = {"__metadata__": meta}, 0
+    for k in order:
+        t = tensors[k]
+        if t.dtype not in _ST_DTYPE:
+            raise TypeError(f"spill: no safetensors dtype for {k} ({t.dtype})")
+        n = t.numel() * t.element_size()
+        header[k] = {"dtype": _ST_DTYPE[t.dtype], "shape": list(t.shape), "data_offsets": [off, off + n]}
+        off += n
+    head = json.dumps(header, separators=(",", ":")).encode()
+    head += b" " * (-len(head) % 8)
+    total = 8 + len(head) + off
+    buf = mmap.mmap(-1, _BUF)                            # anonymous mmap: page aligned, as O_DIRECT needs
+    view, fill, fd = memoryview(buf), 0, -1              # (the buffer first: a failed allocation leaves no fd open)
+    try:
+        fd, _ = _open_direct(path)
+
+        def put(data) -> None:
+            nonlocal fill
+            data = memoryview(data).cast("B")
+            while len(data):
+                n = min(len(data), _BUF - fill)
+                view[fill:fill + n] = data[:n]
+                fill += n
+                data = data[n:]
+                if fill == _BUF:
+                    _write_all(fd, view)
+                    fill = 0
+
+        put(len(head).to_bytes(8, "little"))
+        put(head)
+        for k in order:
+            t = tensors[k]
+            if t.numel():
+                put(t.detach().contiguous().reshape(-1).view(torch.uint8).numpy())
+        if fill:
+            pad = -fill % _ALIGN
+            view[fill:fill + pad] = bytes(pad)
+            _write_all(fd, view[:fill + pad])
+        os.ftruncate(fd, total)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            view.release()
+            buf.close()
+        except BufferError:                              # a slice is still held by a failed write's traceback: the
+            pass                                         # buffer goes with it, and the error that got here stays
+
+
+def _write_all(fd: int, data: memoryview) -> None:
+    while len(data):
+        n = os.write(fd, data)
+        if n <= 0:
+            raise OSError("spill: short write")
+        data = data[n:]
+
+
 _NAME = re.compile(r"[0-9A-Za-z_-]{1,64}")
 _FILE = re.compile(r"(seg|snap)-[0-9A-Za-z_-]{1,64}-\d{1,9}\.st")
 
@@ -170,11 +263,9 @@ class Spill:
             return 0.0
 
     def _save(self, fname: str, tensors: dict, meta: dict) -> None:
-        from safetensors.torch import save_file
-
         path = self._path(fname)
         tmp = path.with_name(path.name + ".partial")
-        save_file(tensors, str(tmp), metadata={k: str(v) for k, v in meta.items()})
+        write_safetensors(tmp, tensors, {k: str(v) for k, v in meta.items()})
         os.replace(tmp, path)
 
     def _write_json(self, path: Path, obj: dict) -> None:
