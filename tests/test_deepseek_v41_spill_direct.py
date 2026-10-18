@@ -72,3 +72,35 @@ def test_offsets_aligned_to_element_size(tmp_path):
 def test_unknown_dtype_refused(tmp_path):
     with pytest.raises(TypeError):
         spill.write_safetensors(tmp_path / "x.st", {"c": torch.zeros(2, dtype=torch.complex64)}, {})
+
+
+def _open_fds():
+    return len(os.listdir("/proc/self/fd"))
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc")
+def test_failed_buffer_leaves_no_fd(tmp_path, monkeypatch):
+    import mmap
+
+    def refuse(*a, **k):
+        raise OSError(12, "Cannot allocate memory")
+
+    monkeypatch.setattr(mmap, "mmap", refuse)
+    before = _open_fds()
+    for _ in range(4):
+        with pytest.raises(OSError):
+            spill.write_safetensors(tmp_path / "x.st", _tensors(), {})
+    assert _open_fds() == before
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc")
+def test_failed_write_closes_fd(tmp_path, monkeypatch):
+    def refuse(fd, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(spill, "_write_all", refuse)
+    before = _open_fds()
+    for _ in range(4):
+        with pytest.raises(OSError):
+            spill.write_safetensors(tmp_path / "x.st", _tensors(), {})
+    assert _open_fds() == before

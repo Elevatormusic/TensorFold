@@ -102,10 +102,11 @@ def write_safetensors(path: Path, tensors: dict, meta: dict) -> None:
     head = json.dumps(header, separators=(",", ":")).encode()
     head += b" " * (-len(head) % 8)
     total = 8 + len(head) + off
-    fd, _ = _open_direct(path)
     buf = mmap.mmap(-1, _BUF)                            # anonymous mmap: page aligned, as O_DIRECT needs
-    view, fill = memoryview(buf), 0
+    view, fill, fd = memoryview(buf), 0, -1              # (the buffer first: a failed allocation leaves no fd open)
     try:
+        fd, _ = _open_direct(path)
+
         def put(data) -> None:
             nonlocal fill
             data = memoryview(data).cast("B")
@@ -130,9 +131,13 @@ def write_safetensors(path: Path, tensors: dict, meta: dict) -> None:
             _write_all(fd, view[:fill + pad])
         os.ftruncate(fd, total)
     finally:
-        view.release()
-        buf.close()
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
+        try:
+            view.release()
+            buf.close()
+        except BufferError:                              # a slice is still held by a failed write's traceback: the
+            pass                                         # buffer goes with it, and the error that got here stays
 
 
 def _write_all(fd: int, data: memoryview) -> None:
