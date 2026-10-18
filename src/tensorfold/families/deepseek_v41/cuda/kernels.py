@@ -222,6 +222,11 @@ SMALL_SWITCHES = {
                                                                  # score kernel and selects with topk_select, instead
                                                                  # of fp32 scores, six torch passes to keys,
                                                                  # torch.topk and a sort (the same row blocks, bits)
+    "prompt_tile": os.environ.get("TF_DS_PROMPT_TILE_ON", "1") != "0",   # with prompt_keys: the score kernel keeps
+                                                                 # the largest key of each PROMPT_TILE (8) keys, so the
+                                                                 # tile search runs from n > 8 k (not 64 k) and both of
+                                                                 # its selections fit topk_select's one launch (the
+                                                                 # same set: the keys are unique)
     "tile_skip": os.environ.get("TF_DS_TILE_SKIP", "1") != "0",   # decode rounds: an indexer key tile wholly at
                                                                  # or past a row's visible count skips its dots (all
                                                                  # -inf anyway) and, when only the pruned selection
@@ -1575,9 +1580,9 @@ def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, CAND, cs, TMAX, nt, IH: tl.const
 @triton.jit
 def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, TMAX, nt, IH: tl.constexpr, ID: tl.constexpr,
                       BN: tl.constexpr, RB: tl.constexpr, PACKED: tl.constexpr, KEYS: tl.constexpr = False,
-                      HAS_TMAX: tl.constexpr = False):
+                      HAS_TMAX: tl.constexpr = False, TB: tl.constexpr = 64):
     """Prompt chunks: RB rows a program share each key tile (dequantized once for all of them). KEYS: the scores as
-    topk_indices' int64 keys (as _index_score's KEYS)."""
+    topk_indices' int64 keys (as _index_score's KEYS). HAS_TMAX: the largest key of each TB keys (TB divides BN)."""
 
     rb = tl.program_id(0)
     b = tl.program_id(1)
@@ -1615,19 +1620,27 @@ def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, TMAX, nt, IH: tl.constexp
         key = (ordered << 32) | (0xFFFFFFFF - t[None, :].to(tl.int64))
         tl.store(OUT + rr[:, None] * n + t[None, :], key, mask=rok[:, None] & ok[None, :])
         if HAS_TMAX:                   # each row's largest key of the tile (topk_select_pruned)
-            tl.store(TMAX + rr * nt + b, tl.max(tl.where(ok[None, :], key, -9223372036854775808), axis=1), mask=rok)
+            km = tl.where(ok[None, :], key, -9223372036854775808)
+            if TB == BN:
+                tl.store(TMAX + rr * nt + b, tl.max(km, axis=1), mask=rok)
+            else:                      # of each TB-key part of the tile (nt: TMAX's row stride)
+                tm = tl.max(tl.reshape(km, (RB, BN // TB, TB)), axis=2)
+                j = b * (BN // TB) + tl.arange(0, BN // TB)
+                tl.store(TMAX + rr[:, None] * nt + j[None, :], tm, mask=rok[:, None] & (j[None, :] < nt))
     else:
         tl.store(OUT + rr[:, None] * n + t[None, :], sc, mask=rok[:, None] & ok[None, :])
 
 
 def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
                 out: torch.Tensor | None = None, base: torch.Tensor | None = None, keys: bool = False,
-                tmax: bool = False, rowwise: bool = False):
+                tmax: bool = False, rowwise: bool = False, tile: int = 64):
     """q [R, IH, ID] bf16, k bf16 [>= n, ID] or a packed FP4 pair (codes [N, ID/2], E8M0 [N, ID/32]),
     w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r]). Decode / verify windows (R <= DECODE_ROWS) take one row a program
     (row-invariant); prompt chunks share each key tile among 8 rows (``rowwise``: one row a program for them too).
     ``keys``: topk_indices' int64 keys of those scores instead (the same kernels, so the same scores; for
-    topk_select); with ``tmax`` also each 64-key tile's largest key: returns (keys, [R, ceil(n / 64)] int64)."""
+    topk_select); with ``tmax`` also each 64-key tile's largest key: returns (keys, [R, ceil(n / 64)] int64).
+    ``tile`` < 64 (prompt chunks only: prompt_tile): the largest key of each ``tile`` keys instead, in a row of
+    prompt_tile_width(n, tile) (PAD_KEY past ceil(n / tile)), so that the tile search fits topk_select's one launch."""
 
     rows, ih, idim = q.shape
     if out is None:
@@ -1636,7 +1649,13 @@ def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
     codes, scales = k if packed else (k, k)
     bn = 64
     nt = triton.cdiv(n, bn)
-    tm = torch.empty((rows, nt), dtype=torch.int64, device=q.device) if tmax else out
+    fine = tmax and tile != bn
+    if fine:
+        assert keys and bn % tile == 0 and rows > DECODE_ROWS and not rowwise, "fine tile maxima: prompt chunks only"
+        width = prompt_tile_width(n, tile)
+        tm = torch.full((rows, width), PAD_KEY, dtype=torch.int64, device=q.device)
+    else:
+        tm = torch.empty((rows, nt), dtype=torch.int64, device=q.device) if tmax else out
     if rows <= DECODE_ROWS or rowwise:
         _index_score[(rows, nt)](q, codes, scales, w, vis, out, n, vis if base is None else base, vis, 0, tm, nt,
                                  IH=ih, ID=idim, BN=bn, PACKED=packed, HAS_BASE=base is not None, num_warps=4,
@@ -1644,9 +1663,10 @@ def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
     else:
         assert base is None, "concurrent rounds are decode windows (DECODE_ROWS rows at most)"
         rbs = 8
-        _index_score_rows[(triton.cdiv(rows, rbs), nt)](q, codes, scales, w, vis, out, n, rows, tm, nt,
+        _index_score_rows[(triton.cdiv(rows, rbs), nt)](q, codes, scales, w, vis, out, n, rows, tm,
+                                                         tm.shape[1] if fine else nt,
                                                          IH=ih, ID=idim, BN=bn, RB=rbs, PACKED=packed, KEYS=keys,
-                                                         HAS_TMAX=tmax and keys, num_warps=8)
+                                                         HAS_TMAX=tmax and keys, TB=tile if fine else bn, num_warps=8)
     return (out, tm) if tmax else out
 
 
@@ -1820,28 +1840,73 @@ def _gather_tiles(KEYS, TPOS, OUT, n, ks, BN: tl.constexpr, KK: tl.constexpr, PD
     tl.store(OUT + r * (KK * BN) + j * BN + tl.arange(0, BN), key)
 
 
+@triton.jit
+def _gather_tiles_blk(KEYS, TPOS, OUT, n, ks, BN: tl.constexpr, KK: tl.constexpr, JB: tl.constexpr,
+                      PDL: tl.constexpr = False):
+    """_gather_tiles for small tiles: program (row, jb) copies JB tiles (TPOS[row, jb * JB:(jb + 1) * JB])."""
+
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    j = tl.program_id(1) * JB + tl.arange(0, JB)
+    pos = tl.load(TPOS + r * KK + j)
+    t = (pos // BN)[:, None] * BN + tl.arange(0, BN)[None, :]
+    key = tl.load(KEYS + r * ks + t, mask=(t < n) & (pos >= 0)[:, None], other=-9223372036854775808)
+    tl.store(OUT + r * (KK * BN) + j[:, None] * BN + tl.arange(0, BN)[None, :], key)
+
+
 TOPK_PRUNE_BN = 64                     # the score kernels' key tile (their tile maxima)
+# (switch "prompt_tile") a prompt chunk's indexer keeps the largest key of each PROMPT_TILE keys, not of each 64: then
+# more than k tiles exist from n > 8 * k (64K-token prompts and less at ratio 2 with k = 512 had at most k tiles of 64,
+# so no tile search, and torch's top-k sorted all n keys), and the tile search (prompt_tile_width(n) <= TOPK_FUSED_MAX
+# maxima) and its k * PROMPT_TILE candidates both fit topk_select's one launch
+PROMPT_TILE = int(os.environ.get("TF_DS_PROMPT_TILE") or 8)
 
 
-def prunes(n: int, k: int) -> bool:
+def prompt_tile_width(n: int, tile: int) -> int:
+    """The tile maxima row of index_score(tile=tile): ceil(n / tile) rounded up to a power of two (_topk_sel's N)."""
+
+    return 1 << (triton.cdiv(n, tile) - 1).bit_length()
+
+
+def prompt_tile(rows: int, n: int, k: int) -> int:
+    """The tile of a prompt chunk's tile maxima for index_score / topk_select_pruned: PROMPT_TILE where it gives the
+    tile search (prunes) and the prompt kernel runs (rows > DECODE_ROWS), else 64."""
+
+    t = PROMPT_TILE
+    if (SMALL_SWITCHES["prompt_tile"] and t < TOPK_PRUNE_BN and TOPK_PRUNE_BN % t == 0 and rows > DECODE_ROWS
+            and prunes(n, k, t)):
+        return t
+    return TOPK_PRUNE_BN
+
+
+def prunes(n: int, k: int, tile: int = TOPK_PRUNE_BN) -> bool:
     """topk_select_pruned searches tiles (not every key) for rows of n keys: the switch on, more than TOPK_FUSED_MAX
     keys and more than k tiles."""
 
-    return SMALL_SWITCHES["topk_prune"] and k > 0 and n > TOPK_FUSED_MAX and triton.cdiv(n, TOPK_PRUNE_BN) > k
+    return SMALL_SWITCHES["topk_prune"] and k > 0 and n > TOPK_FUSED_MAX and triton.cdiv(n, tile) > k
 
 
-def topk_select_pruned(keys: torch.Tensor, tmax: torch.Tensor, k: int, vis: torch.Tensor) -> torch.Tensor:
-    """topk_select(keys, k, vis) from the k tiles (TOPK_PRUNE_BN keys each) with the largest tile maxima ``tmax``:
+def topk_select_pruned(keys: torch.Tensor, tmax: torch.Tensor, k: int, vis: torch.Tensor,
+                       tile: int = TOPK_PRUNE_BN) -> torch.Tensor:
+    """topk_select(keys, k, vis) from the k tiles (``tile`` keys each) with the largest tile maxima ``tmax``:
     every one of a row's k largest keys lies in such a tile (keys are unique: fewer than k keys, so fewer than k tile
-    maxima, exceed one of them), so the k largest of those tiles' keys are the row's. The same int64 [R, k]."""
+    maxima, exceed one of them), so the k largest of those tiles' keys are the row's. The same int64 [R, k]. (PAD_KEY
+    maxima past the row's tiles are below every key, and more than k real tiles exist, so none is chosen.)"""
 
     rows, n = keys.shape
-    if not prunes(n, k) or keys.stride(1) != 1:
+    if not prunes(n, k, tile) or keys.stride(1) != 1:
         return topk_select(keys, k, vis)
     every = torch.full((rows,), 1 << 40, dtype=torch.int64, device=keys.device)       # no mask: tile positions
-    tpos = topk_select(tmax, k, every)                  # positions of the k largest tile maxima, sorted
-    cand = torch.empty((rows, k * TOPK_PRUNE_BN), dtype=torch.int64, device=keys.device)
-    _gather_tiles[(rows, k)](keys, tpos, cand, n, keys.stride(0), BN=TOPK_PRUNE_BN, KK=k, num_warps=1, **_pdl())
+    tpos = topk_select(tmax.contiguous(), k, every)     # positions of the k largest tile maxima, sorted
+    cand = torch.empty((rows, k * tile), dtype=torch.int64, device=keys.device)
+    if tile == TOPK_PRUNE_BN:
+        _gather_tiles[(rows, k)](keys, tpos, cand, n, keys.stride(0), BN=tile, KK=k, num_warps=1, **_pdl())
+    else:
+        jb = max(1, min(k, 1024 // tile))
+        _gather_tiles_blk[(rows, k // jb)](keys, tpos, cand, n, keys.stride(0), BN=tile, KK=k, JB=jb, num_warps=4,
+                                           **_pdl())
     return topk_select(cand, k, vis)
 
 
@@ -1865,16 +1930,23 @@ def _score_keys(S, OUT, n, TMAX, nt, BN: tl.constexpr, PDL: tl.constexpr = False
         tl.store(TMAX + r * nt + j, tm, mask=j < nt)
 
 
-def score_keys(score: torch.Tensor, tmax: bool = False):
+def score_keys(score: torch.Tensor, tmax: bool = False, tile: int = TOPK_PRUNE_BN):
     """topk_indices' int64 keys of fp32 scores [R, n] (contiguous), one launch; with ``tmax`` also each 64-key
-    tile's largest key: returns (keys, [R, ceil(n / 64)] int64)."""
+    tile's largest key: returns (keys, [R, ceil(n / 64)] int64). ``tile`` < 64: each ``tile`` keys' largest key
+    instead, in a row of prompt_tile_width(n, tile) (PAD_KEY past ceil(n / tile)), as index_score(tile=tile)."""
 
     rows, n = score.shape
     out = torch.empty((rows, n), dtype=torch.int64, device=score.device)
-    nt = triton.cdiv(n, TOPK_PRUNE_BN)
-    tm = torch.empty((rows, nt), dtype=torch.int64, device=score.device) if tmax else out
+    if tmax and tile != TOPK_PRUNE_BN:
+        assert TOPK_PRUNE_BN % tile == 0
+        nt = prompt_tile_width(n, tile)
+        tm = torch.full((rows, nt), PAD_KEY, dtype=torch.int64, device=score.device)
+    else:
+        tile = TOPK_PRUNE_BN
+        nt = triton.cdiv(n, TOPK_PRUNE_BN)
+        tm = torch.empty((rows, nt), dtype=torch.int64, device=score.device) if tmax else out
     _score_keys[(rows, triton.cdiv(n, 1024))](score, out, n, tm, nt, BN=1024, num_warps=4, HAS_TMAX=tmax,
-                                             TB=TOPK_PRUNE_BN, **_pdl())
+                                             TB=tile, **_pdl())
     return (out, tm) if tmax else out
 
 
