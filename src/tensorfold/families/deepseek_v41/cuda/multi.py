@@ -1165,12 +1165,13 @@ class MultiDecoder:
     def _differs(self, k: int) -> None:
         """A follower cannot run rank 0's round: a stream ended on this rank alone (``_stream_failed``), so it has no
         live stream or another draft depth. Rank 0 already waits in the round's digest check, so this rank takes part
-        in it with rank 0's depth: the shapes differ, the check fails on every rank, and each rank drops its streams.
+        in it with a plan rank 0 never sends (rank 0's depth and a marker): the check fails on every rank, also when
+        only the depths differ (``TF_DS_PARALLEL_DEPTH`` set apart on one rank), and each rank drops its streams.
         Does not return."""
 
         self._step(True)
         try:
-            self._agree("round", [self._shape(), k])
+            self._agree("round", [self._shape(), k, "out of step"])
         except Exception as exc:
             self._broken(exc)
             raise
