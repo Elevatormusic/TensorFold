@@ -28,6 +28,26 @@ GRAPHS = os.environ.get("TF_DS_GRAPHS", "1") != "0"
 # prompt tokens; off by default (exact prefill) until its agreement and needle recall are measured
 REPLAY = os.environ.get("TF_DS_REPLAY", "0") == "1"
 CHUNK_LOG = os.environ.get("TF_DS_CHUNK_LOG", "0") == "1"
+# TF_DS_ENGRAM_DONTNEED=1: after each prompt chunk, the Engram tables' cached pages are dropped (posix_fadvise
+# DONTNEED) on a thread of their own. A chunk's rows are random 256-byte reads in ~100 GB files, so their pages are
+# rarely read again; on a node with ~5 GiB free they push the kernel into reclaim and compaction, which stall the
+# chunk's GPU work. Decode reads (lane 2, O_DIRECT) use no page cache. The rows read are the same bytes either way.
+ENGRAM_DONTNEED = os.environ.get("TF_DS_ENGRAM_DONTNEED", "0") == "1"
+_drop_busy = threading.Lock()
+
+
+def _drop_pages(fds: list) -> None:
+    """Drop the cached pages of ``fds`` (holds _drop_busy, which the caller took)."""
+
+    try:
+        for fd in fds:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        pass
+    finally:
+        _drop_busy.release()
+
+
 # drafts verified a round chosen from the confidence head's prefix survival and measured window costs (0: fixed k)
 ADAPTIVE = os.environ.get("TF_DS_ADAPTIVE", "0") == "1"
 # before serving: caches at full size, the Triton kernels prompt chunks use, every decode graph (each window size at each
@@ -434,6 +454,9 @@ class DsEngine:
                     block = (pos_dev[i0:i1] - s, rows[i0:i1])
             tc = time.perf_counter()
             out = m.forward(sc, ids, s, taps=taps, host_ids=host[s:e], replay=replay, image=block)
+            if ENGRAM_DONTNEED and m.engram is not None and _drop_busy.acquire(blocking=False):
+                fds = sorted({f[0] for f in m.engram.files.values()})
+                threading.Thread(target=_drop_pages, args=(fds,), daemon=True).start()
             if CHUNK_LOG:
                 torch.cuda.synchronize()
                 print(f"[tensorfold] rank {self.rank} chunk at {s}: {time.perf_counter() - tc:.2f}s, allocated "
