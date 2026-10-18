@@ -37,6 +37,7 @@ GLM-5.3-Flash images run on MLX; dense Qwen's run on MLX and CUDA. See
 | GLM-5.3-Flash | `Vontra/GLM-5.3-Flash-MLX-4bit-MTP` | MLX on a 256 GB Mac, CUDA with two ranks | MTP; optional DFlash2 on CUDA |
 | Gemma 4 26B-A4B | `mlx-community/gemma-4-26b-a4b-it-4bit` | MLX | Context copies; `z-lab/gemma-4-26B-A4B-it-DFlash` is optional |
 | DeepSeek-V4-Flash | `mlx-community/DeepSeek-V4-Flash-4bit` | MLX on a 256 GB Mac | `Vontra/DeepSeek-V4-Flash-DSpark-MLX` or `Vontra/DeepSeek-V4-Flash-MTP-MLX` |
+| DeepSeek-V4.1-Flash-1017 (EXL3) | `LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw` with the Engram tables of `deepseek-ai/DeepSeek-V4.1-Flash-1017` | CUDA with two ranks (two DGX Spark), branch `deepseek-v41-tp2` | DSpark (5 drafts) |
 | Qwen3.8-27B (NVFP4) | `nvidia/Qwen3.8-27B-NVFP4` (ModelOpt: NVFP4 MLP, FP8 attention) | CUDA, one GPU | `z-lab/Qwen3.8-27B-DFlash2` and context copies |
 | Qwen3.8-27B (EXL3, experimental) | `turboderp/Qwen3.8-27B-exl3` (branches `3.00bpw`, `4.00bpw`; any codebook, 1 to 8 bits per weight) | CUDA | `z-lab/Qwen3.8-27B-DFlash2` and context copies |
 | Qwen3.8 Flash Next (EXL3, experimental) | `turboderp/Qwen3.8-Flash-Next-exl3` (branch `3.05bpw_h5_ng5`; any codebook, a width per tensor) | CUDA | Included MTP head and context copies |
@@ -80,6 +81,8 @@ DeepSeek-V4-Flash reads the mlx-community conversion (affine 4-bit/group-64 weig
 needs MLX 0.32.2 or later. Its draft heads are DeepSeek's DSpark blocks and MTP layer (MIT), converted:
 `tensorfold pull Vontra/DeepSeek-V4-Flash-DSpark-MLX` once and `serve` drafts with it; see
 [its recipe](docs/recipes/deepseek-v4-flash.md).
+
+DeepSeek-V4.1-Flash-1017 runs on the branch `deepseek-v41-tp2`: [bertholomus](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10)'s TP2 engine, plus forced tool calls on DeepSeek's DSML format, structured output on the speculative decoder, fault isolation for `--parallel` and a page-cache fix for long prompts (pull requests #1 to #4 of this fork). On two DGX Spark over ConnectX-7 it decodes at 57 tok/s (prose) and 92 tok/s (code), reads cold prompts at over 2,000 tok/s up to 64K tokens, and serves a 1M-token context. The setup scripts, the launch line and every measurement are in [the recipe](https://github.com/Elevatormusic/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark).
 
 See the [recipes](docs/recipes/README.md) for supported formats and backend limits.
 
