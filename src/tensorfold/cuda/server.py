@@ -22,7 +22,7 @@ from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
-from tensorfold.engine.call_gate import CallGate, ThinkBudget, ThinkLoop, call_format, generate_gated
+from tensorfold.engine.call_gate import DSML, CallGate, ThinkBudget, ThinkLoop, call_format, dsml_format, generate_gated
 from tensorfold.engine.tool_draft import ToolCallStreamer
 from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
@@ -641,11 +641,13 @@ class App:
             except Exception:  # noqa: BLE001 - a template that renders no calls: the opener alone
                 text = ""
             openers = [o for o in ("<tool_call>", "<|tool_call>") if self.tok.token_to_id(o) is not None]
-            self._form = call_format(text, "tfprobe_fn", openers) or ((openers[0], None, None) if openers else None)
+            form = call_format(text, "tfprobe_fn", openers) or ((openers[0], None, None) if openers else None)
+            dsml = dsml_format(text, "tfprobe_fn") if self.tok.token_to_id(DSML) is not None else None
+            self._form = dsml or (("", *form) if form else None)       # (head, opener, lead, tail)
         if self._form is None:
             raise RequestError('tool_choice "required" or a named function needs a chat template that marks tool calls '
-                               '(<tool_call> or <|tool_call>), and this one does not: send "auto"')
-        opener, lead, tail = self._form
+                               '(<tool_call>, <|tool_call> or DeepSeek\'s DSML), and this one does not: send "auto"')
+        head, opener, lead, tail = self._form
         eos = set(self.engine.eos)
 
         def text(token: int) -> str:
@@ -658,7 +660,7 @@ class App:
         names = [str((t.get("function") or t).get("name") or "") for t in tools] if lead is not None else []
         return CallGate.after_prompt(prompt, self.tok.token_to_id(opener), blank, think_open=think[0],
                                      think_end=think[1], text=text, lead=lead or "", names=names, tail=tail or "",
-                                     encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
+                                     head=head, encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
 
 
 def token_sha(tokens: list[int]) -> str:
