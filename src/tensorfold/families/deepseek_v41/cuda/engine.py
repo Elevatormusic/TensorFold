@@ -312,14 +312,14 @@ class DsEngine:
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
                  constraint=None, vision=None, **_: Any) -> dict[str, Any]:
-        if constraint is not None:
-            raise ValueError("structured output is not served by the DeepSeek-V4.1 engine yet")
+        from tensorfold.engine.grammar import pack
+
         stop_eos = bool(getattr(self.request, "stop_eos", True))
         if self.scheduler is not None:
             if vision is not None and getattr(vision, "spans", None) and self.tower is None:
                 raise ValueError("image input needs the server started with --vision")
             return self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft), on_tokens,
-                                         stop_eos=stop_eos, vision=vision)
+                                         stop_eos=stop_eos, vision=vision, constraint=constraint)
         positions, rows = [], None
         if vision is not None and getattr(vision, "spans", None):
             if self.tower is None:
@@ -332,13 +332,17 @@ class DsEngine:
         header = [max_tokens, int(stop_eos), int(draft), seed, *_f64(sampling.temperature if sampling else 0.0),
                   int(sampling.top_k) if sampling else 0, *_f64(sampling.top_p if sampling else 1.0),
                   *_f64(sampling.min_p if sampling else 0.0), len(positions)]
-        self._share(header)
+        packed = pack(constraint)                         # the reply's grammar: every rank masks its own logits
+        self._share([*header, len(packed)])
         self._share(list(prompt))
         image = None
         if positions:
             self._share(positions)
             image = (positions, self._share_rows(rows, len(positions)))
-        return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, draft, image=image)
+        if packed:
+            self._share(packed)
+        return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, draft, image=image,
+                         constraint=constraint)
 
     def follow(self) -> None:
         from tensorfold.engine.exact_sampling import Sampling
@@ -349,16 +353,22 @@ class DsEngine:
             self.multi.follow(Link(self.nccl.store, rank=self.rank, world=self.world, host=self._master))
             return
         while True:
-            (max_tokens, stop_eos, draft, seed, t0, t1, top_k, p0, p1, m0, m1, n_img) = self._share(None)
+            (max_tokens, stop_eos, draft, seed, t0, t1, top_k, p0, p1, m0, m1, n_img, n_grammar) = self._share(None)
             prompt = self._share(None)
             image = None
             if n_img:
                 positions = self._share(None)
                 image = (positions, self._share_rows(None, n_img))
+            constraint = None
+            if n_grammar:
+                from .constrain import follow as follow_grammar
+
+                constraint = follow_grammar(self, self._share(None))
             temperature = _f64_back(t0, t1)
             sampling = (Sampling(seed, temperature, top_k, _f64_back(p0, p1), _f64_back(m0, m1))
                         if temperature > 0 else None)
-            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, bool(draft), image=image)
+            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, bool(draft), image=image,
+                      constraint=constraint)
 
     # -- one request -----------------------------------------------------------------------------------------------
     def _sample(self, logits: torch.Tensor, positions: list[int], sampling) -> list[int]:
@@ -446,8 +456,11 @@ class DsEngine:
         return last
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable,
-             draft: bool, image: tuple | None = None) -> dict[str, Any]:
-        """``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16)."""
+             draft: bool, image: tuple | None = None, constraint=None) -> dict[str, Any]:
+        """``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16).
+        ``constraint``: the reply's grammar (``constrain``), or None."""
+        from . import constrain
+
         m = self.model
         eos = self.eos if stop_eos else ()
         if len(prompt) + max_tokens > self.limit:
@@ -466,14 +479,16 @@ class DsEngine:
         last = self.prefill(sc, dc, prompt, image)
         self.last_prefill_logits = last
         torch.cuda.empty_cache()          # a long prompt's chunk buffers back to the node (unified memory)
+        constrain.first(constraint, last)
         first = self._sample(last, [len(prompt)], sampling)[0]
+        constrain.advance(constraint, [first])
         stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0}
         t1 = time.perf_counter()
         if use_drafts:
-            out, st = self._spec(sc, dc, first, max_tokens, sampling, eos, on_tokens)
+            out, st = self._spec(sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint)
             stats.update(rounds=st[0], drafted=st[1], accepted=st[2], **self.last_spec_times)
         else:
-            out = self._serial(sc, first, max_tokens, sampling, eos, on_tokens)
+            out = self._serial(sc, first, max_tokens, sampling, eos, on_tokens, constraint)
         dt = time.perf_counter() - t1
         stats.update(decode_s=dt, tokens=len(out), tokens_per_second=(len(out) - 1) / dt if dt > 0 else 0.0,
                      sha256=hashlib.sha256(json.dumps(out).encode()).hexdigest()[:16])
@@ -484,17 +499,21 @@ class DsEngine:
                      if use_drafts else ""), flush=True)
         return stats
 
-    def _serial(self, sc, first, max_tokens, sampling, eos, on_tokens) -> list[int]:
+    def _serial(self, sc, first, max_tokens, sampling, eos, on_tokens, constraint=None) -> list[int]:
+        from . import constrain
+
         out = [first]
         on_tokens([first])
         tok = first
-        while len(out) < max_tokens and tok not in eos:
+        while len(out) < max_tokens and tok not in eos and not constrain.ended(constraint):
             p = sc.length
             if self.runner is not None:
                 lg, _ = self.runner.forward(sc, [tok], p, False)
             else:
                 lg = self.model.forward(sc, torch.tensor([tok], dtype=torch.long, device="cuda"), p, host_ids=[tok])
+            constrain.first(constraint, lg)
             tok = self._sample(lg, [p + 1], sampling)[0]
+            constrain.advance(constraint, [tok])
             out.append(tok)
             on_tokens([tok])
         return out
@@ -519,8 +538,11 @@ class DsEngine:
                 best, best_v = k, v
         return best
 
-    def _spec(self, sc, dc, first, max_tokens, sampling, eos, on_tokens):
-        """Drafts verified k at a time against the target's keyed samples (the serial rule)."""
+    def _spec(self, sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint=None):
+        """Drafts verified k at a time against the target's keyed samples (the serial rule); ``constraint`` cuts the
+        drafts its grammar cannot keep and masks the verify rows (``constrain``). The grammar never keeps a draft that
+        is its stop token, so a round ends at that token at most."""
+        from . import constrain
 
         m, d = self.model, self.drafter
         out = [first]
@@ -528,7 +550,7 @@ class DsEngine:
         tok = first
         rounds = drafted = accepted = 0
         t_draft = t_verify = t_absorb = 0.0
-        while len(out) < max_tokens and tok not in eos:
+        while len(out) < max_tokens and tok not in eos and not constrain.ended(constraint):
             P = sc.length
             ta = time.perf_counter()
             if self.runner is not None:
@@ -540,7 +562,9 @@ class DsEngine:
             kk = min(self.drafts, max_tokens - len(out), len(drafts))
             if ADAPTIVE and kk > 1:
                 kk = self._choose_k(_conf, kk, (tb - ta) * 1000)
-            window = [tok] + drafts[:kk]
+            drafts, gw = constrain.chain(constraint, tok, list(drafts[:kk]))
+            kk = len(drafts)
+            window = [tok] + drafts
             if self.runner is not None:
                 lg, tapt = self.runner.forward(sc, window, P, True)
                 taps = [tapt]
@@ -548,6 +572,7 @@ class DsEngine:
                 taps = []
                 lg = m.forward(sc, torch.tensor(window, dtype=torch.long, device="cuda"), P, all_logits=True,
                                taps=taps, host_ids=window)
+            constrain.mask(constraint, lg, gw)
             target = self._sample(lg, [P + 1 + i for i in range(kk + 1)], sampling)
             tc = time.perf_counter()
             t_verify += tc - tb
@@ -569,6 +594,7 @@ class DsEngine:
                     new = new[:i + 1]
                     break
             new = new[:max_tokens - len(out)]
+            constrain.advance(constraint, new)
             out += new
             on_tokens(new)
             tok = out[-1]

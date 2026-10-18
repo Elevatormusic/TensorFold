@@ -25,7 +25,8 @@ verify window in one forward a round, each reply exactly its solo run.
   give their room back, oldest first, whenever an admission needs it.
 
 Ported from our GLM-5.3 fork's ``glm_moe_dsa/cuda/multi.py`` (the same design, pipeline/CONCURRENCY-DESIGN.md).
-Structured output and logprobs are not served with ``--parallel``.
+Structured output: a stream's grammar goes with its admission to every rank, and each round cuts its drafts, masks its
+verify rows and follows its kept tokens on every rank (``constrain``). Logprobs are not served with ``--parallel``.
 """
 
 from __future__ import annotations
@@ -39,8 +40,11 @@ import torch
 
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
+from tensorfold.engine.grammar import GrammarError
+from tensorfold.engine.grammar import pack as pack_grammar
 
 from ..ops import HostIds
+from . import constrain
 from .model import RAW
 
 # the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the drafter's block of five
@@ -758,8 +762,8 @@ class MultiDecoder:
     def admit(self, s: Stream) -> None:
         """A request into the lowest free slot: its prompt fills the slot now, then it decodes in the rounds."""
 
-        if s.constraint is not None or s.probabilities is not None:
-            raise ValueError("structured output and logprobs are not served with --parallel on DeepSeek-V4.1")
+        if s.probabilities is not None:
+            raise ValueError("logprobs are not served with --parallel on DeepSeek-V4.1")
         room = self.extents.total - len(s.prompt) - self.max_rows - 8 - 4
         if room < 1:
             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.extents.total}-token "
@@ -779,7 +783,7 @@ class MultiDecoder:
             if far is not None:
                 reuse = ["disk", far[0], far[1]]
         self._send(["admit", list(s.prompt), s.count, _pack(s.sampling), bool(s.draft), bool(s.stop_eos), index,
-                    positions, reuse])
+                    positions, reuse, pack_grammar(s.constraint)])
         self._admit(s, index, positions, reuse)
 
     def _need(self, s: Stream) -> int:
@@ -797,7 +801,7 @@ class MultiDecoder:
         self._step(True)
         try:
             self._agree("admission", [self._shape(), list(s.prompt), s.count, _pack(s.sampling), bool(s.draft),
-                                      bool(s.stop_eos), index, positions, reuse])
+                                      bool(s.stop_eos), index, positions, reuse, pack_grammar(s.constraint)])
             self.ticks += 1
             need = self._need(s)
             disk = bool(reuse) and reuse[0] == "disk"
@@ -889,7 +893,6 @@ class MultiDecoder:
         """One chunk of a filling stream's prompt; at its last one its first token, and it decodes from the next
         round. Returns it if it ended there."""
 
-        e = self.e
         self._step(True)
         try:
             self._agree("fill", [self._shape(), s.sid])
@@ -907,17 +910,59 @@ class MultiDecoder:
                 return []
             self.filling.remove(s)
             s.steps = None
-            first = e._sample(last, [len(s.prompt)], s.sampling)[0]
+            first = self._first(s, last)
             s.started = time.perf_counter()
             s.pending = first
             self.streams[s.sid] = s
             s.take([first], self._ends(s))
+            self._grammar_end(s)
             return [s] if s.done else []
         except Exception as exc:
             self._broken(exc)
             raise
         finally:
             self._step(False)
+
+    def _first(self, s: Stream, last) -> int:
+        """The reply's first token from the prompt's last row, under the reply's grammar when it has one."""
+
+        try:
+            constrain.first(s.constraint, last)
+        except GrammarError as exc:
+            self._grammar_failed(s, exc)
+        first = self.e._sample(last, [len(s.prompt)], s.sampling)[0]
+        try:
+            constrain.advance(s.constraint, [first])
+        except GrammarError as exc:
+            self._grammar_failed(s, exc)
+        return first
+
+    @staticmethod
+    def _grammar_failed(s: Stream, exc: GrammarError) -> None:
+        """A reply whose grammar failed ends with that error at this round's end (every rank walks the same grammar
+        over the same tokens, so every rank ends it at the same round); the other streams go on."""
+
+        s.error, s.constraint = exc, None
+
+    @staticmethod
+    def _emit(s: Stream, new: list[int], ends) -> None:
+        """A round's kept tokens to the stream. A stream whose grammar failed in this round ends with that error and
+        sends none of them: they were sampled from logits the grammar no longer masked. Every rank walks the same
+        grammar over the same tokens, so every rank ends it at the same round."""
+
+        if s.error is not None:
+            s.done, s.finished = True, time.perf_counter()
+            return
+        s.take(new, ends)
+        MultiDecoder._grammar_end(s)
+
+    @staticmethod
+    def _grammar_end(s: Stream) -> None:
+        """A reply whose grammar has taken its stop token ends there, also with ignore_eos (``_ends`` is empty then).
+        Every rank walks the same grammar over the same tokens, so every rank ends it at the same round."""
+
+        if not s.done and constrain.ended(s.constraint):
+            s.done, s.finished = True, time.perf_counter()
 
     def _absorb_eager(self, items: list):
         """absorb_many of ``items`` on the side stream once the forward (on the current stream) has run; returns the
@@ -1065,10 +1110,16 @@ class MultiDecoder:
                     proposed[s.sid] = r[:kk]
                     confs[s.sid] = cf
             mark()
+            grammars: dict[int, object] = {}             # a constrained stream's verify window (``constrain.chain``)
             for s in live:
                 sc = s.st.sc
                 P = sc.length
                 drafts: list[int] = proposed.get(s.sid, [])
+                if s.constraint is not None:             # the drafts its grammar cannot keep are cut before the forward
+                    try:
+                        drafts, grammars[s.sid] = constrain.chain(s.constraint, s.pending, drafts)
+                    except GrammarError as exc:
+                        self._grammar_failed(s, exc)
                 window = [s.pending] + drafts
                 sc.host.set(P, window)
                 windows.append((s.st.index, s.base, s.size, P, window, sc.host.view()))
@@ -1091,6 +1142,11 @@ class MultiDecoder:
             absorbs = []
             for (s, P, drafts), (_, _, _, _, window, _) in zip(kept, windows):
                 n = len(window)
+                if s.constraint is not None and s.sid in grammars:
+                    try:
+                        constrain.mask(s.constraint, logits[r0:r0 + n], grammars[s.sid])
+                    except GrammarError as exc:
+                        self._grammar_failed(s, exc)
                 target = e._sample(logits[r0:r0 + n], [P + 1 + i for i in range(n)], s.sampling)
                 a = 0
                 while a < len(drafts) and drafts[a] == target[a]:
@@ -1120,9 +1176,14 @@ class MultiDecoder:
                         new = new[:i + 1]
                         break
                 new = new[:s.count - len(s.out)]
+                if s.constraint is not None:
+                    try:
+                        constrain.advance(s.constraint, new)
+                    except GrammarError as exc:
+                        self._grammar_failed(s, exc)
                 s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
                 s.pending = new[-1]
-                s.take(new, ends)
+                self._emit(s, new, ends)
                 tokens += len(new)
                 r0 += n
                 if s.done:
@@ -1269,8 +1330,9 @@ class MultiDecoder:
             kind = op[0]
             try:
                 if kind == "admit":
-                    _, prompt, count, sampling, draft, stop_eos, index, positions, reuse = op
-                    s = Stream(list(prompt), int(count), _unpack(sampling), draft=bool(draft), stop_eos=bool(stop_eos))
+                    _, prompt, count, sampling, draft, stop_eos, index, positions, reuse, packed = op
+                    s = Stream(list(prompt), int(count), _unpack(sampling), draft=bool(draft), stop_eos=bool(stop_eos),
+                               constraint=constrain.follow(self.e, packed))
                     s.emit = lambda new: None
                     s.keys = None
                     self._admit(s, int(index), list(positions), reuse)
