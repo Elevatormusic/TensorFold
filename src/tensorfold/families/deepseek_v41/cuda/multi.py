@@ -945,6 +945,18 @@ class MultiDecoder:
         s.error, s.constraint = exc, None
 
     @staticmethod
+    def _emit(s: Stream, new: list[int], ends) -> None:
+        """A round's kept tokens to the stream. A stream whose grammar failed in this round ends with that error and
+        sends none of them: they were sampled from logits the grammar no longer masked. Every rank walks the same
+        grammar over the same tokens, so every rank ends it at the same round."""
+
+        if s.error is not None:
+            s.done, s.finished = True, time.perf_counter()
+            return
+        s.take(new, ends)
+        MultiDecoder._grammar_end(s)
+
+    @staticmethod
     def _grammar_end(s: Stream) -> None:
         """A reply whose grammar has taken its stop token ends there, also with ignore_eos (``_ends`` is empty then).
         Every rank walks the same grammar over the same tokens, so every rank ends it at the same round."""
@@ -1171,8 +1183,7 @@ class MultiDecoder:
                         self._grammar_failed(s, exc)
                 s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
                 s.pending = new[-1]
-                s.take(new, ends)
-                self._grammar_end(s)
+                self._emit(s, new, ends)
                 tokens += len(new)
                 r0 += n
                 if s.done:
