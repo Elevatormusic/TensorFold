@@ -171,3 +171,17 @@ def test_a_parallel_stream_whose_grammar_has_ended_is_done_with_eos_off():
     stamp = s.finished
     multi.MultiDecoder._grammar_end(s)
     assert s.finished == stamp                                        # an ended stream keeps its end time
+
+
+def test_a_parallel_stream_whose_grammar_failed_sends_no_token_of_that_round():
+    c = constraint(Spec("choice", json.dumps(["yes", "no"])))
+    sent = []
+    s = Stream([1], 30, stop_eos=False, constraint=c, emit=lambda toks: sent.extend(toks))
+    multi.MultiDecoder._emit(s, ids("y"), ())
+    assert sent == ids("y") and not s.done
+    with pytest.raises(multi.GrammarError) as failed:
+        constrain.advance(c, ids("x"))                                # a token the grammar rejects
+    multi.MultiDecoder._grammar_failed(s, failed.value)
+    multi.MultiDecoder._emit(s, ids("x"), ())
+    assert sent == ids("y")                                           # the unmasked token is not sent
+    assert s.done and s.finished > 0.0 and s.error is failed.value and s.out == ids("y")
