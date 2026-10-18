@@ -1045,6 +1045,18 @@ class MultiDecoder:
               "the other streams go on", flush=True)
 
     @staticmethod
+    def _emit(s: Stream, new: list[int], ends) -> None:
+        """A round's kept tokens to the stream. A stream whose grammar failed in this round ends with that error and
+        sends none of them: they were sampled from logits the grammar no longer masked. Every rank walks the same
+        grammar over the same tokens, so every rank ends it at the same round."""
+
+        if s.error is not None:
+            s.done, s.finished = True, time.perf_counter()
+            return
+        s.take(new, ends)
+        MultiDecoder._grammar_end(s)
+
+    @staticmethod
     def _grammar_end(s: Stream) -> None:
         """A reply whose grammar has taken its stop token ends there, also with ignore_eos (``_ends`` is empty then).
         Every rank walks the same grammar over the same tokens, so every rank ends it at the same round."""
@@ -1153,12 +1165,13 @@ class MultiDecoder:
     def _differs(self, k: int) -> None:
         """A follower cannot run rank 0's round: a stream ended on this rank alone (``_stream_failed``), so it has no
         live stream or another draft depth. Rank 0 already waits in the round's digest check, so this rank takes part
-        in it with rank 0's depth: the shapes differ, the check fails on every rank, and each rank drops its streams.
+        in it with a plan rank 0 never sends (rank 0's depth and a marker): the check fails on every rank, also when
+        only the depths differ (``TF_DS_PARALLEL_DEPTH`` set apart on one rank), and each rank drops its streams.
         Does not return."""
 
         self._step(True)
         try:
-            self._agree("round", [self._shape(), k])
+            self._agree("round", [self._shape(), k, "out of step"])
         except Exception as exc:
             self._broken(exc)
             raise
@@ -1291,8 +1304,7 @@ class MultiDecoder:
                                 self._grammar_failed(s, exc)
                         s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
                         s.pending = new[-1]
-                        s.take(new, ends)
-                        self._grammar_end(s)
+                        self._emit(s, new, ends)
                         tokens += len(new)
                     except Exception as exc:             # noqa: BLE001  (this stream's own host work: only it fails)
                         self._stream_failed(s, exc)

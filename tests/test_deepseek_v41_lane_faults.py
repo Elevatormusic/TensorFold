@@ -359,6 +359,31 @@ def test_a_follower_check_that_passes_still_fails_the_step(multi, monkeypatch):
     assert ranks.calls == 1 and md.runner.calls == []
 
 
+class Sent(Ranks):
+    """``Ranks`` that keeps every row this rank sent."""
+
+    def __init__(self):
+        super().__init__(same=True)
+        self.rows = []
+
+    def gather(self, mine):
+        self.rows.append(mine.tolist())
+        return super().gather(mine)
+
+
+@pytest.mark.usefixtures("depths")
+def test_a_follower_with_only_another_depth_sends_a_digest_rank_0_cannot_match(multi, monkeypatch):
+    md = decoder(multi, sampler())
+    md.depth_most = 5
+    admitted(multi, md, stream(multi, 13), stream(multi, 14))  # same streams as rank 0; this rank's depth is 5
+    ranked(monkeypatch, md, 1)
+    md.m.comm = sent = Sent()
+    md._agree("round", [md._shape(), 3])                         # what rank 0 sends for its round at depth 3
+    with pytest.raises(multi.OutOfStep):
+        md.round(told=["round", 3])
+    assert len(sent.rows) == 2 and sent.rows[1] != sent.rows[0]   # so rank 0's check fails too: no hang
+
+
 @pytest.mark.usefixtures("depths")
 def test_a_follower_with_rank_0s_depth_runs_the_round_after_one_check(multi, monkeypatch):
     md = decoder(multi, sampler())
