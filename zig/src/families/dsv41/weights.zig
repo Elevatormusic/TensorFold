@@ -139,6 +139,14 @@ pub const Source = union(enum) {
         };
     }
 
+    /// The dtype `key`'s entry is stored in (a key's own dtype request does not apply: this is the bytes').
+    pub fn dtype(s: Source, key: []const u8) !rank_cache.DType {
+        return switch (s) {
+            .cache => |c| (c.index.get(key) orelse return error.MissingEntry).dtype,
+            .shards => |sh| (try checkpoint.describe(sh, key)).dtype,
+        };
+    }
+
     pub fn read(s: Source, key: []const u8, out: []u8) !void {
         switch (s) {
             .cache => |c| {
@@ -281,6 +289,19 @@ const Loader = struct {
     fn plain(L: *Loader, tensor: []const u8, dtype: ?rank_cache.DType) !u64 {
         var kb: [256]u8 = undefined;
         return L.upload(tensor, try L.entry(try plan.plainKey(&kb, tensor, dtype)));
+    }
+
+    /// The MTP markov head, which the kernel reads as fp16: a pack that holds it in bf16 (the 1017 checkpoint's own
+    /// dtype; the converter casts it to f16, a community quant may not) is converted exactly at load, and an f16 head
+    /// is uploaded as it is. The cache key stays the checkpoint's own dtype, so no rank cache is invalidated.
+    fn markovHead(L: *Loader, tensor: []const u8) !u64 {
+        var kb: [256]u8 = undefined;
+        const key = try plan.plainKey(&kb, tensor, null);
+        const src = try L.entry(key);
+        if ((try L.src.dtype(key)) != .bf16) return L.upload(tensor, src);
+        try L.aux.resize(L.gpa, src.len);
+        checkpoint.narrowBfloat(src, L.aux.items);
+        return L.upload(tensor, L.aux.items);
     }
 
     /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips.
@@ -617,7 +638,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
             .main_norm = try L.plain("mtp.0.main_norm.weight", null),
             .norm = try L.plain(try std.fmt.bufPrint(&tb, "{s}.norm.weight", .{last}), null),
             .markov_embed = try L.plain(try std.fmt.bufPrint(&tb, "{s}.markov_head.embed.weight", .{last}), null),
-            .markov_head = try L.plain(try std.fmt.bufPrint(&tb, "{s}.markov_head.head.weight", .{last}), null),
+            .markov_head = try L.markovHead(try std.fmt.bufPrint(&tb, "{s}.markov_head.head.weight", .{last})),
             .conf = try L.plain(try std.fmt.bufPrint(&tb, "{s}.confidence_head.proj.weight", .{last}), null),
         };
     }

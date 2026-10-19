@@ -1,0 +1,345 @@
+{
+ "note": "The tensor names, dtypes and shapes are the real packs' headers (read only, over ssh where the pack lives on another host); data_offsets are rebased into a compact fixture body.",
+ "packs": [
+  {
+   "name": "ours-4.0bpw",
+   "title": "ours 4.0 bpw (bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-4.0bpw, tank publish)",
+   "source": "/tank/models/llm/publish/DeepSeek-V4.1-Flash-1017-EXL3-4.0bpw",
+   "files": [
+    {
+     "name": "model-00001-of-00041.safetensors",
+     "header": "{\"layers.1.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.1.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]}}",
+     "body_bytes": 81920
+    },
+    {
+     "name": "model-00002-of-00041.safetensors",
+     "header": "{\"layers.1.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.1.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]}}",
+     "body_bytes": 81920
+    },
+    {
+     "name": "model-00014-of-00041.safetensors",
+     "header": "{\"layers.14.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.14.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]}}",
+     "body_bytes": 81920
+    },
+    {
+     "name": "model-00015-of-00041.safetensors",
+     "header": "{\"layers.14.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.14.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]}}",
+     "body_bytes": 81920
+    },
+    {
+     "name": "model-00041-of-00041.safetensors",
+     "header": "{\"mtp.2.markov_head.markov_w1.weight\":{\"dtype\":\"BF16\",\"shape\":[129280,256],\"data_offsets\":[0,66191360]},\"mtp.2.markov_head.markov_w2.weight\":{\"dtype\":\"F16\",\"shape\":[129280,256],\"data_offsets\":[66191360,132382720]}}",
+     "body_bytes": 132382720
+    }
+   ],
+   "checks": [
+    {
+     "key": "mtp.2.markov_head.embed.weight|None",
+     "source": "mtp.2.markov_head.markov_w1.weight",
+     "source_dtype": "BF16",
+     "want": "same",
+     "dtype": "BF16"
+    },
+    {
+     "key": "mtp.2.markov_head.head.weight|None",
+     "source": "mtp.2.markov_head.markov_w2.weight",
+     "source_dtype": "F16",
+     "want": "same",
+     "dtype": "F16"
+    },
+    {
+     "key": "layers.1.engram.q_weight|torch.float32",
+     "source": "layers.1.engram.q_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.1.engram.k_weight|torch.float32",
+     "source": "layers.1.engram.k_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.q_weight|torch.float32",
+     "source": "layers.14.engram.q_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.k_weight|torch.float32",
+     "source": "layers.14.engram.k_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    }
+   ]
+  },
+  {
+   "name": "work-2.9bpw",
+   "title": "work 2.9 bpw download (tank work/dsv41-1017-exl3-2.9bpw)",
+   "source": "/tank/models/llm/work/dsv41-1017-exl3-2.9bpw",
+   "files": [
+    {
+     "name": "model-00001-of-00041.safetensors",
+     "header": "{\"layers.1.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.1.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]}}",
+     "body_bytes": 81920
+    },
+    {
+     "name": "model-00002-of-00041.safetensors",
+     "header": "{\"layers.1.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.1.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]}}",
+     "body_bytes": 81920
+    },
+    {
+     "name": "model-00014-of-00041.safetensors",
+     "header": "{\"layers.14.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.14.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]}}",
+     "body_bytes": 81920
+    },
+    {
+     "name": "model-00015-of-00041.safetensors",
+     "header": "{\"layers.14.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.14.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]}}",
+     "body_bytes": 81920
+    },
+    {
+     "name": "model-00041-of-00041.safetensors",
+     "header": "{\"mtp.2.markov_head.markov_w1.weight\":{\"dtype\":\"BF16\",\"shape\":[129280,256],\"data_offsets\":[0,66191360]},\"mtp.2.markov_head.markov_w2.weight\":{\"dtype\":\"F16\",\"shape\":[129280,256],\"data_offsets\":[66191360,132382720]}}",
+     "body_bytes": 132382720
+    }
+   ],
+   "checks": [
+    {
+     "key": "mtp.2.markov_head.embed.weight|None",
+     "source": "mtp.2.markov_head.markov_w1.weight",
+     "source_dtype": "BF16",
+     "want": "same",
+     "dtype": "BF16"
+    },
+    {
+     "key": "mtp.2.markov_head.head.weight|None",
+     "source": "mtp.2.markov_head.markov_w2.weight",
+     "source_dtype": "F16",
+     "want": "same",
+     "dtype": "F16"
+    },
+    {
+     "key": "layers.1.engram.q_weight|torch.float32",
+     "source": "layers.1.engram.q_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.1.engram.k_weight|torch.float32",
+     "source": "layers.1.engram.k_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.q_weight|torch.float32",
+     "source": "layers.14.engram.q_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.k_weight|torch.float32",
+     "source": "layers.14.engram.k_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    }
+   ]
+  },
+  {
+   "name": "a5-2.9bpw-prepared",
+   "title": "A5 2.9 bpw prepared pack (ascent-05 ~/models/deepseek-v41-1017-exl3-2.9bpw/model)",
+   "source": "/home/bertholomus/models/deepseek-v41-1017-exl3-2.9bpw",
+   "files": [
+    {
+     "name": "model-00002-of-00043.safetensors",
+     "header": "{\"layers.1.engram.q_weight\":{\"dtype\":\"F32\",\"shape\":[4,5120],\"data_offsets\":[0,81920]},\"layers.1.engram.k_weight\":{\"dtype\":\"F32\",\"shape\":[4,5120],\"data_offsets\":[81920,163840]}}",
+     "body_bytes": 163840
+    },
+    {
+     "name": "model-00015-of-00043.safetensors",
+     "header": "{\"layers.14.engram.q_weight\":{\"dtype\":\"F32\",\"shape\":[4,5120],\"data_offsets\":[0,81920]},\"layers.14.engram.k_weight\":{\"dtype\":\"F32\",\"shape\":[4,5120],\"data_offsets\":[81920,163840]}}",
+     "body_bytes": 163840
+    },
+    {
+     "name": "model-00043-of-00043.safetensors",
+     "header": "{\"mtp.2.markov_head.embed.weight\":{\"dtype\":\"BF16\",\"shape\":[129280,256],\"data_offsets\":[0,66191360]},\"mtp.2.markov_head.head.weight\":{\"dtype\":\"F16\",\"shape\":[129280,256],\"data_offsets\":[66191360,132382720]}}",
+     "body_bytes": 132382720
+    }
+   ],
+   "checks": [
+    {
+     "key": "mtp.2.markov_head.embed.weight|None",
+     "source": "mtp.2.markov_head.embed.weight",
+     "source_dtype": "BF16",
+     "want": "same",
+     "dtype": "BF16"
+    },
+    {
+     "key": "mtp.2.markov_head.head.weight|None",
+     "source": "mtp.2.markov_head.head.weight",
+     "source_dtype": "F16",
+     "want": "same",
+     "dtype": "F16"
+    },
+    {
+     "key": "layers.1.engram.q_weight|torch.float32",
+     "source": "layers.1.engram.q_weight",
+     "source_dtype": "F32",
+     "want": "same",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.1.engram.k_weight|torch.float32",
+     "source": "layers.1.engram.k_weight",
+     "source_dtype": "F32",
+     "want": "same",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.q_weight|torch.float32",
+     "source": "layers.14.engram.q_weight",
+     "source_dtype": "F32",
+     "want": "same",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.k_weight|torch.float32",
+     "source": "layers.14.engram.k_weight",
+     "source_dtype": "F32",
+     "want": "same",
+     "dtype": "F32"
+    }
+   ]
+  },
+  {
+   "name": "a6-jayleaton-2.8bpw",
+   "title": "A6 jayleaton 2.8 bpw (ascent-06 ~/ai/models/jayleaton-...-2.8bpw)",
+   "source": "/home/bertholomus/ai/models/jayleaton-DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw--859396591c34",
+   "files": [
+    {
+     "name": "native.safetensors",
+     "header": "{\"layers.1.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[0,40960]},\"layers.1.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[40960,81920]},\"layers.14.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[81920,122880]},\"layers.14.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[4,5120],\"data_offsets\":[122880,163840]},\"mtp.2.markov_head.embed.weight\":{\"dtype\":\"BF16\",\"shape\":[129280,256],\"data_offsets\":[163840,66355200]},\"mtp.2.markov_head.head.weight\":{\"dtype\":\"BF16\",\"shape\":[129280,256],\"data_offsets\":[66355200,132546560]}}",
+     "body_bytes": 132546560
+    }
+   ],
+   "checks": [
+    {
+     "key": "mtp.2.markov_head.embed.weight|None",
+     "source": "mtp.2.markov_head.embed.weight",
+     "source_dtype": "BF16",
+     "want": "same",
+     "dtype": "BF16"
+    },
+    {
+     "key": "mtp.2.markov_head.head.weight|None",
+     "source": "mtp.2.markov_head.head.weight",
+     "source_dtype": "BF16",
+     "want": "same",
+     "dtype": "BF16"
+    },
+    {
+     "key": "layers.1.engram.q_weight|torch.float32",
+     "source": "layers.1.engram.q_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.1.engram.k_weight|torch.float32",
+     "source": "layers.1.engram.k_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.q_weight|torch.float32",
+     "source": "layers.14.engram.q_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.k_weight|torch.float32",
+     "source": "layers.14.engram.k_weight",
+     "source_dtype": "BF16",
+     "want": "f32",
+     "dtype": "F32"
+    }
+   ]
+  },
+  {
+   "name": "september-2.9bpw",
+   "title": "September 2.9 bpw served pack (tank banked/DeepSeek-V4.1-Flash-EXL3-2.9bpw--64ba41b6)",
+   "source": "/tank/models/llm/banked/DeepSeek-V4.1-Flash-EXL3-2.9bpw--64ba41b6",
+   "files": [
+    {
+     "name": "model-00002-of-00039.safetensors",
+     "header": "{\"layers.1.engram.q_weight\":{\"dtype\":\"F32\",\"shape\":[4,5120],\"data_offsets\":[0,81920]},\"layers.1.engram.k_weight\":{\"dtype\":\"F32\",\"shape\":[4,5120],\"data_offsets\":[81920,163840]}}",
+     "body_bytes": 163840
+    },
+    {
+     "name": "model-00015-of-00039.safetensors",
+     "header": "{\"layers.14.engram.q_weight\":{\"dtype\":\"F32\",\"shape\":[4,5120],\"data_offsets\":[0,81920]},\"layers.14.engram.k_weight\":{\"dtype\":\"F32\",\"shape\":[4,5120],\"data_offsets\":[81920,163840]}}",
+     "body_bytes": 163840
+    },
+    {
+     "name": "model-00039-of-00039.safetensors",
+     "header": "{\"mtp.2.markov_head.embed.weight\":{\"dtype\":\"BF16\",\"shape\":[129280,256],\"data_offsets\":[0,66191360]},\"mtp.2.markov_head.head.weight\":{\"dtype\":\"F16\",\"shape\":[129280,256],\"data_offsets\":[66191360,132382720]}}",
+     "body_bytes": 132382720
+    }
+   ],
+   "checks": [
+    {
+     "key": "mtp.2.markov_head.embed.weight|None",
+     "source": "mtp.2.markov_head.embed.weight",
+     "source_dtype": "BF16",
+     "want": "same",
+     "dtype": "BF16"
+    },
+    {
+     "key": "mtp.2.markov_head.head.weight|None",
+     "source": "mtp.2.markov_head.head.weight",
+     "source_dtype": "F16",
+     "want": "same",
+     "dtype": "F16"
+    },
+    {
+     "key": "layers.1.engram.q_weight|torch.float32",
+     "source": "layers.1.engram.q_weight",
+     "source_dtype": "F32",
+     "want": "same",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.1.engram.k_weight|torch.float32",
+     "source": "layers.1.engram.k_weight",
+     "source_dtype": "F32",
+     "want": "same",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.q_weight|torch.float32",
+     "source": "layers.14.engram.q_weight",
+     "source_dtype": "F32",
+     "want": "same",
+     "dtype": "F32"
+    },
+    {
+     "key": "layers.14.engram.k_weight|torch.float32",
+     "source": "layers.14.engram.k_weight",
+     "source_dtype": "F32",
+     "want": "same",
+     "dtype": "F32"
+    }
+   ]
+  }
+ ]
+}

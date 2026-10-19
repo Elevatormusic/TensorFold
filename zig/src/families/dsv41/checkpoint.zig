@@ -4,6 +4,8 @@ const std = @import("std");
 const core = @import("core");
 const st = core.safetensors;
 const DType = @import("rank_cache.zig").DType;
+const Config = @import("config.zig").Config;
+const plan = @import("plan.zig");
 
 /// One planned entry's layout once read.
 pub const Slice = struct {
@@ -117,12 +119,28 @@ fn dtypeOf(d: st.DType) !DType {
 
 const Source = struct { t: st.Tensor, name: []const u8 };
 
+/// The 1017 converter's name for one of the engine's MTP markov head names: markov_w1 is the engine's embed.weight,
+/// markov_w2 its head.weight. Null for every other tensor. A pack written with the engine's own names resolves
+/// before this is tried, so the September packs (and every earlier one) read exactly as they did.
+fn converterName(name: []const u8, buf: []u8) ?[]const u8 {
+    const markov = ".markov_head.";
+    const weight = ".weight";
+    const at = std.mem.lastIndexOf(u8, name, markov) orelse return null;
+    if (!std.mem.endsWith(u8, name, weight) or name.len < at + markov.len + weight.len) return null;
+    const which = name[at + markov.len .. name.len - weight.len];
+    const conv = if (std.mem.eql(u8, which, "embed")) "markov_w1" else if (std.mem.eql(u8, which, "head")) "markov_w2" else return null;
+    return std.fmt.bufPrint(buf, "{s}{s}{s}{s}", .{ name[0..at], markov, conv, weight }) catch null;
+}
+
 fn source(sh: *const Shards, k: Key, buf: []u8) !Source {
     const name = if (!k.exl3) k.name else blk: {
         const tail = if (std.mem.eql(u8, k.part, "tr")) "trellis" else if (std.mem.eql(u8, k.part, "suh")) "suh" else if (std.mem.eql(u8, k.part, "svh")) "svh" else return error.BadKey;
         break :blk try std.fmt.bufPrint(buf, "{s}.{s}", .{ k.name, tail });
     };
-    return .{ .t = sh.get(name) orelse return error.MissingTensor, .name = name };
+    if (sh.get(name)) |t| return .{ .t = t, .name = name };
+    var conv_buf: [256]u8 = undefined;
+    const conv = converterName(name, &conv_buf) orelse return error.MissingTensor;
+    return .{ .t = sh.get(conv) orelse return error.MissingTensor, .name = conv };
 }
 
 /// The layout `key` reads into.
@@ -179,6 +197,9 @@ pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u
         const from = try dtypeOf(t.dtype);
         if (k.dtype == null or k.dtype.? == from) return @memcpy(out, t.bytes);
         if (from == .f16 and k.dtype.? == .f32) return widenHalf(t.bytes, out);
+        // the 1017 quants hold the Engram q_weight / k_weight tables in bf16; the engine reads them as f32, and the
+        // widening is exact (bf16 is an f32's top 16 bits), as the Python loader's .to(torch.float32) is.
+        if (from == .bf16 and k.dtype.? == .f32) return widenBfloat(t.bytes, out);
         return error.UnsupportedConversion;
     }
     const es = (try dtypeOf(t.dtype)).size();
@@ -210,6 +231,27 @@ fn widenHalf(src: []const u8, out: []u8) void {
     }
 }
 
+/// bf16 -> f32, exact (the same .to(torch.float32) of a bf16 tensor: bf16 is an f32's top 16 bits).
+fn widenBfloat(src: []const u8, out: []u8) void {
+    const n = src.len / 2;
+    for (0..n) |i| {
+        const bits = std.mem.readInt(u16, src[2 * i ..][0..2], .little);
+        std.mem.writeInt(u32, out[4 * i ..][0..4], @as(u32, bits) << 16, .little);
+    }
+}
+
+/// bf16 -> f16 for a tensor the kernel reads as fp16 (the MTP markov head; the 1017 checkpoint itself holds it in
+/// bf16). Exact for every value f16 holds: bf16's 7 mantissa bits fit f16's 10, and the head's weights are far inside
+/// f16's range; a value outside it saturates, as a cast does.
+pub fn narrowBfloat(src: []const u8, out: []u8) void {
+    const n = src.len / 2;
+    for (0..n) |i| {
+        const bits = std.mem.readInt(u16, src[2 * i ..][0..2], .little);
+        const h: f16 = @floatCast(@as(f32, @bitCast(@as(u32, bits) << 16)));
+        std.mem.writeInt(u16, out[2 * i ..][0..2], @bitCast(h), .little);
+    }
+}
+
 test "loader keys parse as Python prints them" {
     const p = try Key.parse("layers.3.ffn.experts.17.w2|None|(1152, 2304)|tr");
     try std.testing.expect(p.exl3 and p.cols == null and p.rows.?[0] == 1152 and p.rows.?[1] == 2304);
@@ -217,6 +259,116 @@ test "loader keys parse as Python prints them" {
     try std.testing.expect(!q.exl3 and q.dtype.? == .f32);
     try std.testing.expectError(error.BadKey, Key.parse("a|b|c"));
     try std.testing.expectError(error.BadKey, Key.parse("a|(2, 1)|None|tr"));
+}
+
+test "the 1017 converter's markov names map to the engine's, and nothing else does" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("mtp.2.markov_head.markov_w1.weight", converterName("mtp.2.markov_head.embed.weight", &buf).?);
+    try std.testing.expectEqualStrings("mtp.2.markov_head.markov_w2.weight", converterName("mtp.2.markov_head.head.weight", &buf).?);
+    try std.testing.expect(converterName("mtp.2.markov_head.markov_w1.weight", &buf) == null);
+    try std.testing.expect(converterName("layers.1.engram.q_weight", &buf) == null);
+    try std.testing.expect(converterName("embed.weight", &buf) == null);
+    try std.testing.expect(converterName("mtp.2.markov_head.embed.scale", &buf) == null);
+}
+
+test "bf16 -> f16 keeps every value f16 holds" {
+    const vals = [_]f32{ 0.5, -2.0, 0.0234375, 65504.0, 0.0, 1.0, -0.0 };
+    var src: [vals.len * 2]u8 = undefined;
+    for (vals, 0..) |v, i| {
+        const bf: u16 = @truncate(@as(u32, @bitCast(v)) >> 16);
+        std.mem.writeInt(u16, src[2 * i ..][0..2], bf, .little);
+    }
+    var out: [vals.len * 2]u8 = undefined;
+    narrowBfloat(&src, &out);
+    for (0..vals.len) |i| {
+        // the value the bf16 actually holds (65504 is not bf16-representable: it rounds to 65280)
+        const bf = std.mem.readInt(u16, src[2 * i ..][0..2], .little);
+        const expected: f32 = @bitCast(@as(u32, bf) << 16);
+        const h: f16 = @bitCast(std.mem.readInt(u16, out[2 * i ..][0..2], .little));
+        try std.testing.expectEqual(expected, @as(f32, h));
+    }
+}
+
+test "a 1017 pack: converter markov names and bf16 Engram read as the engine's keys" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // the 1017 quant's header entries: markov_w1 / markov_w2 and the Engram q / k in bf16
+    var body: [32]u8 = undefined;
+    for (&body, 0..) |*x, i| x.* = @truncate(i * 7 + 3);
+    const json = "{\"mtp.2.markov_head.markov_w1.weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}," ++
+        "\"mtp.2.markov_head.markov_w2.weight\":{\"dtype\":\"F16\",\"shape\":[2,2],\"data_offsets\":[8,16]}," ++
+        "\"layers.1.engram.q_weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[16,24]}," ++
+        "\"layers.1.engram.k_weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[24,32]}}";
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, json.len, .little);
+    try file.appendSlice(a, &len);
+    try file.appendSlice(a, json);
+    try file.appendSlice(a, &body);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = file.items });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+    var sh = try Shards.open(a, io, dir);
+    defer sh.close(io);
+    // the engine's names find the converter's tensors, byte for byte
+    const embed = try describe(&sh, "mtp.2.markov_head.embed.weight|None");
+    try std.testing.expectEqual(DType.bf16, embed.dtype);
+    try std.testing.expectEqual(@as(usize, 8), embed.bytes);
+    var got: [8]u8 = undefined;
+    try read(&sh, "mtp.2.markov_head.embed.weight|None", &got);
+    try std.testing.expectEqualSlices(u8, body[0..8], &got);
+    try read(&sh, "mtp.2.markov_head.head.weight|None", &got);
+    try std.testing.expectEqualSlices(u8, body[8..16], &got);
+    // the Engram q / k the pack holds in bf16 read as f32, exactly
+    const q = try describe(&sh, "layers.1.engram.q_weight|torch.float32");
+    try std.testing.expectEqual(DType.f32, q.dtype);
+    try std.testing.expectEqual(@as(usize, 16), q.bytes);
+    var wide: [16]u8 = undefined;
+    try read(&sh, "layers.1.engram.q_weight|torch.float32", &wide);
+    for (0..4) |i| {
+        const bits = std.mem.readInt(u16, body[16 + 2 * i ..][0..2], .little);
+        try std.testing.expectEqual(@as(u32, bits) << 16, std.mem.readInt(u32, wide[4 * i ..][0..4], .little));
+    }
+    var wide_k: [16]u8 = undefined;
+    try read(&sh, "layers.1.engram.k_weight|torch.float32", &wide_k);
+    for (0..4) |i| {
+        const bits = std.mem.readInt(u16, body[24 + 2 * i ..][0..2], .little);
+        try std.testing.expectEqual(@as(u32, bits) << 16, std.mem.readInt(u32, wide_k[4 * i ..][0..4], .little));
+    }
+}
+
+test "a pack with the engine's own names reads them as before: the converter's name never wins" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var body: [24]u8 = undefined;
+    for (&body, 0..) |*x, i| x.* = @truncate(i * 11 + 5);
+    const json = "{\"mtp.2.markov_head.embed.weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}," ++
+        "\"mtp.2.markov_head.markov_w1.weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[8,16]}," ++
+        "\"layers.1.engram.q_weight\":{\"dtype\":\"F32\",\"shape\":[1,2],\"data_offsets\":[16,24]}}";
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, json.len, .little);
+    try file.appendSlice(a, &len);
+    try file.appendSlice(a, json);
+    try file.appendSlice(a, &body);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = file.items });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+    var sh = try Shards.open(a, io, dir);
+    defer sh.close(io);
+    var got: [8]u8 = undefined;
+    try read(&sh, "mtp.2.markov_head.embed.weight|None", &got);
+    try std.testing.expectEqualSlices(u8, body[0..8], &got);
+    // an f32 table the engine reads as f32 is copied, not converted (the September packs' shape)
+    var f32_got: [8]u8 = undefined;
+    try read(&sh, "layers.1.engram.q_weight|torch.float32", &f32_got);
+    try std.testing.expectEqualSlices(u8, body[16..24], &f32_got);
 }
 
 test "column, row and whole slices of a toy trellis and its scales" {
@@ -279,4 +431,145 @@ test "column, row and whole slices of a toy trellis and its scales" {
     try read(&sh, "g.bias|torch.float32", &wide);
     const h0: f16 = @bitCast(std.mem.readInt(u16, body[224..226], .little));
     try std.testing.expectEqual(@as(f32, h0), @as(f32, @bitCast(std.mem.readInt(u32, wide[0..4], .little))));
+}
+
+const fixture_1017 = @embedFile("fixtures/1017-headers.json");
+
+/// One pack of the fixture: its shards rebuilt from the real headers (a pattern in the body), then every check read
+/// under the engine's key and compared with the pack's own tensor.
+fn fixturePack(a: std.mem.Allocator, io: std.Io, pack: std.json.Value) !void {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for (pack.object.get("files").?.array.items) |fv| {
+        const f = fv.object;
+        const name = f.get("name").?.string;
+        const header = f.get("header").?.string;
+        const body_bytes: usize = @intCast(f.get("body_bytes").?.integer);
+        var file: std.ArrayList(u8) = .empty;
+        defer file.deinit(a);
+        var len: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len, header.len, .little);
+        try file.appendSlice(a, &len);
+        try file.appendSlice(a, header);
+        const start = file.items.len;
+        try file.resize(a, start + body_bytes);
+        for (file.items[start..], 0..) |*x, i| x.* = @truncate(i * 37 + 11);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = file.items });
+    }
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+    var sh = try Shards.open(a, io, dir);
+    defer sh.close(io);
+    for (pack.object.get("checks").?.array.items) |cv| {
+        const c = cv.object;
+        const key = c.get("key").?.string;
+        const src_name = c.get("source").?.string;
+        const want = c.get("want").?.string;
+        const dtype_text = c.get("dtype").?.string;
+        const want_dtype: DType = if (std.mem.eql(u8, dtype_text, "BF16")) .bf16 else if (std.mem.eql(u8, dtype_text, "F16")) .f16 else if (std.mem.eql(u8, dtype_text, "F32")) .f32 else return error.BadFixture;
+        const src = sh.get(src_name) orelse return error.MissingTensor;
+        const slice = try describe(&sh, key);
+        try std.testing.expectEqual(want_dtype, slice.dtype);
+        const got = try a.alloc(u8, slice.bytes);
+        defer a.free(got);
+        try read(&sh, key, got);
+        if (std.mem.eql(u8, want, "same")) {
+            try std.testing.expectEqualSlices(u8, src.bytes, got);
+        } else if (std.mem.eql(u8, want, "f32")) {
+            try std.testing.expectEqual(src.bytes.len * 2, got.len);
+            for (0..src.bytes.len / 2) |i| {
+                const bits = std.mem.readInt(u16, src.bytes[2 * i ..][0..2], .little);
+                try std.testing.expectEqual(@as(u32, bits) << 16, std.mem.readInt(u32, got[4 * i ..][0..4], .little));
+            }
+        } else return error.BadFixture;
+    }
+}
+
+test "1017 packs from their real headers: converter markov names and bf16 Engram read as the engine's keys" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, fixture_1017, .{});
+    defer parsed.deinit();
+    for (parsed.value.object.get("packs").?.array.items) |pack| try fixturePack(a, io, pack);
+}
+
+test "a real pack reads under the engine's keys (TF_DSV41_PACK): 1017 markov names and Engram dtypes" {
+    const dir = std.c.getenv("TF_DSV41_PACK") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var sh = try Shards.open(a, io, std.mem.span(dir));
+    defer sh.close(io);
+    // the MTP markov head: the engine's names read the pack's own tensor or the 1017 converter's, byte for byte
+    for ([_][]const u8{ "mtp.2.markov_head.embed.weight", "mtp.2.markov_head.head.weight" }) |name| {
+        var kb: [128]u8 = undefined;
+        const key = try std.fmt.bufPrint(&kb, "{s}|None", .{name});
+        var buf: [256]u8 = undefined;
+        const src = try source(&sh, try Key.parse(key), &buf);
+        const got = try a.alloc(u8, src.t.bytes.len);
+        defer a.free(got);
+        try read(&sh, key, got);
+        try std.testing.expectEqualSlices(u8, src.t.bytes, got);
+    }
+    // the Engram q / k: the engine reads f32; a bf16 table widens exactly, an f32 one is copied
+    for ([_][]const u8{ "layers.1.engram.q_weight", "layers.1.engram.k_weight", "layers.14.engram.q_weight", "layers.14.engram.k_weight" }) |name| {
+        var kb: [128]u8 = undefined;
+        var nb: [128]u8 = undefined;
+        const key = try std.fmt.bufPrint(&kb, "{s}|torch.float32", .{name});
+        const raw_key = try std.fmt.bufPrint(&nb, "{s}|None", .{name});
+        const src = sh.get(name) orelse return error.MissingTensor;
+        const from = (try describe(&sh, raw_key)).dtype;
+        const got = try a.alloc(u8, (try describe(&sh, key)).bytes);
+        defer a.free(got);
+        try read(&sh, key, got);
+        if (from == .f32) {
+            try std.testing.expectEqualSlices(u8, src.bytes, got);
+        } else if (from == .bf16) {
+            try std.testing.expectEqual(src.bytes.len * 2, got.len);
+            for (0..src.bytes.len / 2) |i| {
+                const bits = std.mem.readInt(u16, src.bytes[2 * i ..][0..2], .little);
+                try std.testing.expectEqual(@as(u32, bits) << 16, std.mem.readInt(u32, got[4 * i ..][0..4], .little));
+            }
+        } else return error.UnsupportedConversion;
+    }
+    std.debug.print("TF_DSV41_PACK {s}: the markov head names and the Engram q/k read under the engine's keys\n", .{std.mem.span(dir)});
+}
+
+test "a pack's planned entries read to one digest (TF_DSV41_DIGEST_PACK): the loader's byte contract across builds" {
+    const dir = std.c.getenv("TF_DSV41_DIGEST_PACK") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    // the plan's keys are many small allocations: one arena, freed with the test
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const cfg = try Config.read(arena.allocator(), io, std.mem.span(dir));
+    var sh = try Shards.open(a, io, std.mem.span(dir));
+    defer sh.close(io);
+    const wants = try plan.wants(arena.allocator(), cfg, .{ .rank = 0, .world = 2 }, true);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    var n: usize = 0;
+    var bytes: usize = 0;
+    for (wants) |w| {
+        const bar = std.mem.indexOfScalar(u8, w.key, '|') orelse w.key.len;
+        const name = w.key[0..bar];
+        // a representative set: the embedding and head, the DSpark tensors, the Engram q / k and layer 0's non-expert
+        // tensors (the experts are the bulk of the pack and the same code reads them)
+        const take = std.mem.startsWith(u8, name, "embed.") or std.mem.startsWith(u8, name, "norm.") or
+            std.mem.eql(u8, name, "head") or std.mem.startsWith(u8, name, "mtp.") or
+            std.mem.indexOf(u8, name, ".engram.") != null or
+            (std.mem.startsWith(u8, name, "layers.0.") and std.mem.indexOf(u8, name, ".ffn.experts.") == null);
+        if (!take) continue;
+        h.update(w.key);
+        h.update("\x00");
+        const len = (try describe(&sh, w.key)).bytes;
+        try buf.resize(a, len);
+        try read(&sh, w.key, buf.items);
+        h.update(buf.items);
+        n += 1;
+        bytes += len;
+    }
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    std.debug.print("TF_DSV41_DIGEST_PACK {s}: {d} entries, {d} bytes, sha256 {x}\n", .{ std.mem.span(dir), n, bytes, out });
 }
