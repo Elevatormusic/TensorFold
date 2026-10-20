@@ -53,7 +53,7 @@ from tensorfold.engine.grammar import GrammarError
 from tensorfold.engine.grammar import pack as pack_grammar
 
 from ..ops import HostIds
-from . import constrain
+from . import constrain, memtrace
 from .model import RAW
 
 # the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the drafter's block of five
@@ -106,6 +106,14 @@ EAGER_ABSORB = os.environ.get("TF_DS_EAGER_ABSORB", "1") == "1"
 # TF_DS_CONF_LOG=1: per draft depth, drafts verified and kept, and kept by confidence (sigmoid tenths), printed every
 # 200 rounds (the DSpark acceptance report)
 CONF_LOG = os.environ.get("TF_DS_CONF_LOG", "0") == "1"
+# TF_DS_TRIM_MIB (default 256; -1: off): once no stream is filling, and once none is left, torch's cached free blocks go
+# back to the node when they are more than this. On a unified-memory GPU a kept block is host memory that the node's
+# earlyoom counts: after long prompts the cache held 1.5-2 GiB that no request needed.
+TRIM = int(os.environ.get("TF_DS_TRIM_MIB") or 256) * 2**20
+# TF_DS_ADMIT_GIB (default 1; 0: off): a request waits for a live stream to finish while the host's MemAvailable plus
+# torch's cached free blocks is under TF_DS_MEM_FLOOR_GIB (default 2) plus this. (With no live stream it starts at once:
+# waiting would not help.)
+ADMIT_GIB = float(os.environ.get("TF_DS_ADMIT_GIB") or 1.0)
 STEP_TIMEOUT = float(os.environ.get("TF_DS_STEP_TIMEOUT") or 900.0)
 # TF_DS_EXIT_ON_BREAK=1 (default): a broken lane ends its process with EXIT_CODE TF_DS_EXIT_GRACE seconds after the
 # break (time for the live requests to get their error), so a supervisor (a container restart policy, systemd)
@@ -471,6 +479,7 @@ class MultiDecoder:
         self.streams: dict[int, Stream] = {}           # decoding (and just ended) streams
         self.filling: list[Stream] = []                 # admitted, their prompts filling their slots (oldest first)
         self.chunk_s, self.since_fill = 0.0, 0.0        # the last prompt chunk's time; decoding since then
+        self.gate_log = 0.0                             # (the admission gate's last log line)
         self.next_id = 0
         self.link: Link | None = None
         self.watch: Watchdog | None = None
@@ -556,6 +565,45 @@ class MultiDecoder:
     # -- the scheduler's interface --------------------------------------------------------------------------------
     def live(self) -> int:
         return len(self.streams) + len(self.filling)
+
+    def _trim(self) -> None:
+        """Torch's cached free blocks back to the node when they are more than TRIM (every rank, at the same step)."""
+
+        if TRIM < 0 or torch.cuda.memory_reserved() - torch.cuda.memory_allocated() <= TRIM:
+            return
+        with memtrace.phase("trim"):
+            torch.cuda.empty_cache()
+
+    def _host_room(self) -> int:
+        """Bytes this node can still give a step: MemAvailable plus torch's cached free blocks (-1: unknown)."""
+
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return (int(line.split()[1]) * 1024 + torch.cuda.memory_reserved()
+                                - torch.cuda.memory_allocated())
+        except (OSError, ValueError, IndexError):
+            pass
+        return -1
+
+    def _gate(self, s: Stream) -> None:
+        """NoRoom while streams are live and the host is short of its floor plus ADMIT_GIB (rank 0 reads its own
+        memory before the request is sent, so every rank agrees)."""
+
+        if ADMIT_GIB <= 0 or not self.live():
+            return
+        floor = float(os.environ.get("TF_DS_MEM_FLOOR_GIB") or 2.0)
+        if floor <= 0:
+            return
+        room, need = self._host_room(), int((floor + ADMIT_GIB) * 2**30)
+        if 0 <= room < need:
+            now = time.monotonic()
+            if now - self.gate_log > 10.0:
+                self.gate_log = now
+                print(f"[tensorfold] admission waits for a live stream: host room {room / 2**30:.2f} GiB under "
+                      f"{need / 2**30:.2f} (floor {floor:.1f} + {ADMIT_GIB:.1f}), {self.live()} live", flush=True)
+            raise NoRoom("the host is short of memory for another stream now")
 
     def _send(self, op: list) -> None:
         self._alive()
@@ -806,9 +854,10 @@ class MultiDecoder:
         self.kept[k.eid] = k
         self.next_kept += 1
         if self.spill is not None:                       # write-through: its rows past what its lineage holds
-            k.disk = self.spill.persist(f"{self.spill_nonce or 'run'}-{k.eid:06d}", base=k.base, top=k.top,
-                                        replay=k.replay, snaps=k.snaps, host=k.host,
-                                        lineage=getattr(s, "lineage", None), keys=k.keys)
+            with memtrace.phase("spill-save"):
+                k.disk = self.spill.persist(f"{self.spill_nonce or 'run'}-{k.eid:06d}", base=k.base, top=k.top,
+                                            replay=k.replay, snaps=k.snaps, host=k.host,
+                                            lineage=getattr(s, "lineage", None), keys=k.keys)
         s.st.sc = None
         s.snaps = None
 
@@ -849,6 +898,7 @@ class MultiDecoder:
             raise NoRoom("every stream slot is busy")
         if not self._room(self._need(s)):
             raise NoRoom("the window's free extents are too small for this request now")
+        self._gate(s)
         positions = s.vision.positions() if s.vision is not None and getattr(s.vision, "spans", None) else []
         index = self.free[0]
         s.keys = self._keys(s) if KEEP else None
@@ -902,7 +952,8 @@ class MultiDecoder:
             if disk:
                 name, at, t0 = str(reuse[1]), int(reuse[2]), time.perf_counter()
                 try:
-                    snaps, host, lineage = self.spill.load(name, at, base)
+                    with memtrace.phase("spill-load"):
+                        snaps, host, lineage = self.spill.load(name, at, base)
                     loaded = at in snaps
                 except Exception as exc:                 # noqa: BLE001  (every rank agrees on the outcome below)
                     print(f"[tensorfold] rank {e.rank}: spilled prompt {name} did not load ({type(exc).__name__}: "
@@ -940,8 +991,9 @@ class MultiDecoder:
             if later:
                 rows = None
                 if e.rank == 0:                          # the tower runs only for the spans past the boundary
-                    rows = torch.cat([e.tower.span_rows(pic)[max(0, cut - start):] for start, pic in s.vision.spans
-                                      if start + pic.tokens > cut])
+                    with memtrace.phase("vit"):
+                        rows = torch.cat([e.tower.span_rows(pic)[max(0, cut - start):] for start, pic in s.vision.spans
+                                          if start + pic.tokens > cut])
                 image = (later, e._share_rows(rows, len(later)))
             s.draft = bool(s.draft) and e.drafter is not None
             snap = None
@@ -974,7 +1026,8 @@ class MultiDecoder:
             self._agree("fill", [self._shape(), s.sid])
             t0 = time.perf_counter()
             try:
-                s.filled = next(s.steps)
+                with memtrace.phase("fill"):
+                    s.filled = next(s.steps)
                 last = None
             except StopIteration as end:
                 last, s.filled = end.value, len(s.prompt)
@@ -986,6 +1039,8 @@ class MultiDecoder:
                 return []
             self.filling.remove(s)
             s.steps = None
+            if not self.filling:
+                self._trim()
             self.streams[s.sid] = s                   # (a raise below leaves it to ``drop``)
             try:
                 first = self._first(s, last)
@@ -1158,7 +1213,8 @@ class MultiDecoder:
         elif not live or told[1] != k:
             self._differs(told[1])
         t0 = time.perf_counter()
-        done = self._round(live, k)
+        with memtrace.phase("round"):
+            done = self._round(live, k)
         self.since_fill += time.perf_counter() - t0
         return done
 
@@ -1421,6 +1477,8 @@ class MultiDecoder:
             self._forget(min(self.kept.values(), key=lambda k: k.tick))
         if sp is not None and kept_now:
             sp.recycle(pinned={k.disk["name"] for k in self.kept.values() if k.disk is not None})
+        if not self.streams and not self.filling:
+            self._trim()
 
     def drop(self) -> list[Stream]:
         """Every live stream fails (a step raised); their slots are free again."""

@@ -48,6 +48,11 @@ ENGRAM_AIO_SLOTS = 1024                                    # reads in flight at 
 # TF_DS_ENGRAM_TOUCH_ASYNC=1 (default): a round's touch is submitted by engram_io's touch thread (aio_touch), not by the
 # round's thread (whose io_submit of it took ~0.6 ms on one node and held the round); 0: submitted inline as before
 ENGRAM_TOUCH_ASYNC = os.environ.get("TF_DS_ENGRAM_TOUCH_ASYNC", "1") == "1"
+# TF_DS_ENGRAM_BLOCK (default 512; 0: whole chunk): an Engram layer's cross-rank sum runs this many rows at a time. A
+# 2048-row prompt chunk's whole gather and sum held about 0.8 GiB at once (the fp32 product, both ranks' copies, the sum);
+# on a unified-memory GPU that is host memory the node's earlyoom counts. The values are the same (a row's sum is the same
+# adds in the same order).
+ENGRAM_BLOCK = int(os.environ.get("TF_DS_ENGRAM_BLOCK") or 512)
 TIMES: dict = {}
 
 
@@ -125,6 +130,18 @@ class Comm:
         for r in range(1, self.world):
             acc += g[r]
         return acc
+
+    def sum_blocks(self, x: torch.Tensor, block: int, dtype: torch.dtype) -> torch.Tensor:
+        """``sum(x).to(dtype)`` for a [n, cols] x, gathered ``block`` rows at a time: the gather buffer and the sum stay
+        block-sized and only the result is n rows (every rank has the same n, so the same calls)."""
+
+        n = x.shape[0]
+        if self.world == 1 or block <= 0 or n <= block:
+            return self.sum(x).to(dtype)
+        out = torch.empty((n, *x.shape[1:]), dtype=dtype, device=x.device)
+        for i in range(0, n, block):
+            out[i:i + block] = self.sum(x[i:i + block])
+        return out
 
 
 EXACT_MM = os.environ.get("TF_DS_EXACT_MM", "0") == "1"     # test mode: fp32 dequantized weights, fp32 matmuls
@@ -829,7 +846,7 @@ class Model:
         lo, hi = self.engram.cols
         with _T("engram_rows"):
             e = self.engram.rows(lay.idx, hashes[:, lo:hi])
-        kv = self.comm.sum(mm(lay.engram_wkv, e, F32)).to(BF16)
+        kv = self.comm.sum_blocks(mm(lay.engram_wkv, e, F32), ENGRAM_BLOCK, BF16)
         if KERNELS:
             return K.engram_gate(h, kv.contiguous(), lay.engram_qk, c.eps)
         key, value = kv.split([c.hc * c.dim, c.dim], dim=-1)
