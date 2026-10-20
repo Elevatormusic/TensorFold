@@ -515,7 +515,7 @@ class MultiDecoder:
         r0 = torch.cuda.memory_reserved()
         n = 0
         host = [1000 + (i * 7919) % 60000 for i in range(self.cap)]
-        for R, b in self.runner.keys():
+        for R, b in self.runner.keys(self.extents.total):
             if (R, b) in (self.runner.graphs or {}):
                 continue
             self.runner.forward([(0, 0, self.extents.total, b - R, host[b - R:b], host)], replay=False)

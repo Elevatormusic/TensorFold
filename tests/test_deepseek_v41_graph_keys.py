@@ -54,3 +54,12 @@ def test_warm_order_captures_the_largest_bucket_first():
 
 def test_a_small_window_has_few_keys():
     assert keys.round_keys(2_000, 2_000, [1, 2, 4]) == [(r, b) for b in (2_000, 1_024) for r in (4, 2, 1)]
+
+
+def test_the_warm_set_stops_at_the_usable_extent():
+    # the window pool is the context rounded down, the pool cap has spare rows above it: no stream reaches the top bucket
+    usable = 1_048_576
+    warm = keys.round_keys(usable, CAP, [1, 2])
+    assert CAP not in [b for _, b in warm] and len(warm) == 11 * 2
+    for deepest in list(range(1, usable, 4_099)) + [usable]:
+        assert (1, keys.bucket_for(deepest, CAP)) in set(warm)

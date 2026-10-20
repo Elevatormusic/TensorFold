@@ -633,10 +633,11 @@ class RoundRunner:
     def bucket(self, deepest: int) -> int:
         return bucket_for(deepest, self.pool.cap)
 
-    def keys(self) -> list[tuple[int, int]]:
-        """Every (rows, bucket) a round over this pool can use, in warm-up order (``graph_keys.round_keys``)."""
+    def keys(self, limit: int) -> list[tuple[int, int]]:
+        """Every (rows, bucket) a round can use when a stream reaches ``limit`` tokens at most (the extent pool total:
+        the pool cap is above it), in warm-up order (``graph_keys.round_keys``)."""
 
-        return round_keys(self.pool.cap, self.pool.cap, self.sizes)
+        return round_keys(min(limit, self.pool.cap), self.pool.cap, self.sizes)
 
     def engram_touch(self, tails: list[list[int]]) -> None:
         """``tails``: each stream's host ids ending with its pending token, the n-gram's tokens before it included (or
@@ -681,7 +682,7 @@ class RoundRunner:
         R = len(ids)
         b = self.bucket(max(p + 1 for p in pos))
         Rg = R
-        if self.graphs is not None and replay:
+        if self.graphs is not None:                        # also a capture-only call: it makes the key a round uses
             Rg = padded_rows(R, self.sizes)
             for col in (ids, pos, slots, base, end):       # the extra rows copy the last row (graph_keys.ROUND_ROWS)
                 col += col[-1:] * (Rg - R)
