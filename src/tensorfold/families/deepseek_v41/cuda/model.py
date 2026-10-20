@@ -1022,7 +1022,8 @@ class Model:
                     # rows in blocks so the [rows, n_comp] score matrix stays bounded at long contexts
                     rb = max(16, min(n, (1 << 26) // (4 * max(n_comp_end, 1))))
                     # (switch "prompt_keys") layers before the candidate source: the score kernel writes the top-k
-                    # keys and each 64-key tile's maximum, and topk_select_pruned searches only the k tiles with the
+                    # keys and each 64-key tile's maximum (each 8 keys' with switch "prompt_tile", so the search also
+                    # runs below 64 k keys a row), and topk_select_pruned searches only the k tiles with the
                     # largest maxima (exact: keys are unique), in the same row blocks, so the same kernels score each
                     # row: the same selection, without the fp32 scores, six torch passes to keys and a full top-k
                     keyed = (K.on("prompt_keys") and lay.idx != c.cand_source and not 0 <= c.cand_source < lay.idx
@@ -1032,9 +1033,11 @@ class Model:
                         r1 = min(n, r0 + rb)
                         if keyed:
                             vr = vis[r0:r1].contiguous()
+                            tile = K.prompt_tile(r1 - r0, n_comp_end, kk)      # (switch "prompt_tile")
                             keys, tm = K.index_score(iq[r0:r1].contiguous(), sc.index_k[src],
-                                                     wts[r0:r1].contiguous(), vr, n_comp_end, keys=True, tmax=True)
-                            cidx[r0:r1] = K.topk_select_pruned(keys, tm, kk, vr)
+                                                     wts[r0:r1].contiguous(), vr, n_comp_end, keys=True, tmax=True,
+                                                     tile=tile)
+                            cidx[r0:r1] = K.topk_select_pruned(keys, tm, kk, vr, tile)
                             del keys, tm
                             continue
                         score = K.index_score(iq[r0:r1].contiguous(), sc.index_k[src], wts[r0:r1].contiguous(),
@@ -1043,6 +1046,16 @@ class Model:
                             cand_parts.append(_candidates(score, vis[r0:r1, None], c.cand_blocks, c.cand_block))
                         elif 0 <= c.cand_source < lay.idx:
                             apply_candidates(score, shared["cand"][r0:r1], c.cand_block)
+                        # (switch "prompt_tile") the candidate layers' selection from the scores' keys and 8-key
+                        # tile maxima (one launch), with the same tile search: the same set as topk_indices
+                        tile = (K.prompt_tile(r1 - r0, n_comp_end, kk) if K.on("prompt_keys") and kk & (kk - 1) == 0
+                                else K.TOPK_PRUNE_BN)
+                        if tile != K.TOPK_PRUNE_BN:
+                            keys, tm = K.score_keys(score, tmax=True, tile=tile)
+                            del score
+                            cidx[r0:r1] = K.topk_select_pruned(keys, tm, kk, vis[r0:r1].contiguous(), tile)
+                            del keys, tm
+                            continue
                         top = K.topk_indices(score, kk)
                         cidx[r0:r1] = torch.where(top < vis[r0:r1, None], top, -1)
                         del score
