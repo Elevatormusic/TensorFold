@@ -8,7 +8,7 @@ verify window in one forward a round, each reply exactly its solo run.
   at its own position and slot. Every kernel is row-invariant, the cache kernels read each row's own stream and
   selection is a total order, so a row's logits are the solo run's at that position, and each stream samples its own
   rows by its own rule: its reply is its solo reply, whatever else runs beside it. A round holds 16 rows at most
-  (the decode windows' kernels): each stream's depth comes from ``DEPTH_BY`` by how many streams decode.
+  (the decode windows' kernels): the streams' drafts share them by one ranking (``DEPTH_POLICY``).
 - **Drafts.** Each stream's DSpark drafter runs on its slot's own drafter cache (a captured graph a slot). Drafts
   only propose: they change speed, never a reply.
 - **Ranks.** Rank 0 schedules (``tensorfold.cuda.scheduler``) and sends each step to the followers over a TCP link
@@ -56,8 +56,9 @@ from ..ops import HostIds
 from . import constrain
 from .model import RAW
 
-# the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the drafter's block of five
-# alone or beside one other, three at three or four streams: 16 rows at four), capped by the engine's --mtp-drafts
+# "conf", "fixed", "even": the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the
+# drafter's block of five alone or beside one other, three at three or four streams: 16 rows at four), capped by the
+# engine's --mtp-drafts
 DEPTH_BY = [int(x) for x in (os.environ.get("TF_DS_PARALLEL_DEPTH") or "5,5,3,3").split(",") if x.strip()]
 # while prompts fill, decoding keeps this share of the time (a prompt chunk runs once the rounds since the last one
 # took share / (1 - share) of its time); a prompt whose rest fits in QUICK_ROWS tokens fills before the next round
@@ -80,15 +81,20 @@ def _ht(tag: str) -> None:
         _HT.setdefault("_marks", []).append((tag, time.perf_counter()))
 
 
-# TF_DS_DEPTH_POLICY=conf (default; "fixed": the table depth): each stream verifies the k (<= its table depth, up to the drafter's block) with the most
-# expected tokens a millisecond: expected tokens from the confidence head's prefix survivals, the round's cost from a
-# fixed table of forward ms by rows (TF_DS_ROUND_MS, a pure function of state every rank holds: no live timers)
+# TF_DS_DEPTH_POLICY=conf ("fixed": the table depth): each stream verifies the k (<= its table depth, up to the
+# drafter's block) with the most expected tokens a millisecond: expected tokens from the confidence head's prefix
+# survivals, the round's cost from a fixed table of forward ms by rows (TF_DS_ROUND_MS, a pure function of state every
+# rank holds: no live timers)
 # "even": while the drafting streams started together (their rounds within TF_DS_EVEN_COHORT), the stream with the
 # most rounds left (its remaining tokens over its tokens a round lately) takes the k with the most expected tokens a
 # millisecond, up to the drafter's block in the rows left, and every other stream the fewest drafts (<= its table
 # depth) whose expected tokens still end it before that one (by TF_DS_EVEN_MARGIN): a burst's streams end together
 # and its rounds stay short. Streams that did not start together get "conf".
-DEPTH_POLICY = os.environ.get("TF_DS_DEPTH_POLICY", "conf")
+# "rank" (default): all drafting streams' drafts (up to the drafter's block each) in one ranking by prefix survival
+# (a stream's confidence sigmoids multiplied along its drafts); the round verifies the top B, the B (up to the round's
+# row cap) with the most expected tokens of all streams a millisecond under TF_DS_ROUND_MS: a sure stream takes more
+# drafts, an unsure one fewer. One stream: the same k as "conf".
+DEPTH_POLICY = os.environ.get("TF_DS_DEPTH_POLICY", "rank")
 EVEN_MARGIN = float(os.environ.get("TF_DS_EVEN_MARGIN") or 1.1)
 EVEN_COHORT = int(os.environ.get("TF_DS_EVEN_COHORT") or 4)
 ROUND_MS = [float(x) for x in (os.environ.get("TF_DS_ROUND_MS") or
@@ -539,7 +545,8 @@ class MultiDecoder:
         g = self.drafters.get(N)
         if g is None:
             # as deep as any round with N drafting streams may verify ("even": the whole block)
-            steps = None if DEPTH_POLICY == "even" else max(self._depth(L) for L in range(N, len(self.slots) + 1))
+            steps = None if DEPTH_POLICY in ("even", "rank") else \
+                max(self._depth(L) for L in range(N, len(self.slots) + 1))
             g = BatchDraftGraph(self.e.drafter, self.m.pool_view(self.pool, 0, 0, self.extents.total), self.dpool, N,
                                 steps=steps)
             g.tokens.copy_(torch.tensor(tokens, dtype=torch.long))
@@ -1134,7 +1141,34 @@ class MultiDecoder:
         ks[s.sid] = best
         return ks
 
+    def _rank_k(self, live: int, confs: list, want: list[int]) -> list[int]:
+        """TF_DS_DEPTH_POLICY=rank: each drafting stream's k (``confs``: its confidence logits, ``want``: its most
+        drafts) from one ranking of all their drafts; ``live`` streams run the round."""
+
+        import math
+
+        cand = []
+        for i, (cf, w) in enumerate(zip(confs, want)):
+            surv = 1.0
+            for j in range(min(w, len(cf))):
+                surv *= 1.0 / (1.0 + math.exp(-float(cf[j])))
+                cand.append((-surv, i, j))               # survival down, a stream's drafts in order: prefixes
+        cand.sort()
+        cost = lambda rows: ROUND_MS[min(len(ROUND_MS), rows) - 1] + DRAFT_MS
+        best, best_v, exp_tokens = 0, live / cost(live), float(live)
+        for b, (neg, _, _) in enumerate(cand[:max(0, self.max_rows - live)], 1):
+            exp_tokens -= neg
+            v = exp_tokens / cost(live + b)
+            if v > best_v:
+                best, best_v = b, v
+        ks = [0] * len(confs)
+        for _, i, _ in cand[:best]:
+            ks[i] += 1
+        return ks
+
     def _depth(self, live: int) -> int:
+        if DEPTH_POLICY == "rank":                       # any stream may take the whole block; _rank_k keeps the cap
+            return max(0, min(self.depth_most, self.max_rows - max(live, 1)))
         k = DEPTH_BY[min(live, len(DEPTH_BY)) - 1] if DEPTH_BY else self.depth_most
         return max(0, min(k, self.depth_most, self.max_rows // max(live, 1) - 1))
 
@@ -1213,7 +1247,10 @@ class MultiDecoder:
                                     [s.st.index for s in drafting])
                 conf_rows = self.drafters[len(drafting)].last_conf
                 even = None
-                if DEPTH_POLICY == "even" and len(drafting) > 1 and \
+                if DEPTH_POLICY == "rank":
+                    ks = self._rank_k(len(live), conf_rows, [want[s.sid] for s in drafting])
+                    even = {s.sid: kk for s, kk in zip(drafting, ks)}
+                elif DEPTH_POLICY == "even" and len(drafting) > 1 and \
                         max(s.rounds for s in drafting) - min(s.rounds for s in drafting) <= EVEN_COHORT:
                     even = self._even_k(live, drafting, conf_rows, k)
                 for s, r, cf in zip(drafting, rows, conf_rows):
