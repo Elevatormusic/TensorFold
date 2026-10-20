@@ -53,7 +53,7 @@ from tensorfold.engine.grammar import GrammarError
 from tensorfold.engine.grammar import pack as pack_grammar
 
 from ..ops import HostIds
-from . import constrain
+from . import constrain, memtrace
 from .model import RAW
 
 # the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the drafter's block of five
@@ -806,9 +806,10 @@ class MultiDecoder:
         self.kept[k.eid] = k
         self.next_kept += 1
         if self.spill is not None:                       # write-through: its rows past what its lineage holds
-            k.disk = self.spill.persist(f"{self.spill_nonce or 'run'}-{k.eid:06d}", base=k.base, top=k.top,
-                                        replay=k.replay, snaps=k.snaps, host=k.host,
-                                        lineage=getattr(s, "lineage", None), keys=k.keys)
+            with memtrace.phase("spill-save"):
+                k.disk = self.spill.persist(f"{self.spill_nonce or 'run'}-{k.eid:06d}", base=k.base, top=k.top,
+                                            replay=k.replay, snaps=k.snaps, host=k.host,
+                                            lineage=getattr(s, "lineage", None), keys=k.keys)
         s.st.sc = None
         s.snaps = None
 
@@ -902,7 +903,8 @@ class MultiDecoder:
             if disk:
                 name, at, t0 = str(reuse[1]), int(reuse[2]), time.perf_counter()
                 try:
-                    snaps, host, lineage = self.spill.load(name, at, base)
+                    with memtrace.phase("spill-load"):
+                        snaps, host, lineage = self.spill.load(name, at, base)
                     loaded = at in snaps
                 except Exception as exc:                 # noqa: BLE001  (every rank agrees on the outcome below)
                     print(f"[tensorfold] rank {e.rank}: spilled prompt {name} did not load ({type(exc).__name__}: "
@@ -940,8 +942,9 @@ class MultiDecoder:
             if later:
                 rows = None
                 if e.rank == 0:                          # the tower runs only for the spans past the boundary
-                    rows = torch.cat([e.tower.span_rows(pic)[max(0, cut - start):] for start, pic in s.vision.spans
-                                      if start + pic.tokens > cut])
+                    with memtrace.phase("vit"):
+                        rows = torch.cat([e.tower.span_rows(pic)[max(0, cut - start):] for start, pic in s.vision.spans
+                                          if start + pic.tokens > cut])
                 image = (later, e._share_rows(rows, len(later)))
             s.draft = bool(s.draft) and e.drafter is not None
             snap = None
@@ -974,7 +977,8 @@ class MultiDecoder:
             self._agree("fill", [self._shape(), s.sid])
             t0 = time.perf_counter()
             try:
-                s.filled = next(s.steps)
+                with memtrace.phase("fill"):
+                    s.filled = next(s.steps)
                 last = None
             except StopIteration as end:
                 last, s.filled = end.value, len(s.prompt)
@@ -1158,7 +1162,8 @@ class MultiDecoder:
         elif not live or told[1] != k:
             self._differs(told[1])
         t0 = time.perf_counter()
-        done = self._round(live, k)
+        with memtrace.phase("round"):
+            done = self._round(live, k)
         self.since_fill += time.perf_counter() - t0
         return done
 
