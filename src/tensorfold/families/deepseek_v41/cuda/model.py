@@ -177,9 +177,11 @@ def _l2_tensors(model, lay, kind: str, nxt=None) -> list:
     if kind == "moe":
         ex = lay.experts
         e = ex.count
-        # the shared expert's trellises unless SHARED_OVERLAP computes it beside the gate (it streams them itself then)
-        shared = ([ex.keep[e - 1], ex.keep[2 * e - 1], ex.keep[3 * e - 1]]
-                  if lay.shared is None and len(ex.keep) == 3 * e else [])
+        # the shared expert's trellises unless SHARED_OVERLAP computes it beside the gate (it streams them itself then);
+        # a shared expert outside the pack always runs on this stream, after the gate
+        if lay.shared is not None:
+            return [lay.hc_ffn[0], lay.gate_w] + [_linear_storage(w) for w in lay.shared]
+        shared = [ex.keep[e - 1], ex.keep[2 * e - 1], ex.keep[3 * e - 1]] if len(ex.keep) == 3 * e else []
         return [lay.hc_ffn[0], lay.gate_w] + ([] if SHARED_OVERLAP else shared)
     if kind == "next" and nxt is not None:
         if not hasattr(nxt, "wq_a"):                                    # the head
@@ -260,8 +262,13 @@ def mm(layer, x: torch.Tensor, out_dtype=BF16, ws: exl3_prefill.Workspace | None
 
     m = x.shape[0]
     if hasattr(layer, "weight"):
-        out = (K.dense_rows(x.contiguous(), layer.weight) if m <= 128 and KERNELS
-               else x.float() @ layer.weight.float().t())
+        w = layer.weight
+        if x.is_cuda and x.dtype == w.dtype == BF16:
+            # decode windows: the row-invariant kernel; prompt chunks: one BF16 GEMM with FP32 output, no FP32 copies
+            out = (K.dense_rows(x.contiguous(), w) if m <= 128 and KERNELS
+                   else torch.mm(x, w.t(), out_dtype=F32))
+        else:
+            out = x.float() @ w.float().t()
         return out.to(out_dtype)
     if EXACT_MM:
         w = dequant_fp32(None, layer.suh, layer.svh, layer.k, layer.n, layer=layer)
@@ -1154,9 +1161,18 @@ class Model:
         """Run a shared expert that has a dense or other-format projection outside the routed EXL3 pack."""
 
         w1, w3, w2 = lay.shared
-        g = mm(w1, x).float().clamp(max=self.cfg.swiglu_limit)
-        u = mm(w3, x).float().clamp(-self.cfg.swiglu_limit, self.cfg.swiglu_limit)
-        h = (F.silu(g) * u).to(BF16)
+        limit = self.cfg.swiglu_limit
+        fused = KERNELS and not EXACT_MM and x.is_cuda
+        if (fused and GROUPED and x.shape[0] <= 128
+                and all(hasattr(w, "words") and w.split[1] in (4, 8) for w in (w1, w3))):
+            # gate and up read the same rows: one rotation launch and one glinear launch (the bits of two mm calls)
+            g, u = _group(lay, "_tf_shared13", [w1, w3])([x, x], out_dtypes=[BF16, BF16])
+        else:
+            g, u = mm(w1, x), mm(w3, x)
+        if fused:
+            h = K.clamped_swiglu(g.contiguous(), u.contiguous(), limit)
+        else:
+            h = (F.silu(g.float().clamp(max=limit)) * u.float().clamp(-limit, limit)).to(BF16)
         return mm(w2, h, F32)
 
     def _shared_side(self, lay, x: torch.Tensor, n: int, slots: int) -> torch.cuda.Event:

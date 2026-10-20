@@ -13,7 +13,7 @@ import os
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait, libdevice
 
 HC_BLOCKS = 40          # fixed K split of the mHC mixing dots (a function of the shape only)
 # decode / verify windows: at most this many rows take the row-invariant kernels (one row a program, split keys);
@@ -2219,20 +2219,24 @@ def rowmm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> 
     return out
 
 
-@triton.jit
-def _dense_rows(X, xs, W, OUT, K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    """One row's BF16 matrix product. Each row has a fixed reduction order."""
+# One fixed tile for every row count: a row's sums do not depend on the other rows or on R.
+DENSE_BM, DENSE_BN, DENSE_BK, DENSE_WARPS, DENSE_STAGES = 16, 32, 128, 4, 3
 
-    r = tl.program_id(0)
-    nb = tl.program_id(1)
-    nn = nb * BN + tl.arange(0, BN)
+
+@triton.jit(do_not_specialize=["R"])
+def _dense_rows(X, xs, W, OUT, R, K: tl.constexpr, N: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                BK: tl.constexpr):
+    """BM rows of a BF16 matrix product with FP32 sums; one weight tile serves every row of the block."""
+
+    rr = tl.program_id(0) * BM + tl.arange(0, BM)
+    nn = tl.program_id(1) * BN + tl.arange(0, BN)
     kk = tl.arange(0, BK)
-    acc = tl.zeros((BN,), dtype=tl.float32)
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, K, BK):
-        x = tl.load(X + r * xs + k0 + kk).to(tl.float32)
-        w = tl.load(W + nn[:, None] * K + (k0 + kk)[None, :], mask=(nn < N)[:, None], other=0.0).to(tl.float32)
-        acc += tl.sum(w * x[None, :], axis=1)
-    tl.store(OUT + r * N + nn, acc, mask=nn < N)
+        x = tl.load(X + rr[:, None] * xs + (k0 + kk)[None, :], mask=(rr < R)[:, None], other=0.0)
+        w = tl.load(W + nn[None, :] * K + (k0 + kk)[:, None], mask=(nn < N)[None, :], other=0.0)
+        acc = tl.dot(x, w, acc)
+    tl.store(OUT + rr[:, None] * N + nn[None, :], acc, mask=(rr < R)[:, None] & (nn < N)[None, :])
 
 
 def dense_rows(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -2250,10 +2254,38 @@ def dense_rows(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         raise ValueError("dense_rows requires a contiguous weight tensor")
     if not x.is_cuda or x.device != w.device:
         raise ValueError("dense_rows requires input and weight on the same CUDA device")
+    if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
+        raise ValueError("dense_rows requires BF16 input and weight tensors")
     out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
-    bn = 16
-    _dense_rows[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, K=k, N=n, BN=bn, BK=128, num_warps=4)
+    grid = (triton.cdiv(rows, DENSE_BM), triton.cdiv(n, DENSE_BN))
+    _dense_rows[grid](x, x.stride(0), w, out, rows, K=k, N=n, BM=DENSE_BM, BN=DENSE_BN, BK=DENSE_BK,
+                      num_warps=DENSE_WARPS, num_stages=DENSE_STAGES)
     return out
+
+
+@triton.jit
+def _clamped_swiglu(G, U, H, n, limit, BLOCK: tl.constexpr):
+    """h = bf16(silu(min(g, limit)) * clamp(u, -limit, limit)) with FP32 arithmetic."""
+
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ok = i < n
+    g = tl.minimum(tl.load(G + i, mask=ok, other=0.0).to(tl.float32), limit)
+    u = tl.load(U + i, mask=ok, other=0.0).to(tl.float32)
+    u = tl.minimum(tl.maximum(u, -limit), limit)
+    # torch's silu arithmetic (x / (1 + expf(-x)), IEEE division), so the bits match F.silu(g) * u
+    tl.store(H + i, (tl.div_rn(g, 1.0 + libdevice.exp(-g)) * u).to(tl.bfloat16), mask=ok)
+
+
+def clamped_swiglu(g: torch.Tensor, u: torch.Tensor, limit: float) -> torch.Tensor:
+    """The shared expert's activation of two same-shape gate and up tensors in one launch, as BF16."""
+
+    if g.shape != u.shape or not g.is_contiguous() or not u.is_contiguous():
+        raise ValueError("clamped_swiglu requires contiguous gate and up tensors of one shape")
+    h = torch.empty(g.shape, dtype=torch.bfloat16, device=g.device)
+    n = g.numel()
+    if n:
+        _clamped_swiglu[(triton.cdiv(n, 1024),)](g, u, h, n, float(limit), BLOCK=1024, num_warps=4)
+    return h
 
 
 # -- the final collapse: RMSNorm(sum_j pre[j] h_j) (no mixes) ---------------------------------------------------------
