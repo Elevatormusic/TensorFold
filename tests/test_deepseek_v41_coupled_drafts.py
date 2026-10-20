@@ -41,7 +41,7 @@ def test_a_round_with_no_sampled_stream_runs_the_greedy_graph():
         assert g.inputs[3:].eq(0).all()
         g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [None, Sampling(2**63 + 7, 0.7, 40), Sampling(9, 1.0, 0)])
         assert g.ran[-1] is True
-        assert g.inputs[3].tolist() == [0, 7, 9]           # seeds: 63 bits
+        assert g.inputs[3].tolist() == [0, 7 - 2**63, 9]   # a seed's 64 bits as int64
         assert g.inputs[4].tolist() == [0, 40, 0]
         div = struct.unpack("<3d", struct.pack("<3q", *g.inputs[5].tolist()))
         assert div == (0.0, 0.7 * markov.COUPLED_SCALE, 1.0 * markov.COUPLED_SCALE)

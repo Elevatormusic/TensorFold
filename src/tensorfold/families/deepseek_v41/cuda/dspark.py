@@ -450,7 +450,8 @@ class BatchDraftGraph:
         if self.coupled:
             for r, smp in enumerate(samplings or ()):
                 if smp is not None and smp.temperature > 0:
-                    seed[r] = int(smp.seed) & ((1 << 63) - 1)
+                    sd = int(smp.seed) & ((1 << 64) - 1)                # the target's 64 bits, as int64
+                    seed[r] = sd - (1 << 64) if sd >> 63 else sd
                     top_k[r] = min(int(smp.top_k or 0), 1 << 20)        # above the candidates: all of them
                     div[r] = max(float(smp.temperature), 1e-6) * _markov.COUPLED_SCALE   # exact_sampling's divisor
         coupled = any(x > 0 for x in div)
