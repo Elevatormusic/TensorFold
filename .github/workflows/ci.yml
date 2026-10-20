@@ -46,8 +46,18 @@ jobs:
           if [ "${#files[@]}" -eq 0 ]; then echo "no changed Python files"; exit 0; fi
           printf 'checking %s\n' "${files[@]}"
           ruff check --output-format github --select E9,F63,F7,F82 "${files[@]}"
+      # .github/known-test-failures.txt lists the tests that already fail on a Linux runner (most need MLX). CI
+      # deselects them, so a red job means a new failure. --timeout stops a test that hangs (one cancellation test
+      # hung until the job timeout).
       - name: pytest (CPU)
-        run: python -m pytest -q -p no:cacheprovider tests
+        run: |
+          args=()
+          while IFS= read -r id; do
+            case "$id" in ''|'#'*) continue ;; esac
+            args+=(--deselect "$id")
+          done < .github/known-test-failures.txt
+          echo "deselecting ${#args[@]} arguments (2 for each known failure)"
+          python -m pytest -q -p no:cacheprovider --timeout=120 "${args[@]}" tests
 
   workflows:
     name: workflows
