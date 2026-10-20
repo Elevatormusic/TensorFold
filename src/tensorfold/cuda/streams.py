@@ -7,9 +7,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 
-@dataclass
+@dataclass(eq=False)
 class Stream:
-    """One request. ``emit`` receives each round's new tokens and returns True to stop the stream."""
+    """One request. ``emit`` receives each round's new tokens and returns True to stop the stream.
+
+    Two streams are equal only when they are the same object (eq=False): ``list.remove`` and ``in`` on the lane's
+    lists must find this request, not one with equal fields, and a field comparison of image tensors raises."""
 
     prompt: list[int]
     count: int                                    # tokens to produce, the first sampled one included
