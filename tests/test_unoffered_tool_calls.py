@@ -127,3 +127,10 @@ def test_with_tools_the_stream_keeps_a_mixed_case_block(monkeypatch):
     text = "A<TOOL_CALL>bad</TOOL_CALL>B"
     assert hide_tool_calls(text, finished=True) == text
     assert parse_tool_calls(text, TOOLS) == (text, None)
+
+
+def test_any_case_hides_a_mixed_case_block_while_streaming():
+    text = 'A<TOOL_CALL>{"name": "bad", "arguments": {}}</TOOL_CALL>B'
+    assert hide_tool_calls(text, finished=True, any_case=True) == "AB"
+    for cut in range(len(text) + 1):
+        assert "TOOL" not in hide_tool_calls(text[:cut], finished=False, any_case=True).upper()
