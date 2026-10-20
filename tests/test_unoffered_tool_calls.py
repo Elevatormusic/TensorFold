@@ -90,6 +90,12 @@ def test_the_flag_drops_a_complete_glm_block(drop):
     text = "<tool_call>apply_patch<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>"
     assert parse_tool_calls("Done." + text, TOOLS) == ("Done.", None)
 
+
+def test_the_flag_logs_a_dropped_call_in_single_call_mode(drop, capsys):
+    content, calls = parse_tool_calls("Done." + _dsml("apply_patch"), TOOLS, max_calls=1)
+    assert (content, calls) == ("Done.", None)
+    assert "apply_patch" in capsys.readouterr().out
+
 def test_without_tools_the_answer_is_unchanged_by_default(monkeypatch):
     monkeypatch.delenv("TF_DROP_UNOFFERED_TOOL_CALLS", raising=False)
     answer = "Done." + _dsml("apply_patch")

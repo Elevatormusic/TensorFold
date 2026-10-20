@@ -237,6 +237,8 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
         if not name or str(name).lower() not in known:
             if max_calls is None:
                 residue.append(keep_unoffered_call(match.group(0), name) if name and parsed else match.group(0))
+            elif name and parsed and drop_unoffered_calls():
+                keep_unoffered_call(match.group(0), name)    # single-call mode removes the block anyway: log it
             continue
         if max_calls is not None:
             try:
