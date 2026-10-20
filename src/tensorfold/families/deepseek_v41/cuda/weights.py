@@ -26,6 +26,25 @@ from tensorfold.cuda.exl3.linear import Exl3Linear
 from ..config import Cfg
 
 
+@dataclass
+class DenseLinear:
+    """A dense BF16 matrix. The source layout is [output, input]."""
+
+    weight: torch.Tensor
+
+    @property
+    def n(self) -> int:
+        """The output width."""
+
+        return self.weight.shape[0]
+
+    @property
+    def k(self) -> int:
+        """The input width."""
+
+        return self.weight.shape[1]
+
+
 class Shards:
     """Header offsets of every tensor in a folder; reads a whole tensor or a dim-0 slice straight from the file."""
 
@@ -35,13 +54,37 @@ class Shards:
     def __init__(self, root: str | Path):
         self.root = Path(root)
         self.entries: dict[str, tuple[Path, int, dict]] = {}
-        for path in sorted(self.root.glob("*.safetensors")):
+        members: dict = {}
+        paths = sorted(self.root.glob("*.safetensors"), key=lambda p: ("override" in p.stem.lower(), p.name))
+        for path in paths:
             with open(path, "rb") as f:
                 size = struct.unpack("<Q", f.read(8))[0]
                 header = json.loads(f.read(size))
             header.pop("__metadata__", None)
+            # Remove the old group and its codebook marker before a replacement changes the format.
+            groups = {name.rsplit(".", 1)[0] for name in header
+                      if name.rsplit(".", 1)[-1] in {"trellis", "weight"}}
+            for group in groups:
+                branch = members
+                for part in group.split("."):
+                    branch = branch.get(part)
+                    if branch is None:
+                        break
+                if branch is not None:
+                    # None holds exact members; a parent replacement also removes its old child groups.
+                    pending = [branch]
+                    while pending:
+                        old = pending.pop()
+                        for name in old.pop(None, ()):
+                            del self.entries[name]
+                        pending.extend(old.values())
+                        old.clear()
             for name, e in header.items():
                 self.entries[name] = (path, 8 + size, e)
+                branch = members
+                for part in name.split(".")[:-1]:
+                    branch = branch.setdefault(part, {})
+                branch.setdefault(None, set()).add(name)
         self._files: dict[Path, object] = {}
 
     def __contains__(self, name: str) -> bool:
@@ -253,6 +296,24 @@ def _codebook(sh: Shards, prefix: str) -> str:
     return "mul1" if f"{prefix}.mul1" in sh else "mcg" if f"{prefix}.mcg" in sh else "3inst"
 
 
+def is_dense(sh: Shards, prefix: str) -> bool:
+    """True when a group stores one BF16 ``weight`` tensor instead of EXL3 parts."""
+
+    return f"{prefix}.weight" in sh
+
+
+def exl3_bits(sh: Shards, prefix: str) -> int:
+    """The EXL3 bits per weight in a group, or zero for a dense group."""
+
+    entry = sh.entries.get(f"{prefix}.trellis")
+    if entry is None:
+        return 0
+    width = entry[2]["shape"][-1]
+    if width % 16:
+        raise ValueError(f"{prefix}: invalid EXL3 trellis width {width}")
+    return width // 16
+
+
 def exl3_parts(sh: Shards, prefix: str, cols: tuple[int, int] | None = None, rows: tuple[int, int] | None = None,
                device: str | None = "cuda"):
     """(trellis, suh, svh, codebook) of a group, optionally the output columns or input rows [lo, hi) only (multiples
@@ -289,7 +350,19 @@ def pack_trellises(mats: list) -> list:
     return out
 
 
-def linear(sh: Shards, prefix: str, cols=None, rows=None) -> Exl3Linear:
+def linear(sh: Shards, prefix: str, cols=None, rows=None) -> Exl3Linear | DenseLinear:
+    if is_dense(sh, prefix):
+        key = f"{prefix}|dense|{cols}|{rows}"
+
+        def load() -> torch.Tensor:
+            weight = sh.get(f"{prefix}.weight")
+            if cols is not None:
+                weight = weight[cols[0]:cols[1]]
+            if rows is not None:
+                weight = weight[:, rows[0]:rows[1]]
+            return weight.contiguous()
+
+        return DenseLinear(_kept(sh, key, load).cuda())
     tr, suh, svh, cb = exl3_parts(sh, prefix, cols, rows)
     return Exl3Linear.from_tensors(tr, suh, svh, cb)
 
@@ -309,7 +382,7 @@ class Layer:
     kv_norm: torch.Tensor
     sink: torch.Tensor             # local heads [Hl] f32
     wo_a: list                     # local groups' slices
-    wo_b: Exl3Linear               # local groups' input rows
+    wo_b: Exl3Linear | DenseLinear # local groups' input rows
     comp_wkv: Exl3Linear | None = None
     comp_wgate: Exl3Linear | None = None
     comp_norm: torch.Tensor | None = None
@@ -320,7 +393,8 @@ class Layer:
     gate_w: torch.Tensor | None = None       # [E, d] f32
     gate_b: torch.Tensor | None = None       # [E] f32
     gate_b_vl: torch.Tensor | None = None    # [E] f32: the bias image-span tokens pick experts with (attach_vl_bias)
-    experts: object = None                   # Exl3RoutedExperts: routed + the shared expert as the last entry
+    experts: object = None                   # Exl3RoutedExperts: routed experts, and usually the shared expert
+    shared: tuple | None = None              # (w1, w3, w2) when the shared expert cannot join the EXL3 pack
     engram_wkv: Exl3Linear | None = None     # local hash columns' input rows
     engram_qk: torch.Tensor | None = None    # q_weight * k_weight [hc, d] f32
 
@@ -394,8 +468,8 @@ def load_block(sh: Shards, cfg: Cfg, p: str, i: int, rank: int, world: int, n_ex
     cols = (rank * inter_l, (rank + 1) * inter_l)
     gate, up, down = [], [], []
     cb = None
-    for e in list(range(n_experts)) + ["shared"]:
-        ep = f"{p}.ffn.experts.{e}" if e != "shared" else f"{p}.ffn.shared_experts"
+    for e in range(n_experts):
+        ep = f"{p}.ffn.experts.{e}"
         g = exl3_parts(sh, f"{ep}.w1", cols=cols, device=None)
         u = exl3_parts(sh, f"{ep}.w3", cols=cols, device=None)
         dn = exl3_parts(sh, f"{ep}.w2", rows=cols, device=None)
@@ -404,6 +478,19 @@ def load_block(sh: Shards, cfg: Cfg, p: str, i: int, rank: int, world: int, n_ex
         gate.append(g[:3])
         up.append(u[:3])
         down.append(dn[:3])
+    shared = f"{p}.ffn.shared_experts"
+    shared_parts = (f"{shared}.w1", f"{shared}.w3", f"{shared}.w2")
+    if all(not is_dense(sh, part) and _codebook(sh, part) == cb for part in shared_parts):
+        g = exl3_parts(sh, shared_parts[0], cols=cols, device=None)
+        u = exl3_parts(sh, shared_parts[1], cols=cols, device=None)
+        dn = exl3_parts(sh, shared_parts[2], rows=cols, device=None)
+        assert g[3] == u[3] == dn[3] == cb
+        gate.append(g[:3])
+        up.append(u[:3])
+        down.append(dn[:3])
+    else:
+        lay.shared = (linear(sh, shared_parts[0], cols=cols), linear(sh, shared_parts[1], cols=cols),
+                      linear(sh, shared_parts[2], rows=cols))
     trs = pack_trellises([m[0] for m in gate + up + down])
     E1 = len(gate)
     gate = [(trs[k], m[1].cuda(), m[2].cuda()) for k, m in enumerate(gate)]

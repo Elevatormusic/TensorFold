@@ -2219,6 +2219,35 @@ def rowmm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> 
     return out
 
 
+@triton.jit
+def _dense_rows(X, xs, W, OUT, K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """One row's BF16 matrix product. Each row has a fixed reduction order."""
+
+    r = tl.program_id(0)
+    nb = tl.program_id(1)
+    nn = nb * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        x = tl.load(X + r * xs + k0 + kk).to(tl.float32)
+        w = tl.load(W + nn[:, None] * K + (k0 + kk)[None, :], mask=(nn < N)[:, None], other=0.0).to(tl.float32)
+        acc += tl.sum(w * x[None, :], axis=1)
+    tl.store(OUT + r * N + nn, acc, mask=nn < N)
+
+
+def dense_rows(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """x [R, K] @ w[N, K]^T as a row-invariant FP32 result."""
+
+    rows, k = x.shape
+    n = w.shape[0]
+    if w.ndim != 2 or w.shape[1] != k or k % 128:
+        raise ValueError(f"dense matrix shape {tuple(w.shape)} does not match input width {k}")
+    out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
+    bn = 16
+    _dense_rows[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, K=k, N=n, BN=bn, BK=128, num_warps=4)
+    return out
+
+
 # -- the final collapse: RMSNorm(sum_j pre[j] h_j) (no mixes) ---------------------------------------------------------
 @triton.jit
 def _collapse_norm(X, PRE, NW, OUT, eps, D: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = False):
