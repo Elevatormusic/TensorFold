@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 
 from tensorfold.server.stopping import StopPolicy
-from tensorfold.server.tools import parse_glm_tool_call_block
+from tensorfold.server.tools import keep_unoffered_call, parse_glm_tool_call_block
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
@@ -188,7 +188,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                     name, args = glm
         if not name or str(name).lower() not in known:
             if max_calls is None:
-                residue.append(match.group(0))
+                residue.append(keep_unoffered_call(match.group(0), name) if name else match.group(0))
             continue
         if max_calls is not None:
             try:
