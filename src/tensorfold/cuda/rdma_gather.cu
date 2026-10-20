@@ -38,6 +38,7 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
@@ -85,12 +86,13 @@ struct Nic {
     ibv_mr* mr = nullptr;                 // the send ring's (the whole block's when the rings are cudaHostAlloc memory)
     ibv_mr* mr_recv = nullptr;            // the receive ring's (== mr in that case)
     ibv_gid gid{};
+    ibv_mtu mtu = IBV_MTU_4096;           // the port's active MTU (RoCE: the netdev MTU less headers, rounded down)
     std::vector<ibv_qp*> qps;             // per peer
     std::vector<uint32_t> psns;
 };
 
 struct Peer {
-    std::vector<uint32_t> qpn, psn, rkey;  // per device
+    std::vector<uint32_t> qpn, psn, rkey, mtu;  // per device
     std::vector<std::string> gid;
     uint64_t recv = 0;
 };
@@ -401,6 +403,16 @@ Nic open_nic(const std::string& name, Gather& g, int world, int rank) {
                     " failed");
     }
     TORCH_CHECK(ibv_query_gid(nic.ctx, g.port, g.gid_index, &nic.gid) == 0, "rdma gather: ibv_query_gid failed");
+    // The QPs take the port's active MTU, not a fixed 4096: at netdev MTU 1500 RoCE runs at 1024, and a QP set to 4096
+    // sends frames the link drops (every write then fails with "transport retry counter exceeded").
+    ibv_port_attr port{};
+    TORCH_CHECK(ibv_query_port(nic.ctx, g.port, &port) == 0, "rdma gather: ibv_query_port on ", name, " failed");
+    nic.mtu = port.active_mtu;
+    if (nic.mtu < IBV_MTU_4096)
+        fprintf(stderr,
+                "rdma gather: warning: %s port %d active MTU is %d bytes, not 4096: the gather works but decode is "
+                "slower. Set MTU 9000 on the CX7 netdev; see docs/NETWORK.md in the recipe.\n",
+                name.c_str(), g.port, 128 << (int)nic.mtu);
     std::random_device rd;
     nic.qps.assign(world, nullptr);
     nic.psns.assign(world, 0);
@@ -500,20 +512,22 @@ int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, co
     return (int64_t)gathers.size() - 1;
 }
 
-// Per peer: what the other side's QPs toward this rank need: ([qpn], [psn], [gid], receive ring, [rkey]), a device each.
+// Per peer: what the other side's QPs toward this rank need: ([qpn], [psn], [gid], receive ring, [rkey], [mtu]), a
+// device each.
 std::vector<py::tuple> local_info(int64_t h) {
     Gather& g = get(h);
     std::vector<py::tuple> out;
     for (int p = 0; p < g.world; ++p) {
-        std::vector<uint32_t> qpn, psn, rkey;
+        std::vector<uint32_t> qpn, psn, rkey, mtu;
         std::vector<py::bytes> gid;
         for (auto& nic : g.nics) {
             qpn.push_back(nic.qps[p] ? nic.qps[p]->qp_num : 0);
             psn.push_back(nic.psns[p]);
             rkey.push_back(nic.mr_recv->rkey);
             gid.push_back(py::bytes(reinterpret_cast<const char*>(nic.gid.raw), 16));
+            mtu.push_back((uint32_t)nic.mtu);
         }
-        out.push_back(py::make_tuple(qpn, psn, gid, (uint64_t)(uintptr_t)g.recv_ring, rkey));
+        out.push_back(py::make_tuple(qpn, psn, gid, (uint64_t)(uintptr_t)g.recv_ring, rkey, mtu));
     }
     return out;
 }
@@ -530,12 +544,17 @@ void link_peers(int64_t h, const std::vector<py::tuple>& remote) {
         peer.gid = remote[p][2].cast<std::vector<std::string>>();
         peer.recv = remote[p][3].cast<uint64_t>();
         peer.rkey = remote[p][4].cast<std::vector<uint32_t>>();
+        peer.mtu = remote[p][5].cast<std::vector<uint32_t>>();
         TORCH_CHECK((int)peer.qpn.size() == nd, "rdma gather: every rank must open the same number of devices");
+        TORCH_CHECK((int)peer.mtu.size() == nd, "rdma gather: one MTU a device");
         for (int d = 0; d < nd; ++d) {
             TORCH_CHECK(peer.gid[d].size() == 16, "rdma gather: a GID is 16 bytes");
+            TORCH_CHECK(peer.mtu[d] >= (uint32_t)IBV_MTU_256 && peer.mtu[d] <= (uint32_t)IBV_MTU_4096, "rdma gather: peer ", p,
+                        " sent MTU code ", peer.mtu[d]);
             ibv_qp_attr rtr{};
             rtr.qp_state = IBV_QPS_RTR;
-            rtr.path_mtu = IBV_MTU_4096;
+            // both ends of a QP use the smaller of the two ports' MTUs (ibv_mtu codes grow with the size)
+            rtr.path_mtu = std::min(g.nics[d].mtu, (ibv_mtu)peer.mtu[d]);
             rtr.dest_qp_num = peer.qpn[d];
             rtr.rq_psn = peer.psn[d];
             rtr.max_dest_rd_atomic = 1;
