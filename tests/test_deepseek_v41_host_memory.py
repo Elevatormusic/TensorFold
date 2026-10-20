@@ -3,10 +3,11 @@
 from types import SimpleNamespace
 
 import pytest
-import torch
 
-from tensorfold.cuda.memory_gate import NoRoom
-from tensorfold.families.deepseek_v41.cuda import model, multi
+torch = pytest.importorskip("torch")
+
+from tensorfold.cuda.memory_gate import NoRoom  # noqa: E402
+from tensorfold.families.deepseek_v41.cuda import model, multi  # noqa: E402
 
 
 class Peer:
