@@ -15,7 +15,8 @@ W = pytest.importorskip("tensorfold.families.deepseek_v41.cuda.weights")
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 
-ST = {torch.bfloat16: "BF16", torch.float16: "F16", torch.float32: "F32", torch.int16: "I16"}
+ST = {torch.bfloat16: "BF16", torch.float16: "F16", torch.float32: "F32", torch.int16: "I16",
+      torch.float8_e4m3fn: "F8_E4M3"}
 
 
 def _write(path, tensors: dict) -> None:
@@ -49,6 +50,13 @@ def _named(prefix: str, group: dict) -> dict:
     return {f"{prefix}.{key}": value for key, value in group.items()}
 
 
+def _exl3_bits(shards, prefix: str) -> int:
+    """Read the EXL3 bit width from the test checkpoint header."""
+
+    entry = shards.entries.get(f"{prefix}.trellis")
+    return entry[2]["shape"][-1] // 16 if entry is not None else 0
+
+
 def test_override_replaces_all_old_group_parts(tmp_path):
     """An override removes stale EXL3 parts and codebook markers from its group."""
 
@@ -61,13 +69,13 @@ def test_override_replaces_all_old_group_parts(tmp_path):
            | {"layers.10.ffn.shared_experts.w2.weight": dense})
 
     shards = W.Shards(tmp_path)
-    assert W.exl3_bits(shards, "layers.10.attn.wo_b") == 8
+    assert _exl3_bits(shards, "layers.10.attn.wo_b") == 8
     assert not W.is_dense(shards, "layers.10.attn.wo_b")
     assert "layers.10.attn.wo_b.mul1" not in shards
     assert W._codebook(shards, "layers.10.attn.wo_b") == "3inst"
     assert torch.equal(shards.get("layers.10.attn.wo_b.trellis"), wide["trellis"])
     assert W.is_dense(shards, "layers.10.ffn.shared_experts.w2")
-    assert W.exl3_bits(shards, "layers.10.ffn.shared_experts.w2") == 0
+    assert _exl3_bits(shards, "layers.10.ffn.shared_experts.w2") == 0
     assert torch.equal(shards.get("layers.10.ffn.shared_experts.w2.weight"), dense)
     assert torch.equal(shards.get("layers.10.attn_norm.weight"), base["layers.10.attn_norm.weight"])
     shards.close()
@@ -91,13 +99,118 @@ def test_multiple_overrides_keep_neighbors_and_replace_nested_groups(tmp_path):
     shards = W.Shards(tmp_path)
     expected = set(wide) | set(neighbor) | {"layers.10.attn_norm.weight"}
     assert set(shards.entries) == expected
-    assert W.exl3_bits(shards, prefix) == 8
+    assert _exl3_bits(shards, prefix) == 8
     assert W._codebook(shards, prefix) == "3inst"
     for name, tensor in wide.items():
         assert torch.equal(shards.get(name), tensor)
     for name, tensor in neighbor.items():
         assert torch.equal(shards.get(name), tensor)
     assert torch.equal(shards.get("layers.10.attn_norm.weight"), base["layers.10.attn_norm.weight"])
+    shards.close()
+
+
+@pytest.mark.parametrize("codebook", ["mul1", "mcg"])
+def test_base_shards_keep_split_exl3_parts_and_gate_bias(tmp_path, codebook):
+    """Base shards can store one EXL3 group in separate files."""
+
+    prefix = "layers.10.attn.wo_b"
+    group = _named(prefix, _group(256, 128, 5, 1))
+    if codebook == "mcg":
+        group[prefix + ".mcg"] = group.pop(prefix + ".mul1")
+    gate = "layers.10.ffn.gate"
+    first = {name: tensor for name, tensor in group.items() if not name.endswith(".trellis")}
+    first[gate + ".bias"] = torch.ones(8, dtype=torch.float32)
+    second = {prefix + ".trellis": group[prefix + ".trellis"],
+              gate + ".weight": torch.ones((8, 256), dtype=torch.bfloat16)}
+    _write(tmp_path / "model-01.safetensors", first)
+    _write(tmp_path / "model-02.safetensors", second)
+
+    shards = W.Shards(tmp_path)
+    assert set(shards.entries) == set(first) | set(second)
+    assert W._codebook(shards, prefix) == codebook
+    for name, tensor in (first | second).items():
+        assert torch.equal(shards.get(name), tensor)
+    shards.close()
+
+
+@pytest.mark.parametrize("source,dtype", [("model-00", torch.float8_e4m3fn),
+                                         ("model-02", torch.float8_e4m3fn),
+                                         ("override-fp8", torch.float8_e4m3fn),
+                                         ("override-bf16", torch.bfloat16)])
+def test_scaled_engram_keeps_exl3_parts(tmp_path, source, dtype):
+    """A scaled source beside an EXL3 group does not select the dense path."""
+
+    prefix = "layers.10.engram.wkv"
+    group = _named(prefix, _group(256, 128, 5, 1))
+    _write(tmp_path / "model-01.safetensors", group)
+    _write(tmp_path / f"{source}.safetensors",
+           {prefix + ".weight": torch.ones((128, 256)).to(dtype),
+            prefix + ".scale": torch.ones((1, 2), dtype=torch.float32)})
+
+    shards = W.Shards(tmp_path)
+    assert not W.is_dense(shards, prefix)
+    assert W._codebook(shards, prefix) == "mul1"
+    trellis, suh, svh, codebook = W.exl3_parts(shards, prefix, device=None)
+    assert codebook == "mul1"
+    for part, value in zip(("trellis", "suh", "svh"), (trellis, suh, svh)):
+        assert torch.equal(value, group[f"{prefix}.{part}"])
+    assert prefix + ".weight" in shards and prefix + ".scale" in shards
+    shards.close()
+
+
+@pytest.mark.parametrize("dtype,shape,extra", [
+    (torch.float8_e4m3fn, (128, 256), None),
+    (torch.float16, (128, 256), None),
+    (torch.bfloat16, (256,), None),
+    (torch.bfloat16, (128, 256), "scale"),
+    (torch.bfloat16, (128, 256), "trellis"),
+])
+def test_dense_requires_one_bf16_matrix(tmp_path, dtype, shape, extra):
+    """Only a BF16 matrix without EXL3 or scale parts selects the dense path."""
+
+    prefix = "layers.10.attn.wo_b"
+    tensors = {prefix + ".weight": torch.ones(shape).to(dtype)}
+    if extra is not None:
+        tensors[prefix + "." + extra] = torch.ones(1, dtype=torch.int16)
+    _write(tmp_path / "model.safetensors", tensors)
+
+    shards = W.Shards(tmp_path)
+    assert not W.is_dense(shards, prefix)
+    shards.close()
+
+
+def test_bf16_override_removes_stale_exl3_parts(tmp_path):
+    """A BF16 override removes every old EXL3 part and scale."""
+
+    prefix = "layers.10.engram.wkv"
+    base = _named(prefix, _group(256, 128, 5, 1))
+    base[prefix + ".weight"] = torch.ones((128, 256)).to(torch.float8_e4m3fn)
+    base[prefix + ".scale"] = torch.ones((1, 2), dtype=torch.float32)
+    _write(tmp_path / "zz-model.safetensors", base)
+    weight = torch.full((128, 256), 2, dtype=torch.bfloat16)
+    _write(tmp_path / "override-bf16.safetensors", {prefix + ".weight": weight})
+
+    shards = W.Shards(tmp_path)
+    assert set(shards.entries) == {prefix + ".weight"}
+    assert W.is_dense(shards, prefix)
+    assert torch.equal(shards.get(prefix + ".weight"), weight)
+    shards.close()
+
+
+@pytest.mark.parametrize("prefix,shape", [("layers.10.attn_norm", (256,)),
+                                          ("layers.10.ffn.gate", (8, 256))])
+def test_plain_weight_override_keeps_bias(tmp_path, prefix, shape):
+    """A norm or gate weight override keeps the adjacent bias."""
+
+    bias = torch.ones(shape[0], dtype=torch.float32)
+    _write(tmp_path / "model.safetensors",
+           {prefix + ".weight": torch.ones(shape, dtype=torch.bfloat16), prefix + ".bias": bias})
+    weight = torch.full(shape, 2, dtype=torch.bfloat16)
+    _write(tmp_path / "override-plain.safetensors", {prefix + ".weight": weight})
+
+    shards = W.Shards(tmp_path)
+    assert torch.equal(shards.get(prefix + ".weight"), weight)
+    assert torch.equal(shards.get(prefix + ".bias"), bias)
     shards.close()
 
 

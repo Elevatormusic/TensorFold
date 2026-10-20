@@ -2238,10 +2238,18 @@ def _dense_rows(X, xs, W, OUT, K: tl.constexpr, N: tl.constexpr, BN: tl.constexp
 def dense_rows(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """x [R, K] @ w[N, K]^T as a row-invariant FP32 result."""
 
+    if x.ndim != 2 or w.ndim != 2:
+        raise ValueError("dense_rows requires two-dimensional input and weight tensors")
     rows, k = x.shape
     n = w.shape[0]
-    if w.ndim != 2 or w.shape[1] != k or k % 128:
+    if w.shape[1] != k or k % 128:
         raise ValueError(f"dense matrix shape {tuple(w.shape)} does not match input width {k}")
+    if x.stride(1) != 1:
+        raise ValueError("dense_rows requires unit input inner stride")
+    if not w.is_contiguous():
+        raise ValueError("dense_rows requires a contiguous weight tensor")
+    if not x.is_cuda or x.device != w.device:
+        raise ValueError("dense_rows requires input and weight on the same CUDA device")
     out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
     bn = 16
     _dense_rows[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, K=k, N=n, BN=bn, BK=128, num_warps=4)

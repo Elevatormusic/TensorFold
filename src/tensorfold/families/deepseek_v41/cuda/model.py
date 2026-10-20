@@ -111,10 +111,13 @@ class Comm:
         return out
 
     def sum(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum rank partials; NCCL can modify x, so callers must treat x as consumed."""
+
         if self.world == 1:
             return x
-        reduce = getattr(getattr(self, "nccl", None), "all_reduce", None)
-        rdma = getattr(getattr(self, "nccl", None), "rdma", None)
+        nccl = getattr(self, "nccl", None)
+        reduce = getattr(nccl, "all_reduce", None)
+        rdma = getattr(nccl, "rdma", None)
         use_rdma = rdma is not None and rdma.fits(x)
         if self.world == 2 and reduce is not None and x.is_contiguous() and not use_rdma:
             # Two ranks have one addition; NCCL reuses the input buffer.

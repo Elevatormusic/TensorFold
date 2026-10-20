@@ -61,9 +61,16 @@ class Shards:
                 size = struct.unpack("<Q", f.read(8))[0]
                 header = json.loads(f.read(size))
             header.pop("__metadata__", None)
-            # Remove the old group and its codebook marker before a replacement changes the format.
-            groups = {name.rsplit(".", 1)[0] for name in header
-                      if name.rsplit(".", 1)[-1] in {"trellis", "weight"}}
+            # Only override files can replace a complete linear group.
+            groups = set()
+            if "override" in path.stem.lower():
+                for name, entry in header.items():
+                    prefix, _, part = name.rpartition(".")
+                    if part == "trellis" or (part == "weight" and entry["dtype"] == "BF16"
+                                             and len(entry["shape"]) == 2
+                                             and f"{prefix}.scale" not in header
+                                             and f"{prefix}.trellis" in self.entries):
+                        groups.add(prefix)
             for group in groups:
                 branch = members
                 for part in group.split("."):
@@ -297,21 +304,11 @@ def _codebook(sh: Shards, prefix: str) -> str:
 
 
 def is_dense(sh: Shards, prefix: str) -> bool:
-    """True when a group stores one BF16 ``weight`` tensor instead of EXL3 parts."""
+    """True for a BF16 matrix without EXL3 or scale parts."""
 
-    return f"{prefix}.weight" in sh
-
-
-def exl3_bits(sh: Shards, prefix: str) -> int:
-    """The EXL3 bits per weight in a group, or zero for a dense group."""
-
-    entry = sh.entries.get(f"{prefix}.trellis")
-    if entry is None:
-        return 0
-    width = entry[2]["shape"][-1]
-    if width % 16:
-        raise ValueError(f"{prefix}: invalid EXL3 trellis width {width}")
-    return width // 16
+    entry = sh.entries.get(f"{prefix}.weight")
+    return (entry is not None and entry[2]["dtype"] == "BF16" and len(entry[2]["shape"]) == 2
+            and f"{prefix}.trellis" not in sh and f"{prefix}.scale" not in sh)
 
 
 def exl3_parts(sh: Shards, prefix: str, cols: tuple[int, int] | None = None, rows: tuple[int, int] | None = None,
