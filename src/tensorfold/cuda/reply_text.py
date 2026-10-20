@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from typing import Any
@@ -112,6 +113,36 @@ class StopStrings:
         return StopPolicy.visible(self, text, partial=partial)
 
 
+def drop_unoffered_calls() -> bool:
+    """TF_DROP_UNOFFERED_TOOL_CALLS=1: a call to a tool that the request did not offer is removed from the content
+    and logged, instead of kept as text. A model can call a tool from an earlier turn or another harness; a client
+    then shows its markup as text."""
+
+    return os.environ.get("TF_DROP_UNOFFERED_TOOL_CALLS", "0") == "1"
+
+
+def keep_unoffered_call(text: str, name: Any) -> str:
+    """The content kept for a parsed call to a tool the request did not offer: its text, or nothing with the flag."""
+
+    if not drop_unoffered_calls():
+        return text
+    print(f"[tensorfold] dropped a call to a tool the request did not offer: {str(name)[:80]!r}", flush=True)
+    return ""
+
+
+def answer_without_tools(answer: str, *, finished: bool) -> str:
+    """The answer of a request that offers no tools: as it is, or with the flag, without its tool-call blocks (each
+    call is unoffered). While streaming, a block that has begun waits until it ends, as with tools. The finished
+    answer logs that blocks were dropped."""
+
+    if not drop_unoffered_calls():
+        return answer
+    shown = hide_tool_calls(answer, finished=finished)
+    if finished and shown != answer:
+        print("[tensorfold] dropped tool-call markup from a request that offered no tools", flush=True)
+    return shown
+
+
 def hide_tool_calls(text: str, *, finished: bool) -> str:
     cut = text.find(_DSML_OPEN)                        # DeepSeek DSML: a calls block is hidden whole
     if cut >= 0:
@@ -163,6 +194,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
             continue
         block = match.group(1).strip()
         name, args = None, {}
+        parsed = False                                  # the whole payload parsed, not only its name
         try:
             payload = json.loads(block)
             if isinstance(payload, dict):
@@ -171,6 +203,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 args = fn.get("arguments", fn.get("parameters", {}))
                 if isinstance(args, str):
                     args = json.loads(args) if args.strip() else {}
+                parsed = True
         except (json.JSONDecodeError, AttributeError):
             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
             if m:
@@ -182,13 +215,15 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 args = {key: decode_parameter(value, props.get(key, {}))
                         for key, value in ((p.group(1).strip(), p.group(2))
                                            for p in _TOOL_PARAMETER_BLOCK_RE.finditer(m.group(2)))}
+                parsed = True
             else:
                 glm = parse_glm_tool_call_block(block, tools, complete=max_calls is not None)
                 if glm is not None:
                     name, args = glm
+                    parsed = True
         if not name or str(name).lower() not in known:
             if max_calls is None:
-                residue.append(match.group(0))
+                residue.append(keep_unoffered_call(match.group(0), name) if name and parsed else match.group(0))
             continue
         if max_calls is not None:
             try:
