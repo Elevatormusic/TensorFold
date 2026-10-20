@@ -544,9 +544,10 @@ class MultiDecoder:
         N = len(tokens)
         g = self.drafters.get(N)
         if g is None:
-            # as deep as any round with N drafting streams may verify ("even": the whole block)
-            steps = None if DEPTH_POLICY in ("even", "rank") else \
-                max(self._depth(L) for L in range(N, len(self.slots) + 1))
+            # as deep as any round with N drafting streams may verify ("even": the whole block; "rank": up to the
+            # configured drafts, as one stream may take all of them)
+            steps = None if DEPTH_POLICY == "even" else \
+                max(1, max(self._depth(L) for L in range(N, len(self.slots) + 1)))
             g = BatchDraftGraph(self.e.drafter, self.m.pool_view(self.pool, 0, 0, self.extents.total), self.dpool, N,
                                 steps=steps)
             g.tokens.copy_(torch.tensor(tokens, dtype=torch.long))

@@ -1,7 +1,7 @@
 """The "rank" depth policy (families/deepseek_v41/cuda/multi.py ``_rank_k``): the drafts a round verifies across all
 streams are the allocation with the most expected tokens a millisecond under the cost table, each stream's a
 prefix, within the round's row cap; one stream gets the k of the "conf" policy; a constrained stream's drafts its
-grammar cuts take no row."""
+grammar cuts take no row; its drafter graphs run no more steps than the configured drafts."""
 
 from __future__ import annotations
 
@@ -92,3 +92,30 @@ def test_cut_drafts_take_no_row():
     assert pre[0][0] == [7] and 1 not in pre and 2 not in pre
     ks = dec._rank_k(3, [[9.0] * 5] * 3, caps)
     assert ks[0] <= 1 and 3 + sum(ks) == dec.max_rows and ks[1] >= 2
+
+
+def test_rank_drafter_steps_stop_at_the_configured_drafts(monkeypatch):
+    import torch
+
+    from tensorfold.families.deepseek_v41.cuda import dspark
+
+    made = []
+
+    class Graph:
+        def __init__(self, drafter, sc, dpool, streams, steps=None):
+            made.append(steps)
+            self.tokens, self.q0, self.slots = (torch.zeros(streams, dtype=torch.long) for _ in range(3))
+
+        def run(self, tokens, q0, slots):
+            return [[] for _ in tokens]
+
+    monkeypatch.setattr(dspark, "BatchDraftGraph", Graph)
+    monkeypatch.setattr(multi, "DEPTH_POLICY", "rank")
+    dec = decoder(depth=3)
+    dec.drafters, dec.slots, dec.pool, dec.dpool = {}, [0] * 4, None, None
+    dec.e = SimpleNamespace(drafter=object(), runner=None)
+    dec.m = SimpleNamespace(pool_view=lambda *a: None)
+    dec.extents = SimpleNamespace(total=1)
+    for n in range(1, 5):
+        dec._drafts([0] * n, [1] * n, list(range(n)))
+    assert made == [3, 3, 3, 3]
