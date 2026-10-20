@@ -41,3 +41,34 @@ def test_phase_rows(tmp_path, monkeypatch):
     assert {r[2] for r in rows if r[0] == "S"} >= {"idle", "vit", "fill"}
     assert rows[0][4] == "1000" and rows[0][-4:] == ["30", "40", "50", "60"]
     assert memtrace.phase("after") is memtrace._NONE                     # off again after stop()
+
+
+def test_a_failed_write_ends_the_trace_not_the_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(memtrace, "PERIOD", 0.01)
+    monkeypatch.setattr(memtrace, "meminfo", lambda: [1000, 2, 3, 4, 5, 6, 7, 8])
+    monkeypatch.setattr(memtrace, "_torch_stats", lambda reset: [10, 20, 30, 40, 50, 60])
+    assert memtrace.start(0, str(tmp_path / "run")) is True
+
+    class Full:
+        def write(self, text):
+            raise OSError(28, "No space left on device")
+
+        def close(self):
+            pass
+
+    try:
+        memtrace._file = Full()
+        with memtrace.phase("fill"):                         # the request's own work goes on
+            pass
+        assert memtrace._file is None
+        assert "TF_DS_MEMTRACE stopped" in capsys.readouterr().out
+    finally:
+        memtrace.stop()
+
+
+def test_start_on_an_unwritable_path_is_off(tmp_path, capsys):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    assert memtrace.start(0, str(blocker / "sub" / "run")) is False
+    assert memtrace._file is None
+    assert "is off" in capsys.readouterr().out

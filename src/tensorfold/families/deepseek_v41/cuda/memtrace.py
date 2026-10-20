@@ -63,12 +63,24 @@ def _torch_stats(reset: bool) -> list[int]:
 
 
 def _write(kind: str, name: str, dur: float, reset: bool) -> None:
-    mem = meminfo()
-    t = _torch_stats(reset)
-    row = [kind, f"{time.time():.3f}", name, f"{dur:.3f}", *mem, _rss_kib(), *t]
-    with _lock:
-        if _file is not None:
-            _file.write(",".join(map(str, row)) + "\n")
+    """One row. A trace never stops the engine: a failed read or write (a full or read-only disk) ends the trace."""
+
+    global _file
+    try:
+        mem = meminfo()
+        t = _torch_stats(reset)
+        row = [kind, f"{time.time():.3f}", name, f"{dur:.3f}", *mem, _rss_kib(), *t]
+        with _lock:
+            if _file is not None:
+                _file.write(",".join(map(str, row)) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        with _lock:
+            gone, _file = _file, None
+        _stop.set()
+        if gone is not None:
+            print(f"[tensorfold] TF_DS_MEMTRACE stopped: {type(exc).__name__}: {str(exc)[:120]}", flush=True)
+            with contextlib.suppress(Exception):
+                gone.close()
 
 
 def _sample() -> None:
@@ -86,9 +98,15 @@ def start(rank: int, path: str | None = None) -> bool:
     prefix = PATH if path is None else path
     if not prefix or _file is not None:
         return False
-    os.makedirs(os.path.dirname(os.path.abspath(prefix)), exist_ok=True)
-    _file = open(f"{prefix}.rank{rank}.csv", "w", buffering=1)
-    _file.write(HEADER + "\n")
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(prefix)), exist_ok=True)
+        _file = open(f"{prefix}.rank{rank}.csv", "w", buffering=1)
+        _file.write(HEADER + "\n")
+    except OSError as exc:
+        _file = None
+        print(f"[tensorfold] TF_DS_MEMTRACE is off: {exc}", flush=True)
+        return False
+    _stop.clear()
     threading.Thread(target=_sample, daemon=True, name="memtrace").start()
     return True
 
