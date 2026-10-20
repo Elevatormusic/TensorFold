@@ -1,7 +1,7 @@
 """The "rank" depth policy (families/deepseek_v41/cuda/multi.py ``_rank_k``): the drafts a round verifies across all
 streams are the allocation with the most expected tokens a millisecond under the cost table, each stream's a
 prefix, within the round's row cap; one stream gets the k of the "conf" policy; a constrained stream's drafts its
-grammar cuts take no row; its drafter graphs run no more steps than the configured drafts."""
+grammar cuts take no row, nor a draft past the reply's last token; its drafter graphs run no more steps than the configured drafts."""
 
 from __future__ import annotations
 
@@ -78,8 +78,8 @@ class Prefix:                                      # a grammar that keeps the dr
         return SimpleNamespace(tokens=list(tokens[:n]))
 
 
-def stream(sid, constraint=None):
-    return SimpleNamespace(sid=sid, pending=0, constraint=constraint)
+def stream(sid, constraint=None, left=100):
+    return SimpleNamespace(sid=sid, pending=0, constraint=constraint, count=left, out=[])
 
 
 def test_cut_drafts_take_no_row():
@@ -92,6 +92,13 @@ def test_cut_drafts_take_no_row():
     assert pre[0][0] == [7] and 1 not in pre and 2 not in pre
     ks = dec._rank_k(3, [[9.0] * 5] * 3, caps)
     assert ks[0] <= 1 and 3 + sum(ks) == dec.max_rows and ks[1] >= 2
+
+
+def test_no_row_for_a_draft_past_the_last_token():
+    dec = decoder(max_rows=8)
+    drafting = [stream(0, left=3), stream(1, left=1), stream(2)]
+    caps = dec._grammar_caps(drafting, [[1] * 5] * 3, {0: 3, 1: 1, 2: 5}, {})
+    assert caps == [2, 0, 5]                       # 2 kept drafts and the round's token end a 3-token reply
 
 
 def test_rank_drafter_steps_stop_at_the_configured_drafts(monkeypatch):

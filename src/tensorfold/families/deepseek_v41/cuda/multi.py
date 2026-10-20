@@ -1144,12 +1144,13 @@ class MultiDecoder:
 
     @staticmethod
     def _grammar_caps(drafting: list, rows: list, want: dict, pre: dict) -> list[int]:
-        """TF_DS_DEPTH_POLICY=rank: each drafting stream's most drafts for the ranking. A constrained stream's drafts
-        stop where its grammar cuts them (``constrain.chain``), so only drafts the round can verify take a row; its
-        chain goes into ``pre`` for the round to use again. A chain that raises keeps the cap: the round's own chain
-        raises again and ends the stream."""
+        """TF_DS_DEPTH_POLICY=rank: each drafting stream's most drafts for the ranking. With R tokens left, R - 1
+        kept drafts and the round's own token fill the reply, so a stream ranks at most R - 1 drafts. A constrained
+        stream's drafts stop where its grammar cuts them (``constrain.chain``), so only drafts the round can verify
+        take a row; its chain goes into ``pre`` for the round to use again. A chain that raises keeps the cap: the
+        round's own chain raises again and ends the stream."""
 
-        caps = [want[s.sid] for s in drafting]
+        caps = [max(0, min(want[s.sid], s.count - len(s.out) - 1)) for s in drafting]
         for i, (s, r) in enumerate(zip(drafting, rows)):
             if s.constraint is not None:
                 try:
