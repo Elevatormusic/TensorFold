@@ -123,6 +123,7 @@ def _request(host: str, port: int, target: str, addresses: list[tuple],
         sock.settimeout(_remaining(deadline))
         sock.connect(address)
         context = ssl.create_default_context()        # TLS verified for the host, on the address checked for it
+        context.minimum_version = ssl.TLSVersion.TLSv1_2   # the Python 3.10+ default, said here (CodeQL py/insecure-protocol)
         sock = context.wrap_socket(sock, server_hostname=host, do_handshake_on_connect=False)
         live_socket[0] = sock
         sock.settimeout(_remaining(deadline))
