@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from typing import Any
@@ -13,6 +14,10 @@ from tensorfold.tool_parameters import decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+# any case: only the no-tools drop path uses these (the stream with tools keeps the exact tags, as before)
+_CALL_OPEN_ANY_RE = re.compile("<tool_call>", re.IGNORECASE)
+_CALL_CLOSE_ANY_RE = re.compile("</tool_call>", re.IGNORECASE)
+_CALL_OPEN_RE, _CALL_CLOSE_RE = re.compile(re.escape(_CALL_OPEN)), re.compile(re.escape(_CALL_CLOSE))
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
@@ -54,9 +59,9 @@ def dsml_to_tool_calls(text: str) -> str:
 
 
 
-def _partial_tag(text: str, tag: str) -> int:
+def _partial_tag(text: str, tag: str, *, any_case: bool = False) -> int:
     for k in range(min(len(tag) - 1, len(text)), 0, -1):
-        if text.endswith(tag[:k]):
+        if (text[-k:].lower() == tag[:k].lower()) if any_case else text.endswith(tag[:k]):
             return k
     return 0
 
@@ -112,32 +117,73 @@ class StopStrings:
         return StopPolicy.visible(self, text, partial=partial)
 
 
-def hide_tool_calls(text: str, *, finished: bool) -> str:
+def drop_unoffered_calls() -> bool:
+    """TF_DROP_UNOFFERED_TOOL_CALLS=1: a call to a tool that the request did not offer is removed from the content
+    and logged, instead of kept as text. A model can call a tool from an earlier turn or another harness; a client
+    then shows its markup as text."""
+
+    return os.environ.get("TF_DROP_UNOFFERED_TOOL_CALLS", "0") == "1"
+
+
+def keep_unoffered_call(text: str, name: Any) -> str:
+    """The content kept for a parsed call to a tool the request did not offer: its text, or nothing with the flag."""
+
+    if not drop_unoffered_calls():
+        return text
+    print(f"[tensorfold] dropped a call to a tool the request did not offer: {str(name)[:80]!r}", flush=True)
+    return ""
+
+
+def answer_without_tools(answer: str, *, finished: bool) -> str:
+    """The answer of a request that offers no tools: as it is, or with the flag, without its tool-call blocks (each
+    call is unoffered). While streaming, a block that has begun waits until it ends, as with tools. The finished
+    answer logs that blocks were dropped."""
+
+    if not drop_unoffered_calls():
+        return answer
+    shown = hide_tool_calls(answer, finished=finished, any_case=True)   # the parser finds tags in any case
+    if finished and shown != answer:
+        print("[tensorfold] dropped tool-call markup from a request that offered no tools", flush=True)
+    return shown
+
+
+def hide_tool_calls(text: str, *, finished: bool, any_case: bool = False) -> str:
     cut = text.find(_DSML_OPEN)                        # DeepSeek DSML: a calls block is hidden whole
     if cut >= 0:
-        head = _hide_tagged(text[:cut], finished=True)
+        head = _hide_tagged(text[:cut], finished=True, any_case=any_case)
         end = text.find(_DSML_CLOSE, cut)
         if end < 0:
             return head
-        return head + hide_tool_calls(text[end + len(_DSML_CLOSE):], finished=finished)
-    shown = _hide_tagged(text, finished=finished)
+        return head + hide_tool_calls(text[end + len(_DSML_CLOSE):], finished=finished, any_case=any_case)
+    shown = _hide_tagged(text, finished=finished, any_case=any_case)
     return shown if finished else shown[: len(shown) - _partial_tag(shown, _DSML_OPEN)]
 
 
-def _hide_tagged(text: str, *, finished: bool) -> str:
+def _hide_tagged(text: str, *, finished: bool, any_case: bool = False) -> str:
+    open_re, close_re = (_CALL_OPEN_ANY_RE, _CALL_CLOSE_ANY_RE) if any_case else (_CALL_OPEN_RE, _CALL_CLOSE_RE)
     out: list[str] = []
     pos = 0
     while True:
-        start = text.find(_CALL_OPEN, pos)
-        if start < 0:
+        opened = open_re.search(text, pos)
+        if opened is None:
             tail = text[pos:]
-            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
+            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN, any_case=any_case))])
             return "".join(out)
-        out.append(text[pos:start])
-        end = text.find(_CALL_CLOSE, start)
-        if end < 0:
+        out.append(text[pos:opened.start()])
+        closed = close_re.search(text, opened.end())
+        if closed is None:
             return "".join(out)
-        pos = end + len(_CALL_CLOSE)
+        pos = closed.end()
+
+
+def _finite_json(value: Any) -> bool:
+    """True when the value is valid strict JSON (json.loads accepts NaN and Infinity, the call path does not)."""
+
+    try:
+        json.dumps(value, allow_nan=False)
+    except (ValueError, TypeError):
+        return False
+    return True
 
 
 def _tool_name(tool: dict[str, Any]) -> str:
@@ -163,6 +209,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
             continue
         block = match.group(1).strip()
         name, args = None, {}
+        parsed = False                                  # the whole payload parsed, not only its name
         try:
             payload = json.loads(block)
             if isinstance(payload, dict):
@@ -171,6 +218,8 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 args = fn.get("arguments", fn.get("parameters", {}))
                 if isinstance(args, str):
                     args = json.loads(args) if args.strip() else {}
+                # a call needs a name and object arguments that are strict JSON
+                parsed = isinstance(name, str) and isinstance(args, dict) and _finite_json(args)
         except (json.JSONDecodeError, AttributeError):
             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
             if m:
@@ -182,13 +231,18 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 args = {key: decode_parameter(value, props.get(key, {}))
                         for key, value in ((p.group(1).strip(), p.group(2))
                                            for p in _TOOL_PARAMETER_BLOCK_RE.finditer(m.group(2)))}
+                parsed = not _TOOL_PARAMETER_BLOCK_RE.sub("", m.group(2)).strip()   # no text outside the parameters
             else:
                 glm = parse_glm_tool_call_block(block, tools, complete=max_calls is not None)
                 if glm is not None:
                     name, args = glm
+                    # no text outside the arguments, as the complete parser requires
+                    parsed = parse_glm_tool_call_block(block, tools, complete=True) is not None
         if not name or str(name).lower() not in known:
             if max_calls is None:
-                residue.append(match.group(0))
+                residue.append(keep_unoffered_call(match.group(0), name) if name and parsed else match.group(0))
+            elif name and parsed and drop_unoffered_calls():
+                keep_unoffered_call(match.group(0), name)    # single-call mode removes the block anyway: log it
             continue
         if max_calls is not None:
             try:
