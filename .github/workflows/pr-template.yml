@@ -1,5 +1,6 @@
 # Checks the text of each pull request against CONTRIBUTING.md: exactly one ticked type and an AI disclosure block.
-# This copy is the same as the DeepSeek recipe's. It adds the matching "type: ..." label and removes other type labels, so fork pull requests get labels too.
+# This copy is the same as the DeepSeek recipe's. It adds the matching "type: ..." label and removes other
+# type labels, so fork pull requests get labels too.
 # pull_request_target gives the token write access to labels. This workflow reads only the pull request text through
 # the API. It never checks out or runs the code of the pull request: do not add a checkout step.
 name: pr-template
