@@ -82,3 +82,10 @@ def test_without_tools_a_streamed_call_never_shows(drop, capsys):
     for end in range(len(answer) + 1):
         assert answer_without_tools(answer[:end], finished=False) == answer[:min(end, 5)]
     assert capsys.readouterr().out == ""                  # the log comes with the finished answer only
+
+
+def test_without_tools_the_flag_drops_a_mixed_case_call(drop):
+    text = 'Done.<TOOL_CALL>{"name": "apply_patch", "arguments": {}}</Tool_Call> Bye.'
+    assert answer_without_tools(text, finished=True) == "Done. Bye."
+    for cut in range(len(text) + 1):                # no prefix of the block shows while streaming
+        assert "TOOL" not in answer_without_tools(text[:cut], finished=False).upper()

@@ -14,6 +14,7 @@ from tensorfold.tool_parameters import decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+_CALL_OPEN_RE, _CALL_CLOSE_RE = re.compile("<tool_call>", re.IGNORECASE), re.compile("</tool_call>", re.IGNORECASE)
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
@@ -57,7 +58,7 @@ def dsml_to_tool_calls(text: str) -> str:
 
 def _partial_tag(text: str, tag: str) -> int:
     for k in range(min(len(tag) - 1, len(text)), 0, -1):
-        if text.endswith(tag[:k]):
+        if text[-k:].lower() == tag[:k].lower():         # tags match in any case, as the parser does
             return k
     return 0
 
@@ -159,16 +160,16 @@ def _hide_tagged(text: str, *, finished: bool) -> str:
     out: list[str] = []
     pos = 0
     while True:
-        start = text.find(_CALL_OPEN, pos)
-        if start < 0:
+        opened = _CALL_OPEN_RE.search(text, pos)
+        if opened is None:
             tail = text[pos:]
             out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
             return "".join(out)
-        out.append(text[pos:start])
-        end = text.find(_CALL_CLOSE, start)
-        if end < 0:
+        out.append(text[pos:opened.start()])
+        closed = _CALL_CLOSE_RE.search(text, opened.end())
+        if closed is None:
             return "".join(out)
-        pos = end + len(_CALL_CLOSE)
+        pos = closed.end()
 
 
 def _tool_name(tool: dict[str, Any]) -> str:
