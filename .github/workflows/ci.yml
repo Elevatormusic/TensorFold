@@ -84,7 +84,8 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      # gitleaks scans the commits of this branch for keys and tokens. The binary is pinned by version and SHA-256.
+      # gitleaks scans the commits of this branch (--log-opts=HEAD; its default is every branch) for keys and
+      # tokens. The binary is pinned by version and SHA-256.
       # The binary and its config stay in RUNNER_TEMP, outside the checkout. A pull request must not change them:
       # a .gitleaks.toml or .gitleaksignore in the checkout could turn the default rules off.
       - name: Install gitleaks
@@ -98,5 +99,5 @@ jobs:
           mkdir -p no-ignore
       - name: gitleaks (all commits of this branch)
         run: >-
-          "$RUNNER_TEMP/gitleaks" git . --config "$RUNNER_TEMP/gitleaks.toml"
+          "$RUNNER_TEMP/gitleaks" git . --log-opts=HEAD --config "$RUNNER_TEMP/gitleaks.toml"
           --gitleaks-ignore-path "$RUNNER_TEMP/no-ignore" --redact --no-banner --exit-code 1
