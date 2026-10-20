@@ -28,7 +28,8 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
 from tensorfold.cuda import health
 from tensorfold.cuda.chat_template import ChatTemplate
-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
+from tensorfold.cuda.reply_text import (StopStrings, StreamDecoder, answer_without_tools, hide_tool_calls,
+                                        parse_tool_calls)
 from tensorfold.cuda.turns import Turns, Yield
 from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
@@ -443,6 +444,8 @@ class App:
             if tools:
                 answer = (policy.content(answer, finished=finished) if policy.single
                           else hide_tool_calls(answer, finished=finished))
+            else:                                 # TF_DROP_UNOFFERED_TOOL_CALLS=1: every call is unoffered
+                answer = answer_without_tools(answer, finished=finished)
             return reasoning, answer
 
         serving: list[Any] = [None]

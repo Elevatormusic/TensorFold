@@ -3,24 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import uuid
 from typing import Any
 
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas
-
-
-def keep_unoffered_call(text: str, name: Any) -> str:
-    """The content kept for a call to a tool the request did not offer: its own text (the default), or nothing
-    with TF_DROP_UNOFFERED_TOOL_CALLS=1. A model that calls a tool from an earlier turn or another harness then
-    shows no tool markup to the user. The server logs each dropped call."""
-
-    if os.environ.get("TF_DROP_UNOFFERED_TOOL_CALLS", "0") != "1":
-        return text
-    print(f"[tensorfold] dropped a call to a tool the request did not offer: {str(name or '?')[:80]!r}", flush=True)
-    return ""
-
 
 def tool_spec_name(tool: dict[str, Any]) -> str:
     function = tool.get("function") if isinstance(tool, dict) else None
@@ -391,9 +378,7 @@ def parse_tool_calls_from_content(
         if not parsed or any(name.lower() not in known for name, _ in parsed):
             # A malformed or unoffered call stays text: the reply is content, never an error or a client retry loop.
             if max_calls is None:
-                unoffered = bool(parsed) and all(name.lower() not in known for name, _ in parsed)
-                residue_parts.append(keep_unoffered_call(text[start:end], parsed[0][0]) if unoffered
-                                     else text[start:end])
+                residue_parts.append(text[start:end])
             continue
         for one in parsed:
             if max_calls is None or len(calls) < max_calls:

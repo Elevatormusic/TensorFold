@@ -162,10 +162,11 @@ remain strings for the client to validate. Union types and schema references are
 
 A reply that is not a call returns as content, never an error: prose, JSON that names no offered tool
 (a structured answer), and malformed or unoffered `<tool_call>` blocks, which keep their text.
-With `TF_DROP_UNOFFERED_TOOL_CALLS=1` in the server's environment, a call to a tool that the request did not offer
-is removed from the content instead, and the server logs the tool name. Use it when a model calls tools from an
-earlier turn or another harness and the client shows the markup as text. A malformed call, and a DSML block that
-mixes offered and unoffered calls on the Mac server, keep their text.
+On the CUDA server, `TF_DROP_UNOFFERED_TOOL_CALLS=1` in the server's environment removes a call to a tool that the
+request did not offer from the content instead, and the server logs it. Use it when a model calls tools from an
+earlier turn or another harness and the client shows the markup as text. With tools offered, offered calls stay
+calls and a block that does not parse keeps its text. With no tools offered (or `tool_choice: "none"`), each
+tool-call block is removed, also while streaming.
 
 With `parallel_tool_calls: false`, the server buffers tool deltas until it can return the first valid
 completed call. Prose and reasoning can still stream. Usage counts the entire decoded reply, including
