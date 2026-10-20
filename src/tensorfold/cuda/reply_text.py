@@ -216,7 +216,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 args = {key: decode_parameter(value, props.get(key, {}))
                         for key, value in ((p.group(1).strip(), p.group(2))
                                            for p in _TOOL_PARAMETER_BLOCK_RE.finditer(m.group(2)))}
-                parsed = True
+                parsed = not _TOOL_PARAMETER_BLOCK_RE.sub("", m.group(2)).strip()   # no text outside the parameters
             else:
                 glm = parse_glm_tool_call_block(block, tools, complete=max_calls is not None)
                 if glm is not None:

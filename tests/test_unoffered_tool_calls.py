@@ -65,6 +65,15 @@ def test_the_flag_keeps_a_call_that_is_not_a_valid_call(drop, payload):
     text = f"<tool_call>{payload}</tool_call>"
     assert parse_tool_calls("Done." + text, TOOLS) == ("Done." + text, None)
 
+def test_the_flag_keeps_a_function_block_with_text_outside_its_parameters(drop):
+    text = "<tool_call><function=apply_patch>junk</function></tool_call>"
+    assert parse_tool_calls("Done." + text, TOOLS) == ("Done." + text, None)
+
+
+def test_the_flag_drops_a_valid_function_block(drop):
+    text = "<tool_call><function=apply_patch>\n<parameter=patch>x</parameter>\n</function></tool_call>"
+    assert parse_tool_calls("Done." + text, TOOLS) == ("Done.", None)
+
 def test_without_tools_the_answer_is_unchanged_by_default(monkeypatch):
     monkeypatch.delenv("TF_DROP_UNOFFERED_TOOL_CALLS", raising=False)
     answer = "Done." + _dsml("apply_patch")
