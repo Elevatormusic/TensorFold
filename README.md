@@ -1,5 +1,7 @@
 # TensorFold
 
+> **This is a fork** of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) for DGX Spark clusters. Branch `deepseek-v41-tp2` serves DeepSeek-V4.1-Flash on two DGX Spark (TP=2), for the [DeepSeek recipe](https://github.com/Elevatormusic/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark). Branch `glm-dsa-tp4` serves GLM-5.3 on four (TP=4). Engine releases (`dsv41-X.Y.Z`) are on the [releases page](https://github.com/Elevatormusic/TensorFold/releases). Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. The rest of this page is the upstream README.
+
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
 
