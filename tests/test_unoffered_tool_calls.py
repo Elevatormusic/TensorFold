@@ -59,6 +59,12 @@ def test_the_flag_keeps_a_call_whose_arguments_do_not_parse(drop):
     assert parse_tool_calls("Done." + text, TOOLS) == ("Done." + text, None)
 
 
+@pytest.mark.parametrize("payload", ['{"name": "apply_patch", "arguments": []}', '{"name": "apply_patch", "arguments": 1}',
+                                     '{"name": "apply_patch", "arguments": "true"}', '{"name": 5, "arguments": {}}'])
+def test_the_flag_keeps_a_call_that_is_not_a_valid_call(drop, payload):
+    text = f"<tool_call>{payload}</tool_call>"
+    assert parse_tool_calls("Done." + text, TOOLS) == ("Done." + text, None)
+
 def test_without_tools_the_answer_is_unchanged_by_default(monkeypatch):
     monkeypatch.delenv("TF_DROP_UNOFFERED_TOOL_CALLS", raising=False)
     answer = "Done." + _dsml("apply_patch")

@@ -203,7 +203,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 args = fn.get("arguments", fn.get("parameters", {}))
                 if isinstance(args, str):
                     args = json.loads(args) if args.strip() else {}
-                parsed = True
+                parsed = isinstance(name, str) and isinstance(args, dict)   # a call needs a name and object arguments
         except (json.JSONDecodeError, AttributeError):
             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
             if m:
