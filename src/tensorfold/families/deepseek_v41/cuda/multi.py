@@ -506,29 +506,29 @@ class MultiDecoder:
                           flush=True)
                     self.spill = None
 
-    def warm(self, buckets=(1024, 2048, 4096, 8192)) -> None:
-        """Before serving, on every rank in the same order: round graphs for 1 .. 16 rows at the small context
-        buckets (synthetic rows on slot 0, which a request rewrites before it reads them) and each slot's drafter
-        graph."""
+    def warm(self) -> None:
+        """Before serving, on every rank in the same order: a round graph for every (rows, context bucket) a round
+        can use (``RoundRunner.keys``; synthetic rows on slot 0, which a request rewrites before it reads them), the
+        largest bucket first, and each slot drafter graph. A round then never captures while serving."""
 
         t0 = time.perf_counter()
+        r0 = torch.cuda.memory_reserved()
         n = 0
-        for b in buckets:
-            if b > self.cap:
-                break
-            host = [1000 + (i * 7919) % 60000 for i in range(b)]
-            for R in range(self.max_rows, 0, -1):
-                if (R, self.runner.bucket(b)) in (self.runner.graphs or {}):
-                    continue
-                self.runner.forward([(0, 0, self.extents.total, b - R, host[b - R:b], host)], replay=False)
-                n += 1
+        host = [1000 + (i * 7919) % 60000 for i in range(self.cap)]
+        for R, b in self.runner.keys():
+            if (R, b) in (self.runner.graphs or {}):
+                continue
+            self.runner.forward([(0, 0, self.extents.total, b - R, host[b - R:b], host)], replay=False)
+            n += 1
         if self.e.drafter is not None:
             for k in range(1, len(self.slots) + 1):
                 self._drafts([0] * k, [1] * k, list(range(k)))
         torch.cuda.synchronize()
+        self.runner.warmed = True
         if self.e.rank == 0:
             print(f"[tensorfold] --parallel warm-up: {n} round graphs, {len(self.drafters)} drafter graphs, "
-                  f"{time.perf_counter() - t0:.1f}s", flush=True)
+                  f"{time.perf_counter() - t0:.1f}s, reserved {(torch.cuda.memory_reserved() - r0) / 2**20:+.0f} MiB",
+                  flush=True)
 
     def _drafts(self, tokens: list[int], q0: list[int], slots: list[int]) -> list[list[int]]:
         """Every drafting stream's drafts from one batched drafter pass (a graph a stream count)."""

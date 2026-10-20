@@ -18,6 +18,7 @@ from . import kernels as K
 from . import markov as _markov
 from . import model as _model
 from . import rounds as _rounds
+from .graph_keys import CAPTURE_MODE
 from .model import KV_QUANT, Model, attn_in, l2_fork, l2_join, mm, q_proj, wo_a_out, wo_ab
 
 # TF_DS_DRAFT_FUSED=1 (default): the batched drafter graph's stages take the decode round's fused kernels (each
@@ -253,7 +254,7 @@ class DraftGraph:
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=pool):
+        with torch.cuda.graph(self.graph, pool=pool, capture_error_mode=CAPTURE_MODE):
             self._body()
         torch.cuda.synchronize()
 
@@ -422,7 +423,7 @@ class BatchDraftGraph:
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=pool):
+        with torch.cuda.graph(self.graph, pool=pool, capture_error_mode=CAPTURE_MODE):
             self._body()
         torch.cuda.synchronize()
 
