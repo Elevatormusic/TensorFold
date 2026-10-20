@@ -1141,6 +1141,23 @@ class MultiDecoder:
         ks[s.sid] = best
         return ks
 
+    @staticmethod
+    def _grammar_caps(drafting: list, rows: list, want: dict, pre: dict) -> list[int]:
+        """TF_DS_DEPTH_POLICY=rank: each drafting stream's most drafts for the ranking. A constrained stream's drafts
+        stop where its grammar cuts them (``constrain.chain``), so only drafts the round can verify take a row; its
+        chain goes into ``pre`` for the round to use again. A chain that raises keeps the cap: the round's own chain
+        raises again and ends the stream."""
+
+        caps = [want[s.sid] for s in drafting]
+        for i, (s, r) in enumerate(zip(drafting, rows)):
+            if s.constraint is not None:
+                try:
+                    pre[s.sid] = constrain.chain(s.constraint, s.pending, list(r[:caps[i]]))
+                    caps[i] = len(pre[s.sid][0])
+                except Exception:                        # noqa: BLE001
+                    pre.pop(s.sid, None)
+        return caps
+
     def _rank_k(self, live: int, confs: list, want: list[int]) -> list[int]:
         """TF_DS_DEPTH_POLICY=rank: each drafting stream's k (``confs``: its confidence logits, ``want``: its most
         drafts) from one ranking of all their drafts; ``live`` streams run the round."""
@@ -1241,6 +1258,7 @@ class MultiDecoder:
                 self.runner.engram_touch([[*s.st.sc.host[max(0, s.st.sc.length - 8):s.st.sc.length].tolist(),
                                            s.pending] for s in live])
             proposed, confs = {}, {}
+            pre: dict[int, tuple] = {}                   # rank: a constrained stream's chain before the ranking
             _ht("touched")
             if drafting:
                 rows = self._drafts([s.pending for s in drafting], [s.st.sc.length for s in drafting],
@@ -1248,7 +1266,8 @@ class MultiDecoder:
                 conf_rows = self.drafters[len(drafting)].last_conf
                 even = None
                 if DEPTH_POLICY == "rank":
-                    ks = self._rank_k(len(live), conf_rows, [want[s.sid] for s in drafting])
+                    caps = self._grammar_caps(drafting, rows, want, pre)
+                    ks = self._rank_k(len(live), conf_rows, caps)
                     even = {s.sid: kk for s, kk in zip(drafting, ks)}
                 elif DEPTH_POLICY == "even" and len(drafting) > 1 and \
                         max(s.rounds for s in drafting) - min(s.rounds for s in drafting) <= EVEN_COHORT:
@@ -1271,7 +1290,10 @@ class MultiDecoder:
                 drafts: list[int] = proposed.get(s.sid, [])
                 if s.constraint is not None:             # the drafts its grammar cannot keep are cut before the forward
                     try:
-                        drafts, grammars[s.sid] = constrain.chain(s.constraint, s.pending, drafts)
+                        if s.sid in pre and pre[s.sid][0] == drafts:    # the ranking kept all of them: same window
+                            drafts, grammars[s.sid] = pre[s.sid]
+                        else:
+                            drafts, grammars[s.sid] = constrain.chain(s.constraint, s.pending, drafts)
                     except GrammarError as exc:
                         self._grammar_failed(s, exc)
                     except Exception as exc:             # noqa: BLE001  (it keeps its rows this round, no tokens)

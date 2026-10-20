@@ -1,12 +1,14 @@
 """The "rank" depth policy (families/deepseek_v41/cuda/multi.py ``_rank_k``): the drafts a round verifies across all
 streams are the allocation with the most expected tokens a millisecond under the cost table, each stream's a
-prefix, within the round's row cap; one stream gets the k of the "conf" policy."""
+prefix, within the round's row cap; one stream gets the k of the "conf" policy; a constrained stream's drafts its
+grammar cuts take no row."""
 
 from __future__ import annotations
 
 import itertools
 import math
 import random
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,3 +63,32 @@ def test_sure_streams_fill_the_row_cap():
     assert sum(ks) == dec.max_rows - 4 and max(ks) - min(ks) <= 1
     ks = dec._rank_k(4, [[9.0] * 5, [-4.0] * 5, [-4.0] * 5, [-4.0] * 5], [5] * 4)
     assert ks[0] == 5 and ks[1:] == [0, 0, 0]
+
+
+class Prefix:                                      # a grammar that keeps the drafts up to the first one not in ``ok``
+    def __init__(self, ok, fail=False):
+        self.ok, self.fail = set(ok), fail
+
+    def window(self, tokens, parents):
+        if self.fail:
+            raise RuntimeError("grammar failed")
+        n = 1
+        while n < len(tokens) and tokens[n] in self.ok:
+            n += 1
+        return SimpleNamespace(tokens=list(tokens[:n]))
+
+
+def stream(sid, constraint=None):
+    return SimpleNamespace(sid=sid, pending=0, constraint=constraint)
+
+
+def test_cut_drafts_take_no_row():
+    dec = decoder(max_rows=8)
+    drafting = [stream(0, Prefix(ok={7})), stream(1), stream(2, Prefix(ok=set(), fail=True))]
+    rows = [[7, 9, 9, 9, 9], [5, 5, 5, 5, 5], [3, 3, 3, 3, 3]]
+    pre = {}
+    caps = dec._grammar_caps(drafting, rows, {0: 5, 1: 5, 2: 4}, pre)
+    assert caps == [1, 5, 4]                       # the failed grammar keeps its cap: the round's chain ends it
+    assert pre[0][0] == [7] and 1 not in pre and 2 not in pre
+    ks = dec._rank_k(3, [[9.0] * 5] * 3, caps)
+    assert ks[0] <= 1 and 3 + sum(ks) == dec.max_rows and ks[1] >= 2
