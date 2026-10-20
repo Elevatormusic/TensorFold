@@ -1,0 +1,83 @@
+# Offline checks for every pull request into this engine branch and every push to it. They run on GitHub-hosted
+# runners with no GPU. Tests that need PyTorch, CUDA or MLX skip themselves (pytest.importorskip).
+# The job names (python, workflows) are required status checks of the branch ruleset: if you rename a job,
+# change the ruleset too. The secret scan is in secret-scan.yml: it must run from the base branch.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [deepseek-v41-tp2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: python
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install the package and the lint tools
+        run: |
+          python -m pip install --disable-pip-version-check -r .github/requirements-ci.txt
+          python -m pip install --disable-pip-version-check -e '.[test,tui]'
+      # The branch has old lint findings from upstream. CI checks only the Python files that this change adds or
+      # edits, for syntax errors and undefined names (E9, F63, F7, F82). Clean up old files in their own change.
+      - name: ruff (changed files)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then BASE=HEAD~1; fi
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$BASE"...HEAD -- '*.py' \
+            ':!:src/tensorfold/families/deepseek_v4/vendor/**')
+          if [ "${#files[@]}" -eq 0 ]; then echo "no changed Python files"; exit 0; fi
+          printf 'checking %s\n' "${files[@]}"
+          ruff check --output-format github --select E9,F63,F7,F82 "${files[@]}"
+      # .github/known-test-failures.txt lists the tests that already fail on a Linux runner (most need MLX). CI
+      # deselects them, so a red job means a new failure. --timeout stops a test that hangs (one cancellation test
+      # hung until the job timeout).
+      - name: pytest (CPU)
+        run: |
+          args=()
+          while IFS= read -r id; do
+            case "$id" in ''|'#'*) continue ;; esac
+            args+=(--deselect "$id")
+          done < .github/known-test-failures.txt
+          echo "deselecting ${#args[@]} arguments (2 for each known failure)"
+          python -m pytest -q -p no:cacheprovider --timeout=120 "${args[@]}" tests
+
+  workflows:
+    name: workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install actionlint and zizmor
+        run: python -m pip install --disable-pip-version-check -r .github/requirements-ci.txt
+      # actionlint: syntax, expressions and shell steps of each workflow.
+      - name: actionlint
+        run: actionlint -color
+      # zizmor: security audit of each workflow (injection, unsafe triggers, unpinned or impostor actions).
+      # A finding that is safe by design needs an inline "# zizmor: ignore[<audit>]" with the reason.
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format github .github/workflows/
