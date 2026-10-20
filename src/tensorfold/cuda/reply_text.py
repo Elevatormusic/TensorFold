@@ -172,6 +172,16 @@ def _hide_tagged(text: str, *, finished: bool) -> str:
         pos = closed.end()
 
 
+def _finite_json(value: Any) -> bool:
+    """True when the value is valid strict JSON (json.loads accepts NaN and Infinity, the call path does not)."""
+
+    try:
+        json.dumps(value, allow_nan=False)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
 def _tool_name(tool: dict[str, Any]) -> str:
     fn = tool.get("function") if isinstance(tool, dict) else None
     return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
@@ -204,7 +214,8 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 args = fn.get("arguments", fn.get("parameters", {}))
                 if isinstance(args, str):
                     args = json.loads(args) if args.strip() else {}
-                parsed = isinstance(name, str) and isinstance(args, dict)   # a call needs a name and object arguments
+                # a call needs a name and object arguments that are strict JSON
+                parsed = isinstance(name, str) and isinstance(args, dict) and _finite_json(args)
         except (json.JSONDecodeError, AttributeError):
             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
             if m:
@@ -221,7 +232,8 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 glm = parse_glm_tool_call_block(block, tools, complete=max_calls is not None)
                 if glm is not None:
                     name, args = glm
-                    parsed = True
+                    # no text outside the arguments, as the complete parser requires
+                    parsed = parse_glm_tool_call_block(block, tools, complete=True) is not None
         if not name or str(name).lower() not in known:
             if max_calls is None:
                 residue.append(keep_unoffered_call(match.group(0), name) if name and parsed else match.group(0))

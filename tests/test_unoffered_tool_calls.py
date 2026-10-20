@@ -74,6 +74,22 @@ def test_the_flag_drops_a_valid_function_block(drop):
     text = "<tool_call><function=apply_patch>\n<parameter=patch>x</parameter>\n</function></tool_call>"
     assert parse_tool_calls("Done." + text, TOOLS) == ("Done.", None)
 
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_the_flag_keeps_a_call_with_non_finite_arguments(drop, value):
+    text = '<tool_call>{"name": "apply_patch", "arguments": {"x": ' + value + '}}</tool_call>'
+    assert parse_tool_calls("Done." + text, TOOLS) == ("Done." + text, None)
+
+
+def test_the_flag_keeps_a_glm_block_with_text_outside_its_arguments(drop):
+    text = "<tool_call>apply_patch<arg_key>x</arg_key><arg_value>1</arg_value>junk</tool_call>"
+    assert parse_tool_calls("Done." + text, TOOLS) == ("Done." + text, None)
+
+
+def test_the_flag_drops_a_complete_glm_block(drop):
+    text = "<tool_call>apply_patch<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>"
+    assert parse_tool_calls("Done." + text, TOOLS) == ("Done.", None)
+
 def test_without_tools_the_answer_is_unchanged_by_default(monkeypatch):
     monkeypatch.delenv("TF_DROP_UNOFFERED_TOOL_CALLS", raising=False)
     answer = "Done." + _dsml("apply_patch")
