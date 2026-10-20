@@ -561,8 +561,10 @@ class MultiDecoder:
                   f"{time.perf_counter() - t0:.1f}s, reserved {(torch.cuda.memory_reserved() - r0) / 2**20:+.0f} MiB",
                   flush=True)
 
-    def _drafts(self, tokens: list[int], q0: list[int], slots: list[int]) -> list[list[int]]:
-        """Every drafting stream's drafts from one batched drafter pass (a graph a stream count)."""
+    def _drafts(self, tokens: list[int], q0: list[int], slots: list[int],
+                samplings: list | None = None) -> list[list[int]]:
+        """Every drafting stream's drafts from one batched drafter pass (graphs a stream count); ``samplings``: the
+        streams' sampling rules (a sampled stream's drafts are coupled to its keyed draws, markov.COUPLED)."""
 
         from .dspark import BatchDraftGraph
 
@@ -584,7 +586,7 @@ class MultiDecoder:
                 g.capture(self.e.runner.pool)
             self.drafters[N] = g
         _ht("drafter run")
-        return g.run(tokens, q0, slots)
+        return g.run(tokens, q0, slots, samplings)
 
     # -- the scheduler's interface --------------------------------------------------------------------------------
     def live(self) -> int:
@@ -1344,7 +1346,7 @@ class MultiDecoder:
             _ht("touched")
             if drafting:
                 rows = self._drafts([s.pending for s in drafting], [s.st.sc.length for s in drafting],
-                                    [s.st.index for s in drafting])
+                                    [s.st.index for s in drafting], [s.sampling for s in drafting])
                 conf_rows = self.drafters[len(drafting)].last_conf
                 even = None
                 if DEPTH_POLICY == "rank":
