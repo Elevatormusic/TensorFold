@@ -22,6 +22,11 @@ class DsApp(App):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        # --vision-max-images: images take DsVision.split's path, not the shared image limits, so its own count
+        # check gets the server's value (DsVision's default is 8)
+        vision, images = getattr(self.engine, "vision", None), kwargs.get("vision_max_images")
+        if vision is not None and images is not None:
+            vision.max_images = int(images)
         template = self.template
         template.efforts = frozenset(EFFORT_VALUES)     # the server passes every name through unchanged
         # DeepSeek's encoding keeps a second leading system message (Codex's developer turn, say) as its own
