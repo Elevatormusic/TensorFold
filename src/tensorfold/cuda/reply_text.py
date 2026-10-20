@@ -14,7 +14,10 @@ from tensorfold.tool_parameters import decode_parameter, parameter_schemas
 
 _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
-_CALL_OPEN_RE, _CALL_CLOSE_RE = re.compile("<tool_call>", re.IGNORECASE), re.compile("</tool_call>", re.IGNORECASE)
+# any case: only the no-tools drop path uses these (the stream with tools keeps the exact tags, as before)
+_CALL_OPEN_ANY_RE = re.compile("<tool_call>", re.IGNORECASE)
+_CALL_CLOSE_ANY_RE = re.compile("</tool_call>", re.IGNORECASE)
+_CALL_OPEN_RE, _CALL_CLOSE_RE = re.compile(re.escape(_CALL_OPEN)), re.compile(re.escape(_CALL_CLOSE))
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
@@ -56,9 +59,9 @@ def dsml_to_tool_calls(text: str) -> str:
 
 
 
-def _partial_tag(text: str, tag: str) -> int:
+def _partial_tag(text: str, tag: str, *, any_case: bool = False) -> int:
     for k in range(min(len(tag) - 1, len(text)), 0, -1):
-        if text[-k:].lower() == tag[:k].lower():         # tags match in any case, as the parser does
+        if (text[-k:].lower() == tag[:k].lower()) if any_case else text.endswith(tag[:k]):
             return k
     return 0
 
@@ -138,35 +141,36 @@ def answer_without_tools(answer: str, *, finished: bool) -> str:
 
     if not drop_unoffered_calls():
         return answer
-    shown = hide_tool_calls(answer, finished=finished)
+    shown = hide_tool_calls(answer, finished=finished, any_case=True)   # the parser finds tags in any case
     if finished and shown != answer:
         print("[tensorfold] dropped tool-call markup from a request that offered no tools", flush=True)
     return shown
 
 
-def hide_tool_calls(text: str, *, finished: bool) -> str:
+def hide_tool_calls(text: str, *, finished: bool, any_case: bool = False) -> str:
     cut = text.find(_DSML_OPEN)                        # DeepSeek DSML: a calls block is hidden whole
     if cut >= 0:
-        head = _hide_tagged(text[:cut], finished=True)
+        head = _hide_tagged(text[:cut], finished=True, any_case=any_case)
         end = text.find(_DSML_CLOSE, cut)
         if end < 0:
             return head
-        return head + hide_tool_calls(text[end + len(_DSML_CLOSE):], finished=finished)
-    shown = _hide_tagged(text, finished=finished)
+        return head + hide_tool_calls(text[end + len(_DSML_CLOSE):], finished=finished, any_case=any_case)
+    shown = _hide_tagged(text, finished=finished, any_case=any_case)
     return shown if finished else shown[: len(shown) - _partial_tag(shown, _DSML_OPEN)]
 
 
-def _hide_tagged(text: str, *, finished: bool) -> str:
+def _hide_tagged(text: str, *, finished: bool, any_case: bool = False) -> str:
+    open_re, close_re = (_CALL_OPEN_ANY_RE, _CALL_CLOSE_ANY_RE) if any_case else (_CALL_OPEN_RE, _CALL_CLOSE_RE)
     out: list[str] = []
     pos = 0
     while True:
-        opened = _CALL_OPEN_RE.search(text, pos)
+        opened = open_re.search(text, pos)
         if opened is None:
             tail = text[pos:]
-            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN))])
+            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN, any_case=any_case))])
             return "".join(out)
         out.append(text[pos:opened.start()])
-        closed = _CALL_CLOSE_RE.search(text, opened.end())
+        closed = close_re.search(text, opened.end())
         if closed is None:
             return "".join(out)
         pos = closed.end()

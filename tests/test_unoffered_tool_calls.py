@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from tensorfold.cuda.reply_text import answer_without_tools, parse_tool_calls
+from tensorfold.cuda.reply_text import answer_without_tools, hide_tool_calls, parse_tool_calls
 
 D = "｜DSML｜"
 TOOLS = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {}}}}]
@@ -120,3 +120,10 @@ def test_without_tools_the_flag_drops_a_mixed_case_call(drop):
     assert answer_without_tools(text, finished=True) == "Done. Bye."
     for cut in range(len(text) + 1):                # no prefix of the block shows while streaming
         assert "TOOL" not in answer_without_tools(text[:cut], finished=False).upper()
+
+
+def test_with_tools_the_stream_keeps_a_mixed_case_block(monkeypatch):
+    monkeypatch.delenv("TF_DROP_UNOFFERED_TOOL_CALLS", raising=False)
+    text = "A<TOOL_CALL>bad</TOOL_CALL>B"
+    assert hide_tool_calls(text, finished=True) == text
+    assert parse_tool_calls(text, TOOLS) == (text, None)
