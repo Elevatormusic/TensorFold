@@ -18,7 +18,8 @@ import torch.nn.functional as F
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
 from . import model as _model
-from .graph_keys import CAPTURE_MODE, bucket_for, padded_rows, round_keys, row_sizes
+from .graph_keys import (CAPTURE_MODE, ROUND_ROWS, ROUND_ROWS_LONG, bucket_for, padded_rows, round_keys, row_sizes,
+                         sizes_for)
 from .model import (KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, attn_in, attn_in_rot,
                     l2_fork, l2_join, mm, moe_side, q_proj, store_rows, wo_a_out, wo_a_rot, wo_ab)
 
@@ -622,7 +623,8 @@ class RoundRunner:
         self.graph_pool = graph_pool
         self.captures = 0          # graphs captured after the warm-up: each one stalls its round
         self.warmed = False
-        self.sizes = row_sizes(MAX_ROWS)
+        self.sizes = row_sizes(MAX_ROWS, ROUND_ROWS)                 # the row sizes of the graphs (graph_keys)
+        self.sizes_long = row_sizes(MAX_ROWS, ROUND_ROWS_LONG)
         self.out = None
         if SHARED_OUT:                                  # outside every capture: each graph writes these same rows
             c, w = model.cfg, model.w
@@ -637,7 +639,7 @@ class RoundRunner:
         """Every (rows, bucket) a round can use when a stream reaches ``limit`` tokens at most (the extent pool total:
         the pool cap is above it), in warm-up order (``graph_keys.round_keys``)."""
 
-        return round_keys(min(limit, self.pool.cap), self.pool.cap, self.sizes)
+        return round_keys(min(limit, self.pool.cap), self.pool.cap, self.sizes, self.sizes_long)
 
     def engram_touch(self, tails: list[list[int]]) -> None:
         """``tails``: each stream's host ids ending with its pending token, the n-gram's tokens before it included (or
@@ -683,7 +685,7 @@ class RoundRunner:
         b = self.bucket(max(p + 1 for p in pos))
         Rg = R
         if self.graphs is not None:                        # also a capture-only call: it makes the key a round uses
-            Rg = padded_rows(R, self.sizes)
+            Rg = padded_rows(R, sizes_for(b, self.sizes, self.sizes_long))
             for col in (ids, pos, slots, base, end):       # the extra rows copy the last row (graph_keys.ROUND_ROWS)
                 col += col[-1:] * (Rg - R)
         e_rows = e_start = None
