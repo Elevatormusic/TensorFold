@@ -20,6 +20,7 @@ Do not open a pull request against `main` for engine code. `main` follows upstre
 Issues are off in this fork. Report a problem with the recipe that uses the engine:
 
 - DeepSeek-V4.1-Flash on two DGX Spark: [the recipe issues](https://github.com/Elevatormusic/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark/issues/new/choose). Use the bug report form and give the engine image id.
+- GLM-5.3 on four DGX Spark (branch `glm-dsa-tp4`): this has no issue tracker yet. For now, open a post in [the DeepSeek recipe Discussions](https://github.com/Elevatormusic/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark/discussions), put `glm-dsa-tp4` in the title, and give the engine image id.
 - A question: [the recipe Discussions](https://github.com/Elevatormusic/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark/discussions).
 
 If the problem is in TensorFold itself and not in the fork, report it upstream.
