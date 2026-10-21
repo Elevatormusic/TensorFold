@@ -27,12 +27,13 @@ def grace() -> float:
 
 
 def leave(app: Any, code: int = 0) -> NoReturn:
-    """Stop the app's scheduler worker if it stops in time, flush stdout and stderr, end the process with ``code``."""
+    """Stop the app's scheduler worker after its current round if that ends in time, flush stdout and stderr, end the
+    process with ``code``."""
 
     scheduler = getattr(getattr(app, "engine", None), "scheduler", None)
     if scheduler is not None:
         try:
-            scheduler.close(timeout=grace())
+            scheduler.close(timeout=grace(), drain=False)
         except Exception:                                # noqa: BLE001  (the process ends here either way)
             pass
     for stream in (sys.stdout, sys.stderr):

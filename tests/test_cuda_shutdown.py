@@ -47,6 +47,52 @@ def test_close_with_a_timeout_reports_a_busy_worker():
     assert scheduler.decoder is None
 
 
+class Streaming(Busy):
+    """A stream that needs two rounds; the first does not return until ``release`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rounds = 0
+
+    def live(self):
+        return 1 if self.rounds < 2 else 0
+
+    def round(self):
+        self.rounds += 1
+        if self.rounds == 1:
+            self.entered.set()
+            self.release.wait(30)
+        return []
+
+
+def test_close_while_a_stream_is_live_lets_the_worker_finish_it_and_end_without_an_error(monkeypatch):
+    errors = []
+    monkeypatch.setattr(threading, "excepthook", errors.append)
+    decoder = Streaming()
+    scheduler = Scheduler(decoder)
+    assert decoder.entered.wait(5)
+    assert scheduler.close(timeout=0.1) is False         # (close's mark waits in the queue behind the busy round)
+    decoder.release.set()
+    scheduler.thread.join(5)
+    assert not scheduler.thread.is_alive()
+    assert decoder.rounds == 2                           # the live stream ran to its end
+    assert errors == []
+
+
+def test_close_without_drain_ends_the_worker_after_its_current_round(monkeypatch):
+    errors = []
+    monkeypatch.setattr(threading, "excepthook", errors.append)
+    decoder = Streaming()
+    scheduler = Scheduler(decoder)
+    assert decoder.entered.wait(5)
+    assert scheduler.close(timeout=0.1, drain=False) is False
+    decoder.release.set()
+    scheduler.thread.join(5)
+    assert not scheduler.thread.is_alive()
+    assert decoder.rounds == 1                           # the stream was left, not finished
+    assert errors == []
+
+
 def test_leave_ends_the_process_with_the_code_when_the_worker_is_stuck(monkeypatch, capsys):
     ended = []
 
