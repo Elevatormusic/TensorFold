@@ -24,6 +24,12 @@ const key = "tfprobe_k";
 /// Blanks around and between calls: the template's newlines, never an endless run.
 const blanks = "[ \\t\\r\\n]{0,8}";
 
+/// A DSML string argument's value: any text with no `<`, blanks, `/`, blanks, `｜` in it, so a look-alike of the end
+/// tag (`</｜DSML｜  parameter>`) cannot run on inside the value and the exact end tag is the only way out.
+/// The states of "no match yet": after text (s0), after `<` and blanks (s1), after `</` and blanks (s2).
+const string_value = "([^<]|<([ \\t\\r\\n<]|/[ \\t\\r\\n]*<)*([^ \\t\\r\\n/<]|/[ \\t\\r\\n]*[^ \\t\\r\\n<\u{ff5c}]))*" ++
+    "(<([ \\t\\r\\n<]|/[ \\t\\r\\n]*<)*(/[ \\t\\r\\n]*)?)?";
+
 /// The most blank characters between an argument's JSON tokens (grammar.py BLANKS).
 const value_blanks = 32;
 
@@ -124,7 +130,7 @@ fn dsmlInvoke(a: Allocator, name: []const u8, schema: Value) Allocator.Error!Val
 fn dsmlParameter(a: Allocator, key_name: []const u8, schema: Value) Allocator.Error!Value {
     const is_string = if (schema.get("type")) |t| (t == .string and std.mem.eql(u8, t.string, "string")) else false;
     const begin = try std.fmt.allocPrint(a, "<" ++ dsml ++ " parameter name=\"{s}\" string=\"{s}\">", .{ key_name, if (is_string) "true" else "false" });
-    const content = if (is_string) try node(a, "any_text", &.{}) else try arguments(a, schema, "json");
+    const content = if (is_string) try node(a, "regex", &.{.{ "pattern", .{ .string = string_value } }}) else try arguments(a, schema, "json");
     return node(a, "tag", &.{ .{ "begin", .{ .string = begin } }, .{ "content", content }, .{ "end", .{ .string = "</" ++ dsml ++ " parameter>" } } });
 }
 
@@ -197,7 +203,9 @@ test "a DSML required call: one calls block, the invoke's name, string and JSON 
     try std.testing.expect(std.mem.indexOf(u8, g, "invoke name=\\\"get_weather\\\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"city\\\" string=\\\"true\\\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"days\\\" string=\\\"false\\\">") != null);
-    try std.testing.expect(std.mem.indexOf(u8, g, "\"type\":\"any_text\"") != null);
+    // a string value is the regex that keeps end-tag look-alikes out, not any text
+    try std.testing.expect(std.mem.indexOf(u8, g, "\"type\":\"any_text\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "\"type\":\"regex\",\"pattern\":\"([^<]|<(") != null);
     // the optional unit may come after the required ones (a star); one call without parallel: the star is the unit's
     const unit = std.mem.indexOf(u8, g, "parameter name=\\\"unit\\\"").?;
     try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"days\\\"").? < unit);
