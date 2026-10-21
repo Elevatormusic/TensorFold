@@ -9,6 +9,10 @@ respect to other people's DeepSeek-V4.1 work: the jayleaton recipe, upstream Ten
 (AGPL-3.0) was only ever run as a black box, by the TP2 work, for baseline numbers. This file lists every outside source the branch uses, what it took and how. Ideas and techniques we built
 ourselves are not listed.
 
+2026-10-21: a separate study session, not the authors of this port, read jayleaton/deepseek-v41-tensorfold-spark at
+commit 853310da for a comparison report. Its findings were not given to this port, and no code or text from that repo is
+in this branch.
+
 ## Rules we kept
 
 - The model math (compressed attention and its indexer, the compressor, mHC with Sinkhorn, Engram, the MoE gate and its
