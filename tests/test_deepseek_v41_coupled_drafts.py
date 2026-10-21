@@ -40,10 +40,12 @@ def test_a_round_with_no_sampled_stream_runs_the_greedy_graph():
         g.run([1, 2, 3], [10, 20, 30], [0, 1, 2])
         assert g.ran == [False, False]
         assert g.inputs[3:6].eq(0).all()                  # seeds, top_k, divisors: 0 (greedy)
-        g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [None, Sampling(2**63 + 7, 0.7, 40), Sampling(9, 1.0, 0, 1.0, 0.1)])
+        g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [Sampling(4, 1.0, 0), Sampling(4, 1.0, 33), None])
+        assert g.ran[-1] is False                         # top_k 0 or above CAND: the candidates miss the rule
+        g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [None, Sampling(2**63 + 7, 0.7, 32), Sampling(9, 1.0, 1, 1.0, 0.1)])
         assert g.ran[-1] is True
         assert g.inputs[3].tolist() == [0, 7 - 2**63, 9]   # a seed's 64 bits as int64
-        assert g.inputs[4].tolist() == [0, 40, 0]
+        assert g.inputs[4].tolist() == [0, 32, 1]
         div, top_p, min_log = (struct.unpack("<3d", struct.pack("<3q", *g.inputs[i].tolist())) for i in (5, 6, 7))
         assert div == (0.0, 0.7 * markov.COUPLED_SCALE, 1.0 * markov.COUPLED_SCALE)
         assert top_p == (1.0, 0.95, 1.0)                  # 1: off (Sampling's default top_p is 0.95)

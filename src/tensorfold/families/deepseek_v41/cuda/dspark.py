@@ -450,10 +450,12 @@ class BatchDraftGraph:
         seed, top_k, div, top_p, min_log = [0] * N, [0] * N, [0.0] * N, [1.0] * N, [-math.inf] * N
         if self.coupled:
             for r, smp in enumerate(samplings or ()):
-                if smp is not None and smp.temperature > 0:
+                # a rank sends its CAND best: they hold the stream's top_k only for 0 < top_k <= CAND (top_k 0 or
+                # more: greedy drafts)
+                if smp is not None and smp.temperature > 0 and 0 < int(smp.top_k or 0) <= _markov.CAND:
                     sd = int(smp.seed) & ((1 << 64) - 1)                # the target's 64 bits, as int64
                     seed[r] = sd - (1 << 64) if sd >> 63 else sd
-                    top_k[r] = min(int(smp.top_k or 0), 1 << 20)        # above the candidates: all of them
+                    top_k[r] = int(smp.top_k)
                     div[r] = max(float(smp.temperature), 1e-6) * _markov.COUPLED_SCALE   # exact_sampling's divisor
                     top_p[r] = float(smp.top_p) if 0.0 < smp.top_p < 1.0 else 1.0       # choose_rows's rules
                     min_log[r] = float(smp.min_log)

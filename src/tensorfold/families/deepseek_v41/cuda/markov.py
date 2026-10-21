@@ -57,7 +57,7 @@ BC = 1024               # vocabulary entries a scoring program
 NP = 16                 # rows a launch at most (tl.dot's smallest N); a step's rows are its streams
 BIG = tl.constexpr(1 << 30)
 COUPLED = os.environ.get("TF_DS_DRAFT_COUPLED", "1") != "0"
-CAND = 32               # candidates a rank sends a sampled row (a request's top_k above it: the union's CAND x world)
+CAND = 32               # candidates a rank sends a sampled row (a stream couples only with 0 < top_k <= CAND)
 SEND_W = 4 + 2 * CAND   # a coupled step's gathered row: the greedy best (value, index, 0, 0), CAND values, CAND ids
 # a sampled stream's drafts divide the drafter's scores by its temperature x TF_DS_DRAFT_COUPLED_SCALE: below 1 the
 # drafts keep nearer the drafter's argmax (0.5 on the pair: T equal or higher than greedy drafts on every workload;
