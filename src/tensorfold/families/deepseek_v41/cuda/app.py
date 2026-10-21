@@ -56,7 +56,10 @@ class DsApp(App):
         if kwargs is not None and not isinstance(kwargs, dict):
             raise RequestError("chat_template_kwargs must be a JSON object or null")
         kwargs = dict(kwargs or {})
-        kwargs.setdefault("response_format", rf)        # a client's own template input stays
+        spec = rf.get("json_schema") if rf.get("type") == "json_schema" else None
+        # json_schema: DeepSeek's API layer (deepseek-ai/deepseek-recipe) writes the schema, not the OpenAI wrapper
+        shown = spec["schema"] if isinstance(spec, dict) and isinstance(spec.get("schema"), dict) else rf
+        kwargs.setdefault("response_format", shown)     # a client's own template input stays
         return {**body, "chat_template_kwargs": kwargs}
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
