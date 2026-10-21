@@ -63,11 +63,11 @@ http.serve(app, "127.0.0.1", 0)
 '''
 
 
-def run_child(tmp_path, work):
+def run_child(tmp_path, work, *, grace="0.5", second=None):
     script = tmp_path / "child.py"
     script.write_text(CHILD)
     marker = tmp_path / "finalized"
-    env = dict(os.environ, PYTHONPATH=str(SRC), TF_SHUTDOWN_GRACE_S="0.5", PYTHONUNBUFFERED="1")
+    env = dict(os.environ, PYTHONPATH=str(SRC), TF_SHUTDOWN_GRACE_S=grace, PYTHONUNBUFFERED="1")
     child = subprocess.Popen([sys.executable, str(script), str(marker), work], env=env, text=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     seen = set()
@@ -82,6 +82,9 @@ def run_child(tmp_path, work):
         time.sleep(1.0)                                  # the worker is inside its round
         started = time.monotonic()
         child.send_signal(signal.SIGTERM)
+        if second is not None:
+            time.sleep(0.3)                              # the worker still holds the exit for its grace time
+            child.send_signal(second)
         child.wait(timeout=30)
         took = time.monotonic() - started
     finally:
@@ -96,6 +99,15 @@ def test_sigterm_ends_the_server_process_without_finalizing(tmp_path):
     assert code == 0, err
     assert not finalized                                 # os._exit: no atexit, no interpreter finalization
     assert took < 10
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")
+@pytest.mark.parametrize("second", [signal.SIGINT, signal.SIGTERM])
+def test_a_second_signal_during_the_exit_does_not_cut_it_short(tmp_path, second):
+    code, err, finalized, took = run_child(tmp_path, "sleep", grace="2", second=second)
+    assert code == 0, err
+    assert not finalized
+    assert "Traceback" not in err
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX signals")

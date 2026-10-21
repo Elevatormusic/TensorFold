@@ -114,6 +114,19 @@ def test_leave_ends_the_process_with_the_code_when_the_worker_is_stuck(monkeypat
     scheduler.close(timeout=5)
 
 
+def test_leave_ends_the_process_when_the_wait_is_interrupted(monkeypatch):
+    ended = []
+    monkeypatch.setattr(shutdown, "_exit", ended.append)
+
+    class Interrupted:
+        def close(self, timeout=None, *, drain=True):
+            raise KeyboardInterrupt                      # a second Ctrl-C that got through
+
+    with pytest.raises(SystemExit):
+        shutdown.leave(SimpleNamespace(engine=SimpleNamespace(scheduler=Interrupted())), 5)
+    assert ended == [5]
+
+
 def test_leave_stops_an_idle_worker_and_an_app_without_one(monkeypatch):
     ended = []
     monkeypatch.setattr(shutdown, "_exit", ended.append)

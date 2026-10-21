@@ -9,6 +9,7 @@ flushes the logs and calls os._exit, so finalization never runs beside a live wo
 from __future__ import annotations
 
 import os
+import signal
 import sys
 from typing import Any, NoReturn
 
@@ -26,20 +27,32 @@ def grace() -> float:
         return GRACE_S
 
 
+def ignore_signals() -> None:
+    """SIGINT and SIGTERM do nothing from here on, so a second one cannot cut the exit short."""
+
+    for number in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(number, signal.SIG_IGN)
+        except (ValueError, OSError):                    # (not the main thread)
+            pass
+
+
 def leave(app: Any, code: int = 0) -> NoReturn:
     """Stop the app's scheduler worker after its current round if that ends in time, flush stdout and stderr, end the
-    process with ``code``."""
+    process with ``code``. Nothing that goes wrong on the way stops the exit."""
 
-    scheduler = getattr(getattr(app, "engine", None), "scheduler", None)
-    if scheduler is not None:
-        try:
+    ignore_signals()
+    try:
+        scheduler = getattr(getattr(app, "engine", None), "scheduler", None)
+        if scheduler is not None:
             scheduler.close(timeout=grace(), drain=False)
-        except Exception:                                # noqa: BLE001  (the process ends here either way)
-            pass
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.flush()
-        except Exception:                                # noqa: BLE001
-            pass
-    _exit(code)
+    except BaseException:                                # noqa: BLE001  (the process ends here either way)
+        pass
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except BaseException:                        # noqa: BLE001
+                pass
+        _exit(code)
     raise SystemExit(code)                               # (only when a test replaced _exit)

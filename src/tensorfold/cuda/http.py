@@ -360,10 +360,11 @@ def serve(app: App, host: str, port: int) -> NoReturn:
     from tensorfold.cuda import shutdown
 
     def _terminate(signum: int, frame: Any) -> None:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)       # one stop is enough
+        shutdown.ignore_signals()                           # one stop is enough: a second signal must not cut in
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
     server = Server((host, port), make_handler(app))
     code = 1
     try:
