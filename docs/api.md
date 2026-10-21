@@ -177,7 +177,7 @@ space only. Text in a block that is still open is never a call: a reply that sto
 stop string) keeps that text, and a `<tool_call>` block in it does not run. A `<tool_call>` block or a DSML block
 inside an argument value is argument text. A block that is not well formed is not a call and keeps its text. This
 holds for the whole reply, for the stream, and with `TF_DROP_UNOFFERED_TOOL_CALLS=1`. A value ends at its closing tag,
-and a complete block of the same kind inside it is skipped. A lone closing tag in a value therefore makes the block
+and a complete block of the same kind inside it is skipped; so is a complete `<tool_call>` block inside a `<tool_call>` block. A lone closing tag in a value therefore makes the block
 not well formed, and the call does not run.
 
 With `parallel_tool_calls: false`, the server buffers tool deltas until it can return the first valid

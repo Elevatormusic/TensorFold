@@ -10,7 +10,6 @@ import contextlib
 import io
 import json
 import os
-import re
 import time
 import unittest
 from unittest import mock
@@ -192,6 +191,26 @@ class NestedCalls(Flag):
         _, found = parse_tool_calls(text, TOOLS)
         self.assertEqual(arguments(found), [{"path": "see " + NESTED_DSML + " and " + NESTED_DSML}])
 
+    def test_a_nested_call_in_a_tool_call_block_is_argument_text(self):
+        nested = NESTED_JSON.replace("write", "read")
+        json_call = '<tool_call>{"name": "read", "arguments": {"q": ' + json.dumps(nested) + "}}</tool_call>"
+        xml_call = f"<tool_call><function=read>\n<parameter=q>{nested}</parameter>\n</function></tool_call>"
+        mixed_case = '<TOOL_CALL>{"name": "read", "arguments": {"q": ' + json.dumps(nested) + "}}</Tool_Call>"
+        for text in (json_call, xml_call, mixed_case):
+            for quota in (None, 1):
+                content, found = parse_tool_calls("Go.\n" + text + "\n" + json_call, TOOLS, max_calls=quota)
+                self.assertEqual(names(found), ["read"] * (2 if quota is None else 1), text)
+                self.assertEqual(arguments(found)[0], {"q": nested}, text)
+                if quota is None:
+                    self.assertEqual(content, "Go.", text)
+
+    def test_a_nested_call_in_a_cut_off_tool_call_block_is_text(self):
+        nested = NESTED_JSON.replace("write", "read")
+        for text in ('<tool_call>{"name": "read", "arguments": {"q": ' + json.dumps(nested),
+                     '<tool_call>{"name": "read", "arguments": {"q": ' + json.dumps(nested) + "}}",
+                     "<tool_call><function=read>\n<parameter=q>" + nested + "</parameter>\n</function>"):
+            self.assertEqual(parse_tool_calls("Go.\n" + text, TOOLS), ("Go.\n" + text, None), text)
+
     def test_a_dsml_marker_in_a_tool_call_block_is_argument_text(self):
         text = '<tool_call>{"name": "read", "arguments": {"path": "' + OPEN + '"}}</tool_call>'
         content, found = parse_tool_calls(text, TOOLS)
@@ -301,6 +320,12 @@ class StreamedCalls(Flag):
                    "</tool_call>", 0)
         self.check("<tool_call><tool_call><function=write>\n<parameter=path>y</parameter>\n</function></tool_call>", 0)
         self.check("Use <tool_call> tags. " + self.XML_WRITE, 0)
+
+    def test_a_call_with_a_nested_tag_in_its_argument_streams_as_one_call(self):
+        nested = NESTED_JSON.replace("write", "read")
+        call = f"<tool_call><function=write>\n<parameter=path>{nested}</parameter>\n</function></tool_call>"
+        self.check(call, 1)
+        self.check(call + "\n" + self.XML_WRITE, 2)
 
     def test_a_tag_in_other_letter_case_is_not_streamed(self):
         self.check("<TOOL_CALL>" + self.XML_WRITE[len("<tool_call>"):-len("</tool_call>")] + "</tool_call>", 0)
