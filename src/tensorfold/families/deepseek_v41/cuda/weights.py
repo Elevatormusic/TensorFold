@@ -24,7 +24,7 @@ from tensorfold.cuda.exl3 import experts as exl3_experts
 from tensorfold.cuda.exl3.linear import Exl3Linear
 
 from ..config import Cfg
-from .hostenv import drop_page_cache, mem_available_gib, release_enabled
+from .hostenv import drop_page_cache, meminfo_gib, release_enabled
 
 
 @dataclass
@@ -575,10 +575,10 @@ def _load(sh, cfg, model_dir, rank, world, n_layers, log, dspark, t0) -> Weights
                else "the rank cache write failed and was dropped") + ")")
     sh.close()
     _trim()
-    free = mem_available_gib()
-    if free is not None:
-        log(f"[tensorfold] rank {rank}: weights loaded, MemAvailable {free:.1f} GiB (page cache release "
-            f"{'on' if release_enabled() else 'off'})")
+    free, cached = meminfo_gib("MemAvailable"), meminfo_gib("Cached")
+    if free is not None and cached is not None:
+        log(f"[tensorfold] rank {rank}: weights loaded, MemAvailable {free:.1f} GiB, page cache {cached:.1f} GiB "
+            f"(page cache release {'on' if release_enabled() else 'off'})")
     return w
 
 

@@ -248,11 +248,13 @@ class PageCacheTests(unittest.TestCase):
             self.assertTrue(hostenv.drop_page_cache(f.fileno()))
             self.assertEqual(len(f.read()), 1 << 16)           # the file reads the same bytes after the drop
 
-    def test_mem_available_reads_meminfo(self):
+    def test_meminfo_reads_one_field(self):
         f = Path(self._tmp.name) / "meminfo"
-        f.write_text("MemTotal:  131072000 kB\nMemAvailable:   2097152 kB\nCached: 1 kB\n")
-        self.assertAlmostEqual(hostenv.mem_available_gib(str(f)), 2.0)
-        self.assertIsNone(hostenv.mem_available_gib(str(f.with_name("none"))))
+        f.write_text("MemTotal:  131072000 kB\nMemAvailable:   2097152 kB\nCached:   1048576 kB\nSwapCached: 5 kB\n")
+        self.assertAlmostEqual(hostenv.meminfo_gib("MemAvailable", str(f)), 2.0)
+        self.assertAlmostEqual(hostenv.meminfo_gib("Cached", str(f)), 1.0)       # not SwapCached
+        self.assertIsNone(hostenv.meminfo_gib("Missing", str(f)))
+        self.assertIsNone(hostenv.meminfo_gib("Cached", str(f.with_name("none"))))
 
 
 @unittest.skipIf(importlib.util.find_spec("torch") is None, "needs PyTorch (the CUDA backend's code)")

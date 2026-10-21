@@ -84,13 +84,13 @@ def drop_page_cache(target, *, env: Mapping[str, str] | None = None) -> bool:
     return True
 
 
-def mem_available_gib(meminfo: str = "/proc/meminfo") -> float | None:
-    """MemAvailable in GiB, or None where the system has no /proc/meminfo."""
+def meminfo_gib(field: str, meminfo: str = "/proc/meminfo") -> float | None:
+    """One field of /proc/meminfo (for example "MemAvailable" or "Cached") in GiB, or None when it is not there."""
 
     try:
         with open(meminfo) as f:
             for line in f:
-                if line.startswith("MemAvailable:"):
+                if line.startswith(field + ":"):
                     return int(line.split()[1]) / (1 << 20)
     except (OSError, ValueError, IndexError):
         pass
