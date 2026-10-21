@@ -82,6 +82,8 @@ class DsEngine:
         # gather on the CX7 link against 7.1 with NCCL's choice (decode windows go over the RDMA gather)
         os.environ.setdefault("NCCL_PROTO", "Simple")
         os.environ.setdefault("NCCL_MIN_NCHANNELS", "4")
+        if world > 1:
+            self._nccl_host_env()
         nccl = NCCL(rank, world, master, port) if world > 1 else None
         self.nccl = nccl
         self.w = load(model_dir, rank, world, dspark=drafts > 0)
@@ -188,6 +190,16 @@ class DsEngine:
         if rank == 0:
             print(f"[tensorfold] DeepSeek-V4.1 engine ready: {world} rank(s), context {self.limit}, "
                   f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}", flush=True)
+
+    def _nccl_host_env(self) -> None:
+        """NCCL's cuMem allocations off and its GID index set (hostenv.py); a value that the user set stays."""
+
+        from .hostenv import apply_nccl_defaults
+
+        done = apply_nccl_defaults()
+        if done:
+            print(f"[tensorfold] rank {self.rank}: NCCL settings by default: "
+                  + " ".join(f"{k}={v}" for k, v in done.items()), flush=True)
 
     def _memory_ceiling(self) -> None:
         """After the warm-up, torch may grow only while the host keeps TF_DS_MEM_FLOOR_GIB (default 2; 0: no ceiling)
