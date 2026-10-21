@@ -265,6 +265,7 @@ class ToolCallStreamer:
         self.lead = False       # the framing newline after <parameter=NAME> has not arrived yet
         self.held = ""
         self.streamed = False
+        self.call_start = -1    # where the call being streamed begins
         self.scan: tuple[int, list, int] | None = None     # (text length, top-level blocks, open block)
 
     def _args(self, fragment: str) -> dict[str, Any]:
@@ -318,6 +319,7 @@ class ToolCallStreamer:
                 if start < 0:
                     self.state = "abort"            # a top-level block comes first that this streamer cannot follow
                     break
+                self.call_start = start
                 self.pos = start + len(_OPEN)
                 self.state = "call"
             elif self.state == "call":
@@ -390,6 +392,10 @@ class ToolCallStreamer:
             elif self.state == "closing":
                 m = re.match(r"\s*</tool_call>", rest, re.IGNORECASE)
                 if m is None:
+                    break
+                end = self.pos + m.end()
+                if not any(b.start == self.call_start and b.end == end for b in self._blocks(text)[0]):
+                    self.state = "abort"    # the parser ends this block elsewhere: its call is not complete
                     break
                 out.append(self._args(self.held))
                 self.held = ""

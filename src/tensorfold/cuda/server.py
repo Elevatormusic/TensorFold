@@ -444,7 +444,8 @@ class App:
             if tools:
                 answer = (policy.content(answer, finished=finished) if policy.single
                           # with the flag the final content drops an unoffered call in any case: hide it so
-                          else hide_tool_calls(answer, finished=finished, any_case=drop_unoffered_calls()))
+                          else hide_tool_calls(answer, finished=finished, any_case=drop_unoffered_calls(),
+                                               keep_ill_formed=True))
             else:                                 # TF_DROP_UNOFFERED_TOOL_CALLS=1: every call is unoffered
                 answer = answer_without_tools(answer, finished=finished)
             return reasoning, answer

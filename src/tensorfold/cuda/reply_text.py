@@ -143,9 +143,12 @@ def answer_without_tools(answer: str, *, finished: bool) -> str:
     return shown
 
 
-def hide_tool_calls(text: str, *, finished: bool, any_case: bool = False) -> str:
+def hide_tool_calls(text: str, *, finished: bool, any_case: bool = False, keep_ill_formed: bool = False) -> str:
     """The text without its top-level tool-call blocks. A block that is still open hides the rest of the text, and
-    while streaming, so does a tail that may begin an opening tag. The parser finds the same blocks."""
+    while streaming, so does a tail that may begin an opening tag. The parser finds the same blocks.
+
+    ``keep_ill_formed``: a closed DSML block that is not well formed is not a call, so it stays in the text, as the
+    parser keeps it in the content."""
 
     blocks, open_at = top_level_blocks(text, any_case=any_case)
     end = len(text) if open_at < 0 else open_at
@@ -154,6 +157,8 @@ def hide_tool_calls(text: str, *, finished: bool, any_case: bool = False) -> str
     for block in blocks:
         if block.start >= end:
             break
+        if keep_ill_formed and block.kind == "dsml" and parse_calls_block(block.inner) is None:
+            continue
         out.append(text[pos:block.start])
         pos = block.end
     tail = text[pos:end]

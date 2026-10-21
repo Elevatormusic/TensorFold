@@ -280,6 +280,19 @@ class StreamedText(Flag):
             content, _ = parse_tool_calls(text, TOOLS)
             self.assertEqual(hide_tool_calls(text, finished=True).strip(), content)
 
+    def test_a_block_that_is_not_well_formed_stays_in_the_streamed_text(self):
+        for block in (calls("junk\n"), calls(invoke("read"), "junk\n"), calls()):
+            text = "A" + block + "B"
+            content, found = parse_tool_calls(text, TOOLS)
+            self.assertEqual((content, found), (text, None))
+            before = ""
+            for cut in range(len(text) + 1):
+                shown = hide_tool_calls(text[:cut], finished=False, keep_ill_formed=True)
+                self.assertTrue(shown.startswith(before), (cut, shown, before))
+                before = shown
+            self.assertEqual(hide_tool_calls(text, finished=True, keep_ill_formed=True), content)
+            self.assertEqual(hide_tool_calls(text, finished=True), "AB")      # without the flag it is hidden
+
     def test_an_open_block_hides_the_rest_of_the_reply(self):
         text = "Go.\n" + OPEN + "\nrest " + NESTED_JSON
         self.assertEqual(hide_tool_calls(text, finished=True), "Go.\n")
@@ -390,6 +403,17 @@ class StreamedCalls(Flag):
             with self.assertRaises(ValueError, msg=cut):
                 json.loads(sent)
         self.assertEqual(parse_tool_calls(text, self.STREAM_TOOLS), (text, None))
+
+    def test_a_lone_closing_tag_in_a_value_never_completes_the_streamed_arguments(self):
+        for value in ("x</tool_call>y", "x</TOOL_CALL>y"):
+            text = f"<tool_call><function=write>\n<parameter=path>{value}</parameter>\n</function></tool_call>"
+            for cut in range(len(text) + 1):
+                streamer = ToolCallStreamer(self.STREAM_TOOLS)
+                sent = "".join(call["function"]["arguments"] for delta in streamer.feed(text[:cut])
+                               for call in delta["tool_calls"])
+                with self.assertRaises(ValueError, msg=(value, cut)):
+                    json.loads(sent)
+            self.assertEqual(parse_tool_calls(text, self.STREAM_TOOLS)[1], None)
 
     def test_a_tag_in_other_letter_case_is_not_streamed(self):
         self.check("<TOOL_CALL>" + self.XML_WRITE[len("<tool_call>"):-len("</tool_call>")] + "</tool_call>", 0)
