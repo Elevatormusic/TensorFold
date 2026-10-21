@@ -608,14 +608,16 @@ class MultiDecoder:
 
     def _host_room(self) -> int:
         """Bytes this node can still give a step: MemAvailable plus the cached free bytes that a trim can give back,
-        which are torch's free bytes above ``slack0`` (-1: unknown). Counting the slack made a head that was 221 MiB
-        under the gate's threshold look 100 to 300 MiB over it."""
+        which are torch's free bytes above ``slack0`` (none while ``slack0`` is unknown; -1: MemAvailable unknown).
+        Counting the slack made a head that was 221 MiB under the gate's threshold look 100 to 300 MiB over it."""
 
         avail = _mem_available()
         if avail < 0:
             return -1
         gap = int(torch.cuda.memory_reserved() - torch.cuda.memory_allocated())
-        return avail + max(0, gap - (self.slack0 or 0))
+        if self.slack0 is None:                          # no baseline yet (no warm-up, no trim): count none of it
+            return avail
+        return avail + max(0, gap - self.slack0)
 
     def _gate(self, s: Stream) -> None:
         """NoRoom while streams are live and the host is short of its floor plus ADMIT_GIB (rank 0 reads its own

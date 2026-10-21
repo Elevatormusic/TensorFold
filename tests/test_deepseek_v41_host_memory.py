@@ -100,9 +100,9 @@ def test_host_room_counts_only_the_cached_bytes_a_trim_can_return(monkeypatch):
     assert multi.MultiDecoder._host_room(d) == 2339 * 2**20                  # the slack is not room
     _torch_gap(monkeypatch, 100)
     assert multi.MultiDecoder._host_room(d) == 2339 * 2**20                  # (never below MemAvailable)
-    d.slack0 = None                                                          # before a baseline: as before
-    _torch_gap(monkeypatch, 300)
-    assert multi.MultiDecoder._host_room(d) == (2339 + 300) * 2**20
+    d.slack0 = None                                                          # no baseline (no warm-up, no trim)
+    _torch_gap(monkeypatch, 800)
+    assert multi.MultiDecoder._host_room(d) == 2339 * 2**20                  # counts none of the cache
     monkeypatch.setattr(multi, "_mem_available", lambda: -1)
     assert multi.MultiDecoder._host_room(d) == -1
 
