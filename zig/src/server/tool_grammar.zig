@@ -10,8 +10,13 @@ const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
 
-/// How the template writes a call inside <tool_call>: Qwen3-Coder's XML (Nemotron, Qwen3.5), or a JSON object.
-pub const Style = enum { xml, json };
+/// How the template writes a call: inside <tool_call>, Qwen3-Coder's XML (Nemotron, Qwen3.5) or a JSON object; or
+/// DeepSeek-V4.1's DSML block (<｜DSML｜ calls> with an invoke a call and a parameter an argument).
+pub const Style = enum { xml, json, dsml41 };
+
+const dsml = "\u{ff5c}DSML\u{ff5c}";
+const dsml41_open = "<" ++ dsml ++ " calls>";
+const dsml41_close = "</" ++ dsml ++ " calls>";
 
 const probe = "tfprobe_fn";
 const key = "tfprobe_k";
@@ -24,6 +29,9 @@ const value_blanks = 32;
 
 /// The style of `rendered`, a turn that calls `probe` with {key: "v"}; null: markup this grammar does not write.
 pub fn style(rendered: []const u8) ?Style {
+    if (std.mem.lastIndexOf(u8, rendered, dsml41_open)) |d| {
+        if (std.mem.indexOf(u8, rendered[d..], "<" ++ dsml ++ " invoke name=\"" ++ probe ++ "\">") != null) return .dsml41;
+    }
     const at = std.mem.lastIndexOf(u8, rendered, "<tool_call>") orelse return null;
     const text = rendered[at..];
     if (std.mem.indexOf(u8, text, "<function=" ++ probe ++ ">") != null and std.mem.indexOf(u8, text, "<parameter=" ++ key ++ ">") != null) return .xml;
@@ -36,7 +44,7 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
     const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
     var scratch: Cx = .{ .a = cx.a };
     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
-    const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object), and this one does not: send \"auto\"");
+    const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object) or DSML calls, and this one does not: send \"auto\"");
     const text = try build(cx.a, s, tools, parallel);
     return srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
 }
@@ -48,8 +56,12 @@ pub fn build(a: Allocator, s: Style, tools: []const Value, parallel: bool) Alloc
     const one: Value = if (calls.len == 1) calls[0] else try node(a, "or", &.{.{ "elements", .{ .array = calls } }});
     const ws = try node(a, "regex", &.{.{ "pattern", .{ .string = blanks } }});
     var parts: std.ArrayList(Value) = .empty;
-    try parts.appendSlice(a, &.{ ws, one });
+    try parts.append(a, ws);
+    // DSML: every call of the reply sits inside one calls block
+    if (s == .dsml41) try parts.appendSlice(a, &.{ try constant(a, dsml41_open), ws });
+    try parts.append(a, one);
     if (parallel) try parts.append(a, try node(a, "star", &.{.{ "content", try node(a, "sequence", &.{.{ "elements", try list(a, &.{ ws, one }) }}) }}));
+    if (s == .dsml41) try parts.appendSlice(a, &.{ ws, try constant(a, dsml41_close) });
     try parts.append(a, ws);
     const format = try node(a, "sequence", &.{.{ "elements", .{ .array = parts.items } }});
     return json.stringify(a, try node(a, "structural_tag", &.{.{ "format", format }}), .{ .ascii = false, .compact = true });
@@ -77,8 +89,48 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
             try whole.put(a, "required", try list(a, &.{ .{ .string = "name" }, .{ .string = "arguments" } }));
             break :blk try list(a, &.{ try constant(a, "<tool_call>"), ws, try arguments(a, .{ .object = whole }, "json"), ws, try constant(a, "</tool_call>") });
         },
+        .dsml41 => try dsmlInvoke(a, name, schema),
     };
     return node(a, "sequence", &.{.{ "elements", elements }});
+}
+
+/// One DSML invoke: the name, each required argument in the schema's order, then any optional ones, the close. A
+/// string argument is the template's string="true" form (text up to the parameter's close); any other is string="false"
+/// with its value as JSON in the property's schema (tool_parse.zig dsml41Calls reads both).
+fn dsmlInvoke(a: Allocator, name: []const u8, schema: Value) Allocator.Error!Value {
+    const ws = try node(a, "regex", &.{.{ "pattern", .{ .string = blanks } }});
+    var parts: std.ArrayList(Value) = .empty;
+    try parts.append(a, try constant(a, try std.fmt.allocPrint(a, "<" ++ dsml ++ " invoke name=\"{s}\">", .{name})));
+    const props: ?Value = if (schema.get("properties")) |pv| (if (pv == .object) pv else null) else null;
+    var required: std.ArrayList([]const u8) = .empty;
+    if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string) try required.append(a, x.string);
+    if (props) |ps| {
+        // the required arguments in order, each once
+        for (ps.object.keys(), ps.object.values()) |k, v| {
+            if (!contains(required.items, k)) continue;
+            try parts.appendSlice(a, &.{ ws, try dsmlParameter(a, k, v) });
+        }
+        // the optional ones: each may come, after the required ones
+        for (ps.object.keys(), ps.object.values()) |k, v| {
+            if (contains(required.items, k)) continue;
+            const one = try node(a, "sequence", &.{.{ "elements", try list(a, &.{ ws, try dsmlParameter(a, k, v) }) }});
+            try parts.append(a, try node(a, "star", &.{.{ "content", one }}));
+        }
+    }
+    try parts.appendSlice(a, &.{ ws, try constant(a, "</" ++ dsml ++ " invoke>") });
+    return .{ .array = parts.items };
+}
+
+fn dsmlParameter(a: Allocator, key_name: []const u8, schema: Value) Allocator.Error!Value {
+    const is_string = if (schema.get("type")) |t| (t == .string and std.mem.eql(u8, t.string, "string")) else false;
+    const begin = try std.fmt.allocPrint(a, "<" ++ dsml ++ " parameter name=\"{s}\" string=\"{s}\">", .{ key_name, if (is_string) "true" else "false" });
+    const content = if (is_string) try node(a, "any_text", &.{}) else try arguments(a, schema, "json");
+    return node(a, "tag", &.{ .{ "begin", .{ .string = begin } }, .{ "content", content }, .{ "end", .{ .string = "</" ++ dsml ++ " parameter>" } } });
+}
+
+fn contains(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }
 
 /// The tool's parameter schema (OpenAI's function.parameters, a bare tool's parameters or input_schema).
@@ -115,6 +167,7 @@ test "the probe call's markup picks the style" {
     try std.testing.expectEqual(Style.xml, style("<think></think><tool_call>\n<function=tfprobe_fn>\n<parameter=tfprobe_k>\nv\n</parameter>\n</function>\n</tool_call>\n").?);
     try std.testing.expectEqual(Style.json, style("<tool_call>\n{\"name\": \"tfprobe_fn\", \"arguments\": {\"tfprobe_k\": \"v\"}}\n</tool_call>").?);
     try std.testing.expectEqual(@as(?Style, null), style("<|tool_call>call:tfprobe_fn{tfprobe_k:<|\"|>v<|\"|>}<tool_call|>"));
+    try std.testing.expectEqual(Style.dsml41, style("<\u{ff5c}Assistant\u{ff5c}></think>\n\n<\u{ff5c}DSML\u{ff5c} calls>\n<\u{ff5c}DSML\u{ff5c} invoke name=\"tfprobe_fn\">\n<\u{ff5c}DSML\u{ff5c} parameter name=\"tfprobe_k\" string=\"true\">v</\u{ff5c}DSML\u{ff5c} parameter>\n</\u{ff5c}DSML\u{ff5c} invoke>\n</\u{ff5c}DSML\u{ff5c} calls>").?);
 }
 
 test "a required call's grammar names every offered tool and its schema; one call without parallel" {
@@ -131,4 +184,22 @@ test "a required call's grammar names every offered tool and its schema; one cal
     const single = try build(a, .json, tools.array[0..1], false);
     try std.testing.expect(std.mem.indexOf(u8, single, "\"type\":\"star\"") == null and std.mem.indexOf(u8, single, "\"type\":\"or\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, single, "\"const\":\"get_weather\"") != null);
+}
+
+test "a DSML required call: one calls block, the invoke's name, string and JSON parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}, \"unit\": {\"type\": \"string\"}}, \"required\": [\"city\", \"days\"]}}}]")).ok;
+    const g = try build(a, .dsml41, tools.array, false);
+    try std.testing.expect(std.mem.indexOf(u8, g, "\"value\":\"<\u{ff5c}DSML\u{ff5c} calls>\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "\"value\":\"</\u{ff5c}DSML\u{ff5c} calls>\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "invoke name=\\\"get_weather\\\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"city\\\" string=\\\"true\\\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"days\\\" string=\\\"false\\\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "\"type\":\"any_text\"") != null);
+    // the optional unit may come after the required ones (a star); one call without parallel: the star is the unit's
+    const unit = std.mem.indexOf(u8, g, "parameter name=\\\"unit\\\"").?;
+    try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"days\\\"").? < unit);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, g, "\"type\":\"star\""));
 }
