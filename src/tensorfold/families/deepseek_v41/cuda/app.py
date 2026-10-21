@@ -33,10 +33,6 @@ class DsApp(App):
         # --vision-max-images: images take DsVision.split's path, not the shared image limits, so its own count
         # check gets the server's value (DsVision's default is 8)
         vision, images = getattr(self.engine, "vision", None), kwargs.get("vision_max_images")
-        if vision is not None:          # vision.split writes the image placeholder into content: it is the server's
-            from .vision import PLACEHOLDER
-
-            self.plain_content_keep = (PLACEHOLDER,)
         if vision is not None and images is not None:
             vision.max_images = int(images)
         template = self.template
@@ -92,7 +88,10 @@ class DsApp(App):
             text_messages, pictures = vision.split(messages)
         except (ValueError, OSError) as exc:
             raise RequestError(f"image input: {exc}") from exc
-        prepared = super()._prepare({**body, "messages": text_messages}, chat)
+        from .vision import PLACEHOLDER
+
+        # split refused every placeholder that the client wrote, so each one left in content is the server's own
+        prepared = super()._prepare({**body, "messages": text_messages}, chat, plain_keep=(PLACEHOLDER,))
         try:
             vp = vision.expand(prepared.prompt, pictures)
         except ValueError as exc:

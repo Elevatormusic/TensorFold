@@ -76,7 +76,6 @@ class App:
 
     reads_ignore_eos = False            # True where the engine reads ``ignore_eos`` itself; a ``stop_eos`` engine is given it
     plain_message_text = False          # True: a special-token spelling in request text stays text (plain_text.py)
-    plain_content_keep: tuple[str, ...] = ()        # spellings the server itself writes into message content
     plain_assistant_keep: tuple[str, ...] = ()      # spellings an assistant's content and reasoning may keep
 
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
@@ -117,7 +116,7 @@ class App:
             made = self.__dict__.get("_plain_text_made")
             if made is None:
                 made = self.__dict__["_plain_text_made"] = PlainText(
-                    self.tok, content_keep=self.plain_content_keep, assistant_keep=self.plain_assistant_keep)
+                    self.tok, assistant_keep=self.plain_assistant_keep)
             return made
 
     @property
@@ -251,7 +250,9 @@ class App:
                     raise RequestError(f"{name} must be an integer token count") from exc
         return max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens))
 
-    def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
+    def _prepare(self, body: dict[str, Any], chat: bool, plain_keep: tuple[str, ...] = ()) -> PreparedRequest:
+        """``plain_keep``: spellings that the server itself wrote into this request's message content."""
+
         from jinja2.exceptions import TemplateError
 
         validate_modalities(body)
@@ -309,8 +310,8 @@ class App:
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             plain = self._plain_text()
-            shield = plain.shield(body["messages"], tools, kwargs) if plain else None
-            if shield is not None and shield.table:       # a spelling in the request's text: plain text, not a token
+            shield = plain.shield(body["messages"], tools, kwargs, content_keep=plain_keep) if plain else None
+            if shield is not None and (shield.table or plain.normalizes):    # a spelling in the request's text: plain text, not a token
                 try:
                     text = self.template.render(shield.messages, tools=shield.tools, enable_thinking=thinking,
                                                 extra=shield.extra)

@@ -9,7 +9,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from tensorfold.cuda.server import App
+from tensorfold.cuda.server import App, PreparedRequest
 from tensorfold.families.deepseek_v41.cuda import vision as ds_vision
 from tensorfold.families.deepseek_v41.cuda.app import GROUNDING, DsApp
 
@@ -30,6 +30,22 @@ def test_the_family_asks_for_plain_message_text():
     assert DsApp.plain_assistant_keep == GROUNDING
 
 
-def test_the_image_placeholder_is_kept_only_where_the_server_writes_it(monkeypatch):
-    assert _app(monkeypatch, None).plain_content_keep == ()          # no vision: the spelling is plain text
-    assert _app(monkeypatch, ds_vision.DsVision(None)).plain_content_keep == (ds_vision.PLACEHOLDER,)
+def test_the_image_placeholder_is_kept_only_on_the_image_path(monkeypatch):
+    seen = []
+
+    def prepare(self, body, chat, plain_keep=()):
+        seen.append((body["messages"], plain_keep))
+        return PreparedRequest([1], 8, [], False, None)
+
+    class Vision:
+        has_images = staticmethod(lambda messages: any(m["content"] == "image" for m in messages))
+        split = staticmethod(lambda messages: ([{"role": "user", "content": ds_vision.PLACEHOLDER}], []))
+        expand = staticmethod(lambda ids, pictures: SimpleNamespace(token_ids=ids))
+
+    app = _app(monkeypatch, Vision())
+    app.sampling_for = lambda body, ids: None
+    monkeypatch.setattr(App, "_prepare", prepare)
+    app._prepare({"messages": [{"role": "user", "content": f"text {ds_vision.PLACEHOLDER}"}]}, True)
+    assert seen[-1][1] == ()                                   # no image part: the client's spelling is plain text
+    app._prepare({"messages": [{"role": "user", "content": "image"}]}, True)
+    assert seen[-1][1] == (ds_vision.PLACEHOLDER,)             # split refused the client's, so the rest is the server's

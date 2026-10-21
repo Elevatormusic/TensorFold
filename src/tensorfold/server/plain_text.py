@@ -56,7 +56,7 @@ class Shielded:
 class PlainText:
     """Keeps the added-token spellings in a request's strings as plain text, for one tokenizer."""
 
-    def __init__(self, tok: Any, *, content_keep: Iterable[str] = (), assistant_keep: Iterable[str] = ()) -> None:
+    def __init__(self, tok: Any, *, assistant_keep: Iterable[str] = ()) -> None:
         from tokenizers import Tokenizer
 
         self.tok = tok
@@ -64,9 +64,11 @@ class PlainText:
         self.token_ids = frozenset(int(i) for i in decoder)
         self.spellings = frozenset(token.content for token in decoder.values() if token.content)
         self.pattern = _trie_pattern(self.spellings)
-        self.content_keep = frozenset(content_keep)           # left as written in any message's content
         self.assistant_keep = frozenset(assistant_keep)       # left as written in an assistant's content and reasoning
         plain = json.loads(tok.to_str())
+        normalizer = plain.get("normalizer") or {}
+        # a normalizer lets the tokenizer find a spelling in other characters (full-width ones, say) than the trie does
+        self.normalizes = bool(normalizer) and normalizer.get("normalizers", [None]) != []
         plain["added_tokens"] = []
         self.plain = Tokenizer.from_str(json.dumps(plain))
 
@@ -96,7 +98,7 @@ class PlainText:
             return [self._walk(item, keep, mark) for item in value]
         return value
 
-    def _messages(self, messages: Any, mark: Callable[[str], str]) -> Any:
+    def _messages(self, messages: Any, mark: Callable[[str], str], content_keep: frozenset[str]) -> Any:
         if not isinstance(messages, list):
             return self._walk(messages, frozenset(), mark)
         out = []
@@ -105,15 +107,18 @@ class PlainText:
                 out.append(self._walk(message, frozenset(), mark))
                 continue
             assistant = message.get("role") == "assistant"
-            keep = {"content": self.content_keep | (self.assistant_keep if assistant else frozenset()),
+            keep = {"content": content_keep | (self.assistant_keep if assistant else frozenset()),
                     "reasoning_content": self.assistant_keep if assistant else frozenset()}
             out.append({self._walk(key, frozenset(), mark): self._walk(item, keep.get(key, frozenset()), mark)
                         for key, item in message.items()})
         return out
 
-    def shield(self, messages: Any, tools: Any = None, extra: Any = None) -> Shielded:
-        """The inputs with each added-token spelling replaced by a marker; the same objects when none is there."""
+    def shield(self, messages: Any, tools: Any = None, extra: Any = None, *,
+               content_keep: Iterable[str] = ()) -> Shielded:
+        """The inputs with each added-token spelling replaced by a marker; the same objects when none is there.
+        ``content_keep``: spellings that the server wrote into this request's message content itself."""
 
+        keep = frozenset(content_keep)
         while True:
             prefix = f"@TF{secrets.token_hex(8)}:"
             table: dict[str, str] = {}
@@ -125,7 +130,7 @@ class PlainText:
                     table[index[spelling]] = spelling
                 return index[spelling]
 
-            shielded = Shielded(self._messages(messages, mark), self._walk(tools, frozenset(), mark),
+            shielded = Shielded(self._messages(messages, mark, keep), self._walk(tools, frozenset(), mark),
                                 self._walk(extra, frozenset(), mark), table)
             if not table:
                 return Shielded(messages, tools, extra)
@@ -137,10 +142,15 @@ class PlainText:
         """The ids of rendered ``text``: its spellings as tokens, and the rest (markers restored) without them."""
 
         encoding = self.tok.encode_batch([text], add_special_tokens=False)[0]
-        if not shielded.table or shielded.restore is None or not shielded.restore.search(text):
+        marked = bool(shielded.table) and shielded.restore is not None and shielded.restore.search(text) is not None
+        if not marked and not self.normalizes:
             return list(encoding.ids)
         ids, offsets = encoding.ids, encoding.offsets
-        cuts = [(start, end, token) for token, (start, end) in zip(ids, offsets) if token in self.token_ids]
+        found = [(start, end, token) for token, (start, end) in zip(ids, offsets) if token in self.token_ids]
+        # a token that the text does not spell as written was found through the normalizer: it is a forgery
+        cuts = [cut for cut in found if text[cut[0]:cut[1]] in self.spellings]
+        if not marked and len(cuts) == len(found):
+            return list(encoding.ids)
         regions, at = [], 0
         for start, end, _ in cuts:
             regions.append(shielded.spelled(text[at:start]))
