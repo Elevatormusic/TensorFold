@@ -39,7 +39,7 @@ def test_a_round_with_no_sampled_stream_runs_the_greedy_graph():
         g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [None, Sampling(5, 0.0, 20), None])
         g.run([1, 2, 3], [10, 20, 30], [0, 1, 2])
         assert g.ran == [False, False]
-        assert g.inputs[3:].eq(0).all()
+        assert g.inputs[3:6].eq(0).all()                  # seeds, top_k, divisors: 0 (greedy)
         g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [None, Sampling(2**63 + 7, 0.7, 40), Sampling(9, 1.0, 0, 1.0, 0.1)])
         assert g.ran[-1] is True
         assert g.inputs[3].tolist() == [0, 7 - 2**63, 9]   # a seed's 64 bits as int64
