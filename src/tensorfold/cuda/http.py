@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from tensorfold.cuda import health
 from tensorfold.server import anthropic, metrics, responses, token_routes
@@ -352,22 +352,31 @@ def make_handler(app: App):
     return handler(Handler, app)
 
 
-def serve(app: App, host: str, port: int) -> None:
-    """Serve until interrupted (SIGTERM included)."""
+def serve(app: App, host: str, port: int) -> NoReturn:
+    """Serve until interrupted (SIGTERM included), then end the process (``shutdown.leave``): it does not return."""
 
     import signal
 
+    from tensorfold.cuda import shutdown
+
     def _terminate(signum: int, frame: Any) -> None:
+        shutdown.ignore_signals()                           # one stop is enough: a second signal must not cut in
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
     server = Server((host, port), make_handler(app))
+    code = 1
     try:
         from contextlib import nullcontext
         auth = getattr(app, "auth", None)
         with auth.signals() if auth is not None else nullcontext():
             server.serve_forever()
+        code = 0
     except KeyboardInterrupt:
-        pass
+        code = 0
     finally:
+        if code:
+            traceback.print_exc()
         server.server_close()
+        shutdown.leave(app, code)
