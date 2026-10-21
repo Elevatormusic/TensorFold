@@ -31,6 +31,17 @@ def usage_of(result: dict[str, Any]) -> dict[str, Any]:
             "completion_tokens_details": {"reasoning_tokens": result.get("reasoning_tokens", 0)}}
 
 
+def unsent_call_deltas(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """The calls of a reply that the stream did not send as deltas, whole. The first ``calls_streamed`` calls were
+    sent. A started call that never closed (``calls_offset``) keeps its index, so these take the next ones."""
+
+    sent, offset = result.get("calls_streamed", 0), result.get("calls_offset", 0)
+    return [{"tool_calls": [{"index": i + offset, "id": call["id"], "type": "function",
+                             "function": {"name": call["function"]["name"],
+                                          "arguments": call["function"]["arguments"]}}]}
+            for i, call in enumerate(result.get("calls") or []) if i >= sent]
+
+
 def _error_message(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
@@ -256,13 +267,8 @@ def make_handler(app: App):
                         quiet.join()
                 if result["final"]:
                     emit(result["final"])
-                if result["calls"]:
-                    for i, call in enumerate(result["calls"]):
-                        if i < result.get("calls_streamed", 0):      # sent as deltas already
-                            continue
-                        emit({"tool_calls": [{"index": i, "id": call["id"], "type": "function",
-                                              "function": {"name": call["function"]["name"],
-                                                           "arguments": call["function"]["arguments"]}}]})
+                for call_delta in unsent_call_deltas(result):
+                    emit(call_delta)
                 end = chunk({}, result["finish"])
                 if result.get("stop_sequence") is not None:
                     end["stop_sequence"] = result["stop_sequence"]

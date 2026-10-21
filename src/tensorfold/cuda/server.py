@@ -444,7 +444,8 @@ class App:
             if tools:
                 answer = (policy.content(answer, finished=finished) if policy.single
                           # with the flag the final content drops an unoffered call in any case: hide it so
-                          else hide_tool_calls(answer, finished=finished, any_case=drop_unoffered_calls()))
+                          else hide_tool_calls(answer, finished=finished, any_case=drop_unoffered_calls(),
+                                               keep_ill_formed=True))
             else:                                 # TF_DROP_UNOFFERED_TOOL_CALLS=1: every call is unoffered
                 answer = answer_without_tools(answer, finished=finished)
             return reasoning, answer
@@ -595,13 +596,14 @@ class App:
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
                     if probabilities is not None else None)
         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
-        streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
+        streamed = calls_stream.completed if calls_stream is not None and calls_stream.streamed else 0
+        skipped = calls_stream.abandoned if calls_stream is not None and calls_stream.streamed else 0
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
                 "stop_sequence": matched_stop(raw_text, stops.strings),
                 **({"logprobs": logprobs} if logprobs is not None else {}),
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
-                "stats": stats, "calls_streamed": streamed}
+                "stats": stats, "calls_streamed": streamed, "calls_offset": skipped}
 
     def _turns(self) -> Turns:
         """The engine's turns (one request at a time, background ones last), made on first use."""

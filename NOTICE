@@ -17,6 +17,9 @@ nodes. TensorFold's text above, LICENSE, LICENSES/ and the upstream sections of 
 Added:
   src/tensorfold/families/deepseek_v41/   the model family (engine, kernels, server integration)
   src/tensorfold/cuda/rdma.py, src/tensorfold/cuda/rdma_gather.cu   RDMA-write all-gather for TP decode
+  src/tensorfold/dsml_calls.py             top-level DSML and <tool_call> blocks: the rules for contained tool calls
+                                           (written for this fork; the rules follow ashhart/TensorFold PRs #684,
+                                           #650 and #489, Apache-2.0, see THIRD_PARTY_NOTICES.md)
   src/tensorfold/cuda/roce_gid.py          RoCE v2 IPv4 GID index scan of an RDMA port (sysfs)
   tools/dsv41/                             tests, checks, benchmark clients, the reference model, DESIGN.md,
                                            REPORT.md and ATTRIBUTION.md
@@ -45,7 +48,9 @@ Modified upstream files:
   src/tensorfold/engine/call_gate.py           ThinkLoop: the loop guard's token 8-gram novelty check
   src/tensorfold/cuda/comm.py                  NCCL abort and asynchronous-error hooks (a concurrent lane's watchdog)
   src/tensorfold/serve_options.py              --vision for families with their own image path (CUDA_VISION)
-  src/tensorfold/cuda/reply_text.py            DSML tool-call parsing for DeepSeek-V4.1
+  src/tensorfold/cuda/reply_text.py            DSML tool-call parsing for DeepSeek-V4.1; a call must be a complete,
+                                               well formed block at the top level (contained tool calls)
+  src/tensorfold/engine/tool_draft.py          ToolCallStreamer skips DSML calls blocks (contained tool calls)
   src/tensorfold/server/request_options.py     reasoning_effort "off" heard as "none"
   src/tensorfold/server/authentication.py      the no-key startup line names the CUDA server's TF_API_KEY gate
   .gitignore                                   ignores macOS ._* files
