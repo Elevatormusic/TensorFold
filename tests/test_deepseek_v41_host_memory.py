@@ -62,16 +62,64 @@ def test_gate_waits_only_with_live_streams_and_a_short_host(monkeypatch, capsys)
 
 
 def test_trim_is_off_below_its_threshold(monkeypatch):
-    freed = []
+    freed, slack = [], []
+    trimmer = SimpleNamespace(_slack=lambda: slack.append(1))
     monkeypatch.setattr(multi.torch.cuda, "empty_cache", lambda: freed.append(1))
     monkeypatch.setattr(multi.torch.cuda, "memory_reserved", lambda *a: 1000 * 2**20)
     monkeypatch.setattr(multi.torch.cuda, "memory_allocated", lambda *a: 800 * 2**20)
     monkeypatch.setattr(multi, "TRIM", 256 * 2**20)
-    multi.MultiDecoder._trim(None)
-    assert freed == []
+    multi.MultiDecoder._trim(trimmer)
+    assert freed == [] and slack == []
     monkeypatch.setattr(multi.torch.cuda, "memory_allocated", lambda *a: 700 * 2**20)
-    multi.MultiDecoder._trim(None)
-    assert freed == [1]
+    multi.MultiDecoder._trim(trimmer)
+    assert freed == [1] and slack == [1]                                     # the baseline is read after a release
     monkeypatch.setattr(multi, "TRIM", -1)
-    multi.MultiDecoder._trim(None)
-    assert freed == [1]
+    multi.MultiDecoder._trim(trimmer)
+    assert freed == [1] and slack == [1]
+
+
+def _torch_gap(monkeypatch, gap_mib):
+    monkeypatch.setattr(multi.torch.cuda, "memory_reserved", lambda *a: (1000 + gap_mib) * 2**20)
+    monkeypatch.setattr(multi.torch.cuda, "memory_allocated", lambda *a: 1000 * 2**20)
+
+
+def test_slack_keeps_the_smallest_gap_seen(monkeypatch):
+    d = SimpleNamespace(slack0=None)
+    for gap, want in ((600, 600), (300, 300), (400, 300)):
+        _torch_gap(monkeypatch, gap)
+        multi.MultiDecoder._slack(d)
+        assert d.slack0 == want * 2**20
+
+
+def test_host_room_counts_only_the_cached_bytes_a_trim_can_return(monkeypatch):
+    monkeypatch.setattr(multi, "_mem_available", lambda: 2339 * 2**20)
+    d = SimpleNamespace(slack0=300 * 2**20)
+    _torch_gap(monkeypatch, 800)
+    assert multi.MultiDecoder._host_room(d) == (2339 + 500) * 2**20          # 500 MiB can go back
+    _torch_gap(monkeypatch, 300)
+    assert multi.MultiDecoder._host_room(d) == 2339 * 2**20                  # the slack is not room
+    _torch_gap(monkeypatch, 100)
+    assert multi.MultiDecoder._host_room(d) == 2339 * 2**20                  # (never below MemAvailable)
+    d.slack0 = None                                                          # no baseline (no warm-up, no trim)
+    _torch_gap(monkeypatch, 800)
+    assert multi.MultiDecoder._host_room(d) == 2339 * 2**20                  # counts none of the cache
+    monkeypatch.setattr(multi, "_mem_available", lambda: -1)
+    assert multi.MultiDecoder._host_room(d) == -1
+
+
+def test_the_gate_holds_a_head_that_is_under_the_threshold_only_by_the_slack(monkeypatch):
+    """Run A of the 1.1.0 gate: MemAvailable 2,339 MiB, floor 1.5 + 1.0 GiB, about 300 MiB of slack."""
+
+    monkeypatch.setenv("TF_DS_MEM_FLOOR_GIB", "1.5")
+    monkeypatch.setattr(multi, "ADMIT_GIB", 1.0)
+    monkeypatch.setattr(multi, "_mem_available", lambda: 2339 * 2**20)
+    _torch_gap(monkeypatch, 300)
+    d = SimpleNamespace(live=lambda: 1, slack0=300 * 2**20, gate_log=0.0)
+    d._host_room = lambda: multi.MultiDecoder._host_room(d)
+    with pytest.raises(NoRoom):
+        multi.MultiDecoder._gate(d, None)
+    d.slack0 = 0                                                             # the old reading let it through
+    multi.MultiDecoder._gate(d, None)
+    d.slack0 = 300 * 2**20
+    monkeypatch.setattr(multi, "_mem_available", lambda: 3300 * 2**20)      # a fresh start
+    multi.MultiDecoder._gate(d, None)
