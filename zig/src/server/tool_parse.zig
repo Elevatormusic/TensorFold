@@ -128,7 +128,7 @@ fn knownTools(a: Allocator, tools: []const Value) Allocator.Error!std.StringArra
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
 pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
     if (tools.len == 0) return .{ .content = text, .calls = null };
-    var known = try knownTools(a, tools);
+    const known = try knownTools(a, tools);
     if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
     const schemas = try tool_params.schemas(a, tools);
     const envs = try envelopes(a, text);
@@ -212,7 +212,7 @@ pub const Cut = struct { parsed: Parsed, open: bool };
 pub fn parseCut(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Cut {
     // a reply that is one bare JSON call (or a list of them) is a call, also when an argument holds a DSML opener
     if (tools.len > 0) {
-        var known = try knownTools(a, tools);
+        const known = try knownTools(a, tools);
         if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .parsed = .{ .content = "", .calls = calls }, .open = false };
     }
     const at = try openDsml(a, text);
