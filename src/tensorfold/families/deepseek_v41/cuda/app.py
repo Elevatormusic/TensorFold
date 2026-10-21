@@ -17,14 +17,26 @@ from tensorfold.server.errors import RequestError
 EFFORT_VALUES = {"minimal": 25, "low": 50, "medium": 62, "high": 75, "xhigh": 88, "max": 100}
 
 
+# The grounding tokens: DeepSeek's encoding keeps them as tokens in an assistant's content and reasoning (a model wrote
+# them there). Every other special-token spelling in message text is plain text.
+GROUNDING = ("<｜ref｜>", "<｜/ref｜>", "<｜box｜>", "<｜/box｜>",
+             "<｜point｜>", "<｜/point｜>", "<｜polygon｜>", "<｜/polygon｜>")
+
+
 class DsApp(App):
     reads_ignore_eos = True
+    plain_message_text = True           # DeepSeek's encoding: a special-token spelling in message text is plain text
+    plain_assistant_keep = GROUNDING
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         # --vision-max-images: images take DsVision.split's path, not the shared image limits, so its own count
         # check gets the server's value (DsVision's default is 8)
         vision, images = getattr(self.engine, "vision", None), kwargs.get("vision_max_images")
+        if vision is not None:          # vision.split writes the image placeholder into content: it is the server's
+            from .vision import PLACEHOLDER
+
+            self.plain_content_keep = (PLACEHOLDER,)
         if vision is not None and images is not None:
             vision.max_images = int(images)
         template = self.template

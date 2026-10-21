@@ -16,6 +16,7 @@ from tensorfold.engine import grammar
 from tensorfold.server.cancellation import RequestCancelled
 from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
+from tensorfold.server.plain_text import PlainText
 from tensorfold.server.probabilities import TokenBytes, probability_options
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
 from tensorfold.server.stopping import matched_stop, stop_options
@@ -74,6 +75,9 @@ class App:
     """Serve one engine with sampling and reply-length defaults for requests that omit them."""
 
     reads_ignore_eos = False            # True where the engine reads ``ignore_eos`` itself; a ``stop_eos`` engine is given it
+    plain_message_text = False          # True: a special-token spelling in request text stays text (plain_text.py)
+    plain_content_keep: tuple[str, ...] = ()        # spellings the server itself writes into message content
+    plain_assistant_keep: tuple[str, ...] = ()      # spellings an assistant's content and reasoning may keep
 
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
@@ -103,6 +107,18 @@ class App:
         if self.context_window < 0:
             raise ValueError("context_window must be 0 or a positive token count")
         self.turns = Turns()                # one request at a time where the engine decodes one
+
+    def _plain_text(self) -> PlainText | None:
+        """The request-text shield, made once; None where the family keeps the old tokenization."""
+
+        if not self.plain_message_text or not PlainText.supports(self.tok):
+            return None
+        with _MADE:
+            made = self.__dict__.get("_plain_text_made")
+            if made is None:
+                made = self.__dict__["_plain_text_made"] = PlainText(
+                    self.tok, content_keep=self.plain_content_keep, assistant_keep=self.plain_assistant_keep)
+            return made
 
     @property
     def model_ids(self) -> list[str]:
@@ -183,13 +199,22 @@ class App:
         if not hasattr(self.engine, "score_labels"):
             raise RequestError("this model's CUDA engine does not score decision labels")
 
+        plain = self._plain_text()
+        latest: list[Any] = [None]               # the shield of the question rendered last: its text is encoded next
+
         def render(content: str) -> str:
+            messages = [{"role": "user", "content": content}]
+            shield = plain.shield(messages) if plain else None
+            latest[0] = shield
             try:
-                return self.template.render([{"role": "user", "content": content}], tools=None, enable_thinking=False)
+                return self.template.render(shield.messages if shield else messages, tools=None, enable_thinking=False)
             except TemplateError as exc:
-                raise DecisionError(f"the chat template failed: {exc}") from exc
+                message = shield.spelled(str(exc)) if shield else exc
+                raise DecisionError(f"the chat template failed: {message}") from exc
 
         def encode(text: str) -> list[int]:
+            if plain and latest[0] is not None:
+                return [int(token) for token in plain.encode(text, latest[0])]
             return [int(token) for token in self._encode(text, False)]
 
         try:
@@ -283,8 +308,18 @@ class App:
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
-            text = render(body["messages"])
-            prompt = self._encode(text, False)
+            plain = self._plain_text()
+            shield = plain.shield(body["messages"], tools, kwargs) if plain else None
+            if shield is not None and shield.table:       # a spelling in the request's text: plain text, not a token
+                try:
+                    text = self.template.render(shield.messages, tools=shield.tools, enable_thinking=thinking,
+                                                extra=shield.extra)
+                except TemplateError as exc:
+                    raise RequestError(f"the chat template rejected the request: {shield.spelled(str(exc))}") from exc
+                prompt = plain.encode(text, shield)
+            else:
+                text = render(body["messages"])
+                prompt = self._encode(text, False)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
