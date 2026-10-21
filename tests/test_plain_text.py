@@ -203,6 +203,22 @@ def test_a_spelling_split_across_text_parts_is_plain_text(tmp_path, parts):
         assert sum(got[i:i + len(_ids(text))] == _ids(text) for i in range(len(got))) >= 1
 
 
+def test_a_json_escape_in_string_tool_arguments_hides_no_spelling(tmp_path):
+    """The template parses string arguments, so ``<\u0074hink>`` becomes ``<think>`` there."""
+
+    escaped = '{"x": "<' + chr(92) + 'u0074hink> and ' + chr(92) + 'u003c/think>"}'
+    plain = {"x": "<think> and </think>"}
+
+    def history(arguments):
+        call = [{"id": "1", "type": "function", "function": {"name": "f", "arguments": arguments}}]
+        return [{"role": "user", "content": "q"}, {"role": "assistant", "content": "", "tool_calls": call},
+                {"role": "tool", "tool_call_id": "1", "content": "r"}]
+
+    app = _app(tmp_path)
+    assert _prompt(app, history(escaped)) == _prompt(app, history(plain))
+    assert _prompt(app, history(plain)).count(_token(END_THINK)) == 1       # the template's own, after the assistant
+
+
 def test_a_text_only_request_gets_no_placeholder_token(tmp_path):
     text = f"look {IMAGE} here"
     assert _prompt(_app(tmp_path), [{"role": "user", "content": text}]) == _expected(BOS, USER, text, ASSISTANT, THINK)

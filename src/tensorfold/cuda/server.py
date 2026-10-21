@@ -203,7 +203,7 @@ class App:
 
         def render(content: str) -> str:
             messages = [{"role": "user", "content": content}]
-            shield = plain.shield(messages) if plain else None
+            shield = plain.shield(self.template.prepared(messages)) if plain else None
             latest[0] = shield
             try:
                 return self.template.render(shield.messages if shield else messages, tools=None, enable_thinking=False)
@@ -310,7 +310,9 @@ class App:
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             plain = self._plain_text()
-            shield = plain.shield(body["messages"], tools, kwargs, content_keep=plain_keep) if plain else None
+            # the shield sees the messages as the template gets them: a JSON escape or a split text part hides nothing
+            shield = plain.shield(self.template.prepared(body["messages"]), tools, kwargs,
+                                  content_keep=plain_keep) if plain else None
             if shield is not None and (shield.table or plain.normalizes):    # a spelling in the request's text: plain text, not a token
                 try:
                     text = self.template.render(shield.messages, tools=shield.tools, enable_thinking=thinking,
