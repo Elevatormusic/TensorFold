@@ -342,13 +342,15 @@ const Run = struct {
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
-        const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+        // a reply cut inside a DSML calls block: no call from that block and none of its markup, as the stream shows it
+        const cut = try tool_parse.parseCut(r.a, reply.content, tools, r.plan.policy.maxCalls());
+        const parsed = cut.parsed;
         const calls = (if (r.turn != null) cortheon.clientCalls(parsed.calls) else parsed.calls) orelse {
-            if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
+            if (r.plan.policy.single or parsed.calls != null or cut.open) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
             return null;
         };
         reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
-        reply.finish_reason = "tool_calls";
+        if (!cut.open) reply.finish_reason = "tool_calls"; // a cut reply keeps its finish reason (length)
         if (r.plan.policy.single) reply.tool_calls_streamed = false;
         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
     }
