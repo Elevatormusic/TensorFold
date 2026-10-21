@@ -59,12 +59,16 @@ class Scheduler:
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
-    def close(self) -> None:
-        """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now)."""
+    def close(self, timeout: float | None = None) -> bool:
+        """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now).
+        With ``timeout`` seconds, True if the worker stopped in time; a worker still busy keeps its decoder."""
 
         self.waiting.stop()
-        self.thread.join()
+        self.thread.join(timeout)
+        if self.thread.is_alive():
+            return False
         self.decoder = None
+        return True
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
