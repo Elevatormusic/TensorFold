@@ -427,6 +427,19 @@ class Slot:
         self.index, self.sc, self.dc = index, None, dc
 
 
+def _mem_available() -> int:
+    """MemAvailable in bytes (-1: unknown)."""
+
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return -1
+
+
 class Kept:
     """A finished stream's prompt kept in the window: positions [base, base + size) hold the compressed and indexer
     rows (and token ids) of its first ``top`` prompt tokens; ``snaps`` its slot's rings and compressor inputs at each
@@ -486,6 +499,7 @@ class MultiDecoder:
         self.filling: list[Stream] = []                 # admitted, their prompts filling their slots (oldest first)
         self.chunk_s, self.since_fill = 0.0, 0.0        # the last prompt chunk's time; decoding since then
         self.gate_log = 0.0                             # (the admission gate's last log line)
+        self.slack0: int | None = None                  # torch's free bytes that no trim gives back (see ``_slack``)
         self.next_id = 0
         self.link: Link | None = None
         self.watch: Watchdog | None = None
@@ -539,6 +553,8 @@ class MultiDecoder:
             for k in range(1, len(self.slots) + 1):
                 self._drafts([0] * k, [1] * k, list(range(k)))
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()                         # (the capture's scratch back to the node before the baseline)
+        self._slack()
         self.runner.warmed = True
         if self.e.rank == 0:
             print(f"[tensorfold] --parallel warm-up: {n} round graphs, {len(self.drafters)} drafter graphs, "
@@ -581,19 +597,25 @@ class MultiDecoder:
             return
         with memtrace.phase("trim"):
             torch.cuda.empty_cache()
+        self._slack()
+
+    def _slack(self) -> None:
+        """Right after a release, the free bytes torch still holds (the graphs' pools, which ``empty_cache`` cannot
+        return) are the least it holds at any time: ``slack0`` keeps the smallest such value."""
+
+        gap = int(torch.cuda.memory_reserved() - torch.cuda.memory_allocated())
+        self.slack0 = gap if self.slack0 is None else min(self.slack0, gap)
 
     def _host_room(self) -> int:
-        """Bytes this node can still give a step: MemAvailable plus torch's cached free blocks (-1: unknown)."""
+        """Bytes this node can still give a step: MemAvailable plus the cached free bytes that a trim can give back,
+        which are torch's free bytes above ``slack0`` (-1: unknown). Counting the slack made a head that was 221 MiB
+        under the gate's threshold look 100 to 300 MiB over it."""
 
-        try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
-                        return (int(line.split()[1]) * 1024 + torch.cuda.memory_reserved()
-                                - torch.cuda.memory_allocated())
-        except (OSError, ValueError, IndexError):
-            pass
-        return -1
+        avail = _mem_available()
+        if avail < 0:
+            return -1
+        gap = int(torch.cuda.memory_reserved() - torch.cuda.memory_allocated())
+        return avail + max(0, gap - (self.slack0 or 0))
 
     def _gate(self, s: Stream) -> None:
         """NoRoom while streams are live and the host is short of its floor plus ADMIT_GIB (rank 0 reads its own
