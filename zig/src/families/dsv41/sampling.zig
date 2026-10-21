@@ -44,7 +44,8 @@ pub fn uniform(seed: u64, position: u64, id: u64) f64 {
     return @as(f64, @floatFromInt(x >> 11)) * 0x1p-53 + 0x1p-54;
 }
 
-/// numpy's pairwise sum of a contiguous float64 row (umath pairwise_sum, under its 128-element block).
+/// numpy's pairwise sum of a contiguous float64 row (umath pairwise_sum: blocks of 128 summed 8 lanes wide, longer
+/// rows split in halves at a multiple of 8).
 pub fn pairwiseSum(a: []const f64) f64 {
     const n = a.len;
     if (n < 8) {
@@ -52,7 +53,11 @@ pub fn pairwiseSum(a: []const f64) f64 {
         for (a) |v| res += v;
         return res;
     }
-    std.debug.assert(n <= 128);
+    if (n > 128) {
+        var n2 = n / 2;
+        n2 -= n2 % 8;
+        return pairwiseSum(a[0..n2]) + pairwiseSum(a[n2..]);
+    }
     var r: [8]f64 = a[0..8].*;
     var i: usize = 8;
     while (i < n - n % 8) : (i += 8) {
@@ -103,15 +108,32 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     if (s.temperature <= 0) return @intCast(argmax(row));
     if (s.top_k == 0) return nucleusRow(row, position, s);
     const count = @min(row.len, s.top_k + margin);
-    if (count > max_candidates) return error.TooManyCandidates;
-    var values: [max_candidates]f32 = undefined;
-    var ids: [max_candidates]i64 = undefined;
-    const width = topCandidates(row, count, &values, &ids);
-    // choose_rows on the candidates (already in lexsort's order)
+    if (count <= max_candidates) {
+        var values: [max_candidates]f32 = undefined;
+        var ids: [max_candidates]i64 = undefined;
+        var scaled: [max_candidates]f64 = undefined;
+        var score: [max_candidates]f64 = undefined;
+        return choose(row, position, s, values[0..count], ids[0..count], scaled[0..count], score[0..count]);
+    }
+    // a top_k past max_candidates - margin: the same rule on heap buffers (no per-stream error that fails a round)
+    const gpa = std.heap.page_allocator;
+    const values = try gpa.alloc(f32, count);
+    defer gpa.free(values);
+    const ids = try gpa.alloc(i64, count);
+    defer gpa.free(ids);
+    const scaled = try gpa.alloc(f64, count);
+    defer gpa.free(scaled);
+    const score = try gpa.alloc(f64, count);
+    defer gpa.free(score);
+    return choose(row, position, s, values, ids, scaled, score);
+}
+
+/// choose_rows for one row on buffers of the candidate count: the top candidates in lexsort's order, the keyed scores,
+/// the top_p and min_p cuts, the first best score.
+fn choose(row: []const f32, position: u64, s: Sampling, values: []f32, ids: []i64, scaled: []f64, score: []f64) i64 {
+    const width = topCandidates(row, values.len, values, ids);
     const k = @max(1, @min(s.top_k, width));
     const t = @max(s.temperature, 1e-6);
-    var scaled: [max_candidates]f64 = undefined;
-    var score: [max_candidates]f64 = undefined;
     for (0..k) |j| {
         scaled[j] = @as(f64, values[j]) / t;
         const u = uniform(s.seed, position, @bitCast(ids[j]));
@@ -120,7 +142,12 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     if (0.0 < s.top_p and s.top_p < 1.0) {
         var mx = scaled[0];
         for (scaled[1..k]) |v| mx = @max(mx, v);
-        var probs: [max_candidates]f64 = undefined;
+        // probs over the candidates: the score buffer's twin (score is written after this only for the cut)
+        var small: [max_candidates]f64 = undefined;
+        const big = if (k > max_candidates) std.heap.page_allocator.alloc(f64, k) catch null else null;
+        defer if (big) |b| std.heap.page_allocator.free(b);
+        const probs: []f64 = if (big) |b| b else small[0..k];
+        if (k > max_candidates and big == null) return ids[0]; // out of memory: the top candidate
         for (0..k) |j| probs[j] = exp(scaled[j] - mx);
         const sum = pairwiseSum(probs[0..k]);
         for (0..k) |j| probs[j] /= sum;
@@ -304,6 +331,21 @@ test "numpy's pairwise sum" {
     // r = a[0..8] (no whole second block of 8); ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7)), then the rest in order
     var want = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
     for (a[8..]) |v| want += v;
+    try std.testing.expectEqual(want, pairwiseSum(&a));
+}
+
+test "a top_k past the stack buffers draws as the same rule, and numpy's long pairwise sum" {
+    var row: [300]f32 = undefined;
+    for (&row, 0..) |*x, j| x.* = @as(f32, @floatFromInt(j % 37)) * 0.25;
+    for (0..20) |p| {
+        const t = try sampleRow(&row, p, .{ .seed = 9, .top_k = 100, .top_p = 0.9 });
+        try std.testing.expect(t >= 0 and t < 300);
+        try std.testing.expect(row[@intCast(t)] >= 4.0); // inside the nucleus of the larger values
+    }
+    var a: [300]f64 = undefined;
+    for (&a, 0..) |*x, j| x.* = 1.0 / @as(f64, @floatFromInt(j + 1));
+    // n 300: halves at 144 (150 - 150 % 8), then 144 and 156 (> 128: 72 + 84)
+    const want = (pairwiseSum(a[0..72]) + pairwiseSum(a[72..144])) + (pairwiseSum(a[144..216]) + pairwiseSum(a[216..300]));
     try std.testing.expectEqual(want, pairwiseSum(&a));
 }
 

@@ -173,7 +173,8 @@ pub fn main(init: std.process.Init) !u8 {
         dsv41.lanes.follow(gpa, m) catch |err| {
             try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });
             try w.flush();
-            return 1;
+            // a broken link or frame: 75 tells a supervisor to restart both ranks (TF_DS_EXIT_ON_FAULT, lane_host.zig)
+            return if (std.c.getenv("TF_DS_EXIT_ON_FAULT")) |v| (if (std.mem.eql(u8, std.mem.span(v), "1")) 75 else 1) else 1;
         };
         try w.print("{{\"rank\": {d}, \"followed\": true}}\n", .{o.rank});
         try w.flush();
