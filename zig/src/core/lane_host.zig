@@ -629,7 +629,7 @@ pub const LaneHost = struct {
                     // a failed round leaves the device or the ranks' link in an unknown state: every live request has its
                     // error; the process goes so that a supervisor restarts both ranks (the Python line's exit 75)
                     std.debug.print("[tensorfold] a round failed ({s}); every live request got the error; exit 75 in {d} ms (TF_DS_EXIT_ON_FAULT)\n", .{ @errorName(e), grace_ms });
-                    std.Io.sleep(h.io, .fromMilliseconds(grace_ms), .awake) catch {};
+                    std.Io.sleep(h.io, .fromMilliseconds(@intCast(grace_ms)), .awake) catch {};
                     std.process.exit(75);
                 }
                 continue;
