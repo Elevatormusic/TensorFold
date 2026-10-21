@@ -43,6 +43,16 @@ pub const Settings = struct {
     probing: bool = false,
 };
 
+/// TF_RDMA_GID_INDEX (the Python build's switch): the GID index of each RDMA device's port 1 that the rings use, for
+/// example the RoCE v2 entry of the link's IPv4 address. 5 when unset, as before.
+pub fn gidIndex() !u8 {
+    const raw = std.c.getenv("TF_RDMA_GID_INDEX") orelse return 5;
+    const v = std.mem.span(raw);
+    if (v.len == 0) return error.BadRdmaGid;
+    for (v) |c| if (c < '0' or c > '9') return error.BadRdmaGid;
+    return std.fmt.parseInt(u8, v, 10) catch error.BadRdmaGid;
+}
+
 /// What the other side's queue pairs toward this rank need (a device each), and where this rank's receive ring is.
 pub const Info = extern struct {
     devices: u32,
