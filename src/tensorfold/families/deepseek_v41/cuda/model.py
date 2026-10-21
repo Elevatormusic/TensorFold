@@ -1,10 +1,4 @@
-"""DeepSeek-V4.1 forward on one TP rank: rows of one sequence at consecutive positions (a prompt chunk, a decode
-token, a verify window), updating that sequence's caches.
-
-Phase 1 (correctness first): EXL3 linears and the grouped expert kernel from TensorFold, attention / indexer /
-compressor / mHC in plain torch following DeepSeek's definitions, partial sums gathered from every rank and added in
-rank order so both ranks hold the same bits.
-"""
+"""Run DeepSeek-V4.1 on one TP rank with EXL3 or selected dense BF16 projections and FP32 partial sums."""
 
 from __future__ import annotations
 
@@ -96,8 +90,7 @@ def store_rows(cache, rows: torch.Tensor, x: torch.Tensor, block: int, e4m3: boo
 
 
 class Comm:
-    """All-gather of fp32 partials then a rank-order sum (identity on one rank). Decode-sized fp32 payloads go over
-    our RDMA-write gather (tensorfold.cuda.rdma) when every rank opens it, the rest over NCCL."""
+    """Sum partials through RDMA gather, two-rank NCCL in place, or a rank-order sum of gathered values."""
 
     def __init__(self, nccl, world: int, rdma_bytes: int = 0):
         self.nccl, self.world = nccl, world
@@ -123,7 +116,17 @@ class Comm:
         return out
 
     def sum(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum rank partials; NCCL can modify x, so callers must treat x as consumed."""
+
         if self.world == 1:
+            return x
+        nccl = getattr(self, "nccl", None)
+        reduce = getattr(nccl, "all_reduce", None)
+        rdma = getattr(nccl, "rdma", None)
+        use_rdma = rdma is not None and rdma.fits(x)
+        if self.world == 2 and reduce is not None and x.is_contiguous() and not use_rdma:
+            # Two ranks have one addition; NCCL reuses the input buffer.
+            reduce(x)
             return x
         g = self.gather(x)
         acc = g[0].clone()
@@ -175,17 +178,26 @@ L2_MOE_MB = int(os.environ.get("TF_DS_L2_MOE_MB") or 8)
 L2_NEXT_MB = int(os.environ.get("TF_DS_L2_NEXT_MB") or 16)
 
 
+def _linear_storage(layer):
+    """The tensor that keeps a linear's weights alive for an L2 prefetch."""
+
+    return layer.words if hasattr(layer, "words") else layer.weight
+
+
 def _l2_tensors(model, lay, kind: str, nxt=None) -> list:
     """The weights a fork prefetches, in the order the kernels after it read them; ``nxt`` for "next": the next layer,
     or the head (an Exl3Linear) after the last layer. (The grouped launches and q_proj's group read these same
     tensors: an Exl3Group keeps each layer's own words.)"""
 
     if kind == "attn":
-        return [wo.words for wo in lay.wo_a] + [lay.wo_b.words]
+        return [wo.words for wo in lay.wo_a] + [_linear_storage(lay.wo_b)]
     if kind == "moe":
         ex = lay.experts
         e = ex.count
-        # the shared expert's trellises unless SHARED_OVERLAP computes it beside the gate (it streams them itself then)
+        # the shared expert's trellises unless SHARED_OVERLAP computes it beside the gate (it streams them itself then);
+        # a shared expert outside the pack always runs on this stream, after the gate
+        if lay.shared is not None:
+            return [lay.hc_ffn[0], lay.gate_w] + [_linear_storage(w) for w in lay.shared]
         shared = [ex.keep[e - 1], ex.keep[2 * e - 1], ex.keep[3 * e - 1]] if len(ex.keep) == 3 * e else []
         return [lay.hc_ffn[0], lay.gate_w] + ([] if SHARED_OVERLAP else shared)
     if kind == "next" and nxt is not None:
@@ -263,9 +275,18 @@ def dequant_fp32(words_or_trellis, suh, svh, k: int, n: int, layer=None) -> torc
 
 
 def mm(layer, x: torch.Tensor, out_dtype=BF16, ws: exl3_prefill.Workspace | None = None) -> torch.Tensor:
-    """x [M, K] @ W: the row-invariant EXL3 linear up to 128 rows, the prompt GEMM beyond."""
+    """Apply an EXL3 or dense BF16 projection; dense CUDA rows use a fixed sum order up to 128 rows."""
 
     m = x.shape[0]
+    if hasattr(layer, "weight"):
+        w = layer.weight
+        if x.is_cuda and x.dtype == w.dtype == BF16:
+            # decode windows: the row-invariant kernel; prompt chunks: one BF16 GEMM with FP32 output, no FP32 copies
+            out = (K.dense_rows(x.contiguous(), w) if m <= 128 and KERNELS
+                   else torch.mm(x, w.t(), out_dtype=F32))
+        else:
+            out = x.float() @ w.float().t()
+        return out.to(out_dtype)
     if EXACT_MM:
         w = dequant_fp32(None, layer.suh, layer.svh, layer.k, layer.n, layer=layer)
         return (x.float() @ w).to(out_dtype)
@@ -394,12 +415,12 @@ def wo_a_rot(lay, n: int, device, head_dim: int) -> tuple:
 
 
 def wo_ab(lay, o: torch.Tensor | None = None, xh: list | None = None, fold: bool = True) -> torch.Tensor:
-    """mm(wo_b, wo_a_out(lay, o), F32) at decode sizes in one rotation and two glinear launches: wo_a's group (its
-    inputs rotated from o, or given rotated in ``xh``) also writes wo_b's rotated input rows from its epilogue
-    (linear_grouped.cu rot_out: rot_many's bits of u), then wo_b's glinear on them. The same bits."""
+    """Apply wo_a then wo_b with FP32 output; a dense wo_b skips the EXL3 input rotation."""
 
     ga = _group(lay, "_tf_wo_a", lay.wo_a)
-    gb = _group(lay, "_tf_wo_b", [lay.wo_b])
+    dense = hasattr(lay.wo_b, "weight")
+    gb = None if dense else _group(lay, "_tf_wo_b", [lay.wo_b])
+    fold = fold and not dense
     if xh is None:
         n = o.shape[0]
         og = o.view(n, len(lay.wo_a), -1)
@@ -1108,12 +1129,14 @@ class Model:
         n = x.shape[0]
         topk = topk or c.topk
         slots = topk + 1
-        shared_id = lay.experts.count - 1
+        separate_shared = getattr(lay, "shared", None) is not None
+        shared_id = lay.experts.count if separate_shared else lay.experts.count - 1
         vl = getattr(lay, "gate_b_vl", None)
         if img is not None and vl is None:
             vl = lay.gate_b                   # no VL bias in this pack: image rows route as text (warned at load)
         side_done = None
-        if shared_side and KERNELS and SHARED_OVERLAP and not EXACT_MM and n < exl3_experts.EXACT_ROWS:
+        if (not separate_shared and shared_side and KERNELS and SHARED_OVERLAP and not EXACT_MM
+                and n < exl3_experts.EXACT_ROWS):
             # the shared expert starts now on the side stream; the routing marks its slot as computed elsewhere
             side_done = self._shared_side(lay, x, n, slots)
             shared_id = lay.experts.count
@@ -1144,8 +1167,10 @@ class Model:
         s = self._moe_scratch(lay, n, slots)
         if EXACT_MM:
             return self._moe_exact(lay, x, pick, wts)
+        shared = self._shared_apart(lay, x) if separate_shared else None
         out = exl3_experts.routed(x.contiguous(), pick.contiguous(), wts, lay.experts, s, None, n,
-                                  limit=c.swiglu_limit, act_mode=exl3_experts.ACT_F32, before_down=side_done)
+                                  limit=c.swiglu_limit, act_mode=exl3_experts.ACT_F32, add=shared,
+                                  before_down=side_done)
         return out                                                        # fp32 partial [n, d]
 
     def _moe_scratch(self, lay, n: int, slots: int) -> "exl3_experts.Scratch":
@@ -1161,6 +1186,24 @@ class Model:
             s = exl3_experts.Scratch(lay.experts, rows=max(n, 64) if not prompt else n, slots=slots, prompt=prompt)
             self.scratch[skey] = s
         return s
+
+    def _shared_apart(self, lay, x: torch.Tensor) -> torch.Tensor:
+        """Run a shared expert that has a dense or other-format projection outside the routed EXL3 pack."""
+
+        w1, w3, w2 = lay.shared
+        limit = self.cfg.swiglu_limit
+        fused = KERNELS and not EXACT_MM and x.is_cuda
+        if (fused and GROUPED and x.shape[0] <= 128
+                and all(hasattr(w, "words") and w.split[1] in (4, 8) for w in (w1, w3))):
+            # gate and up read the same rows: one rotation launch and one glinear launch (the bits of two mm calls)
+            g, u = _group(lay, "_tf_shared13", [w1, w3])([x, x], out_dtypes=[BF16, BF16])
+        else:
+            g, u = mm(w1, x), mm(w3, x)
+        if fused:
+            h = K.clamped_swiglu(g.contiguous(), u.contiguous(), limit)
+        else:
+            h = (F.silu(g.float().clamp(max=limit)) * u.float().clamp(-limit, limit)).to(BF16)
+        return mm(w2, h, F32)
 
     def _shared_side(self, lay, x: torch.Tensor, n: int, slots: int) -> torch.cuda.Event:
         """SHARED_OVERLAP: the shared expert of x's n rows on the side stream, from now on: exl3_experts.routed with
@@ -1204,6 +1247,8 @@ class Model:
             return dequant_fp32(wq, suh[e], svh[e], k, n)
 
         for e in torch.unique(pick).tolist():
+            if e >= ex.count:
+                continue
             rows, slot = torch.where(pick == e)
             xs = x[rows]
             g = (xs.float() @ mat("g", None, ex.suh_g, ex.svh_g, e, D, I)).to(BF16).float()
@@ -1212,6 +1257,8 @@ class Model:
             g = g.clamp(max=c.swiglu_limit)
             hh = F.silu(g) * u * wts[rows, slot, None]
             y[rows] += (hh.to(BF16).float() @ mat("d", None, ex.suh_d, ex.svh_d, e, I, D)).to(BF16).float()
+        if getattr(lay, "shared", None) is not None:
+            y += self._shared_apart(lay, x)
         return y
 
     # -- one block of rows ----------------------------------------------------------------------------------------

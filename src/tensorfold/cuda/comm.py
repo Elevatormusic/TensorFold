@@ -1,4 +1,4 @@
-"""NCCL all-gather on the current stream so CUDA graphs capture it; a rank-order sum after it keeps ranks bit-equal."""
+"""NCCL collectives on the current CUDA stream for eager execution and CUDA graphs."""
 
 from __future__ import annotations
 
@@ -29,6 +29,10 @@ class Comm(Protocol):
 
 class _UniqueId(ctypes.Structure):
     _fields_ = [("internal", ctypes.c_byte * 128)]
+
+
+# ``ncclSum`` in the installed NCCL C ABI. Keep this value close to the call site.
+NCCL_SUM = 0
 
 
 def _library() -> ctypes.CDLL:
@@ -66,6 +70,8 @@ class NCCL:
         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
                                       ctypes.c_void_p]
+        lib.ncclAllReduce.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_void_p, ctypes.c_void_p]
         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout_s))
         uid = _UniqueId()
         if rank == 0:
@@ -90,6 +96,17 @@ class NCCL:
         stream = torch.cuda.current_stream().cuda_stream
         self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
                                            self.comm, stream))
+
+    def all_reduce(self, value: torch.Tensor) -> None:
+        """Sum ``value`` across ranks in place on the current CUDA stream."""
+
+        if not value.is_contiguous():
+            raise ValueError("all_reduce needs a contiguous tensor")
+        if not value.numel():
+            return
+        stream = torch.cuda.current_stream().cuda_stream
+        self._check(self.lib.ncclAllReduce(value.data_ptr(), value.data_ptr(), value.numel(), _DTYPES[value.dtype],
+                                           NCCL_SUM, self.comm, stream))
 
     def ready(self, label: str, *, every: float = 60.0, timeout: float = 3600.0) -> None:
         """Every rank finishes ``label`` before any goes on; a rank missing after ``timeout`` s is named."""
