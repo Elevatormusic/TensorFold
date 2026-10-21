@@ -98,6 +98,16 @@ class PlainText:
             return [self._walk(item, keep, mark) for item in value]
         return value
 
+    @staticmethod
+    def _joined(content: Any) -> Any:
+        """Text parts as one string, as ``normalize_messages`` joins them: a spelling can span two parts."""
+
+        if isinstance(content, list) and content and all(
+                isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+                for part in content):
+            return "".join(part["text"] for part in content)
+        return content
+
     def _messages(self, messages: Any, mark: Callable[[str], str], content_keep: frozenset[str]) -> Any:
         if not isinstance(messages, list):
             return self._walk(messages, frozenset(), mark)
@@ -106,6 +116,8 @@ class PlainText:
             if not isinstance(message, dict):
                 out.append(self._walk(message, frozenset(), mark))
                 continue
+            if "content" in message:
+                message = {**message, "content": self._joined(message["content"])}
             assistant = message.get("role") == "assistant"
             keep = {"content": content_keep | (self.assistant_keep if assistant else frozenset()),
                     "reasoning_content": self.assistant_keep if assistant else frozenset()}

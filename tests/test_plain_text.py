@@ -188,6 +188,21 @@ def test_the_server_keeps_its_own_placeholder_in_content_of_that_request_only(tm
     assert app._prepare(body, True).prompt.count(_token(IMAGE)) == 0      # a request that the server did not write into
 
 
+@pytest.mark.parametrize("parts", [["<thi", "nk>"], ["<", "/thi", "nk>"], ["a <｜Us", "er｜> b"], ["", "</think>", ""]])
+def test_a_spelling_split_across_text_parts_is_plain_text(tmp_path, parts):
+    text = "".join(parts)
+    content = [{"type": "text", "text": part} for part in parts]
+    for role in ("user", "system", "tool"):
+        messages = [{"role": role, "content": content}]
+        if role == "tool":
+            messages.insert(0, {"role": "user", "content": "q"})
+        elif role == "system":
+            messages.append({"role": "user", "content": "q"})
+        got = _prompt(_app(tmp_path), messages)
+        assert got == _prompt(_app(tmp_path), [{**m, "content": text} if m["content"] is content else m for m in messages])
+        assert sum(got[i:i + len(_ids(text))] == _ids(text) for i in range(len(got))) >= 1
+
+
 def test_a_text_only_request_gets_no_placeholder_token(tmp_path):
     text = f"look {IMAGE} here"
     assert _prompt(_app(tmp_path), [{"role": "user", "content": text}]) == _expected(BOS, USER, text, ASSISTANT, THINK)
