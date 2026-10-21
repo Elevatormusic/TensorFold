@@ -24,6 +24,7 @@ from tensorfold.cuda.exl3 import experts as exl3_experts
 from tensorfold.cuda.exl3.linear import Exl3Linear
 
 from ..config import Cfg
+from .hostenv import drop_page_cache, mem_available_gib, release_enabled
 
 
 @dataclass
@@ -129,7 +130,11 @@ class Shards:
         return t.reshape(shape)
 
     def close(self) -> None:
+        """Close the files. Their cached pages go back to the node first (``drop_page_cache``): a load reads most of
+        the checkpoint once, and on GB10 the page cache takes memory that the serving process needs."""
+
         for f in self._files.values():
+            drop_page_cache(f.fileno())
             f.close()
         self._files.clear()
 
@@ -248,6 +253,7 @@ class RankCache:
             for f in self.ahead:
                 f.cancel()
             self.pool.shutdown(wait=True)
+            drop_page_cache(self.fd)
             os.close(self.fd)
             if ok and self.i != len(self.index):
                 self.path.unlink(missing_ok=True)
@@ -259,6 +265,7 @@ class RankCache:
                 self.f.write(body + struct.pack("<Q", self.at) + self.MAGIC)
                 self.f.flush()
                 os.fsync(self.f.fileno())
+                drop_page_cache(self.f.fileno())          # (clean after the fsync: the kernel keeps dirty pages)
             self.f.close()
             if ok:
                 os.replace(self.tmp, self.path)
@@ -568,6 +575,10 @@ def _load(sh, cfg, model_dir, rank, world, n_layers, log, dspark, t0) -> Weights
                else "the rank cache write failed and was dropped") + ")")
     sh.close()
     _trim()
+    free = mem_available_gib()
+    if free is not None:
+        log(f"[tensorfold] rank {rank}: weights loaded, MemAvailable {free:.1f} GiB (page cache release "
+            f"{'on' if release_enabled() else 'off'})")
     return w
 
 
