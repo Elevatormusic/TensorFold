@@ -9,6 +9,7 @@ from tensorfold.dsml_calls import DSML_CLOSE, DSML_OPEN, top_level_blocks
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
 
 _OPEN = "<tool_call>"
+_VALUE_END = re.compile("</parameter>", re.IGNORECASE)
 # the tags that decide where the top-level blocks are: a text that adds none of them leaves the blocks as they were
 _BLOCK_TAGS = re.compile(f"</?tool_call>|{re.escape(DSML_OPEN)}|{re.escape(DSML_CLOSE)}", re.IGNORECASE)
 _TAG_REACH = len(DSML_CLOSE)
@@ -331,7 +332,7 @@ class ToolCallStreamer:
                 self.pos = start + len(_OPEN)
                 self.state = "call"
             elif self.state == "call":
-                m = re.match(r"\s*<function=([^>\n]+)>\n?", rest)
+                m = re.match(r"\s*<function=([^>\n]+)>\n?", rest, re.IGNORECASE)
                 if m is None:
                     if len(rest) > 256 or (rest.strip() and not rest.strip().startswith("<")):
                         self.state = "abort"  # not a call we can follow: the end parser decides
@@ -350,7 +351,7 @@ class ToolCallStreamer:
                 self.pos += m.end()
                 self.state = "function"
             elif self.state == "function":
-                m = re.match(r"\s*<parameter=([^>\n]+)>\n?", rest)
+                m = re.match(r"\s*<parameter=([^>\n]+)>\n?", rest, re.IGNORECASE)
                 if m is not None:
                     self.value_schema = self.current_schema.get(m.group(1).strip(), {})
                     self.typed = typed_parameter(self.value_schema)
@@ -363,7 +364,7 @@ class ToolCallStreamer:
                     self.lead = not m.group(0).endswith("\n")
                     self.held = ""
                     continue
-                m = re.match(r"\s*</function>", rest)
+                m = re.match(r"\s*</function>", rest, re.IGNORECASE)
                 if m is not None:
                     self.held = "}" if self.args_open else "{}"     # sent when the block closes: a cut block stays invalid
                     self.pos += m.end()
@@ -371,7 +372,8 @@ class ToolCallStreamer:
                     continue
                 break
             elif self.state == "value":
-                end = rest.find(self._TAIL)
+                tail = _VALUE_END.search(rest)               # in any case, as the parser finds it
+                end = tail.start() if tail else -1
                 chunk = rest[:end] if end >= 0 else rest[:max(0, len(rest) - len(self._TAIL))]
                 self.pos += len(chunk)
                 piece = self.held + chunk

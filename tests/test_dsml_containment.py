@@ -443,6 +443,15 @@ class StreamedCalls(Flag):
         self.assertEqual(unsent_call_deltas({"calls": None}), [])
         self.assertEqual([d["tool_calls"][0]["index"] for d in unsent_call_deltas({"calls": found * 2})], [0, 1])
 
+    def test_the_inner_tags_of_a_streamed_call_match_in_any_case_as_the_parser_does(self):
+        for text in ("<tool_call><function=write>\n<parameter=path>y</parameter>\n</FUNCTION></tool_call>",
+                     "<tool_call><function=write>\n<PARAMETER=path>y</Parameter>\n</function></tool_call>",
+                     "<tool_call><FUNCTION=write>\n<parameter=path>y</parameter>\n</function></Tool_Call>"):
+            self.check(text, 1)
+            streamer = ToolCallStreamer(self.STREAM_TOOLS)
+            streamer.feed(text)
+            self.assertEqual((streamer.completed, streamer.abandoned), (1, 0))
+
     def test_a_tag_in_other_letter_case_is_not_streamed(self):
         self.check("<TOOL_CALL>" + self.XML_WRITE[len("<tool_call>"):-len("</tool_call>")] + "</tool_call>", 0)
 
