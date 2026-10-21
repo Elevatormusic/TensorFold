@@ -89,7 +89,7 @@ def _key(v, i):
 
     bits = tl.where(v == 0.0, 0, v.to(tl.int32, bitcast=True))
     ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
-    return (ordered << 32) | (0xFFFFFFFF - i)
+    return (ordered << 32) | (0xFFFFFFFF - i.to(tl.int64))
 
 
 @triton.jit
