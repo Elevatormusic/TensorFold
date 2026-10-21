@@ -61,6 +61,53 @@ def detect_gid_index(device: str, port: int = 1, *, root: Path | str = SYSFS) ->
     return None
 
 
+def active_roce_devices(*, root: Path | str = SYSFS) -> list[str]:
+    """The RDMA devices whose port 1 is ACTIVE with an Ethernet link layer (RoCE), in name order."""
+
+    root = Path(root)
+    out = []
+    try:
+        names = sorted(p.name for p in root.iterdir())
+    except OSError:
+        return out
+    for d in names:
+        state, layer = _read(root / d / "ports" / "1" / "state"), _read(root / d / "ports" / "1" / "link_layer")
+        if state is not None and "ACTIVE" in state and layer == "Ethernet":
+            out.append(d)
+    return out
+
+
+def nccl_hca_ports(env: Mapping[str, str] | None = None, *, root: Path | str = SYSFS) -> list[tuple[str, int]] | None:
+    """The ``(device, port)`` pairs that NCCL_IB_HCA lets NCCL use, among the active RoCE devices.
+
+    NCCL_IB_HCA is ``[^][=]<name>[:<port>],...``: a name matches the start of a device name, or the whole name after
+    ``=``. Unset or empty: every active RoCE device (port 1). A list with ``^`` excludes devices: returns None, as the
+    scan does not follow NCCL's rules for it. A pair without a port uses port 1.
+    """
+
+    env = os.environ if env is None else env
+    raw = (env.get("NCCL_IB_HCA") or "").strip()
+    active = active_roce_devices(root=root)
+    if not raw:
+        return [(d, 1) for d in active]
+    if raw.startswith("^"):
+        return None
+    exact = raw.startswith("=")
+    out = []
+    for item in raw.lstrip("=").split(","):
+        name, _, port = item.strip().partition(":")
+        if not name:
+            continue
+        try:
+            number = int(port) if port.strip() else 1
+        except ValueError:
+            return None
+        for d in active:
+            if (d == name if exact else d.startswith(name)) and (d, number) not in out:
+                out.append((d, number))
+    return out
+
+
 def gid_override(env: Mapping[str, str] | None = None) -> int | None:
     """The index that the user fixed, or None when the user did not fix one (variable unset, empty or -1)."""
 
@@ -82,14 +129,14 @@ def resolve_gid_indices(devices: Sequence[str], port: int = 1, *, fixed: int | N
                         root: Path | str = SYSFS) -> list[tuple[int, str]]:
     """One ``(index, how)`` for each device. ``how`` is "fixed" (an argument or a variable) or "detected".
 
-    ``fixed`` (an argument) wins over the variables. A negative ``fixed`` means "detect".
+    ``fixed`` (an argument) wins over the variables. A negative ``fixed`` means "detect", and the variables are not read.
     Raises RuntimeError when a device has no RoCE v2 IPv4 entry and nothing fixes the index.
     """
 
-    if fixed is not None and fixed < 0:
-        fixed = None
     if fixed is None:
         fixed = gid_override(env)
+    elif fixed < 0:
+        fixed = None
     out = []
     for device in devices:
         if fixed is not None:

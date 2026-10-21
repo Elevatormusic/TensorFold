@@ -13,10 +13,10 @@ a loaded file with ``fadvise(DONTNEED)`` (its pull requests #766 and #916). ``dr
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 
-from tensorfold.cuda.roce_gid import SYSFS, detect_gid_index
+from tensorfold.cuda.roce_gid import SYSFS, detect_gid_index, nccl_hca_ports
 
 NCCL_DEFAULTS = {"NCCL_CUMEM_ENABLE": "0", "NCCL_CUMEM_HOST_ENABLE": "0"}
 RELEASE_VAR = "TF_DS_RELEASE_PAGE_CACHE"
@@ -26,12 +26,13 @@ def _is_set(env: Mapping[str, str], name: str) -> bool:
     return bool((env.get(name) or "").strip())
 
 
-def apply_nccl_defaults(devices: Sequence[str] = (), *, env: dict | None = None, root: Path | str = SYSFS,
-                        port: int = 1) -> dict[str, str]:
+def apply_nccl_defaults(*, env: dict | None = None, root: Path | str = SYSFS) -> dict[str, str]:
     """Set what the user did not set, before NCCL starts. Returns the variables that this call set.
 
     * ``NCCL_CUMEM_ENABLE`` and ``NCCL_CUMEM_HOST_ENABLE`` become 0.
-    * ``NCCL_IB_GID_INDEX`` becomes the RoCE v2 IPv4 GID index of ``devices`` when every device has the same one.
+    * ``NCCL_IB_GID_INDEX`` becomes the RoCE v2 IPv4 GID index of the ports that NCCL_IB_HCA lets NCCL use (every
+      active RoCE port when it is unset), when each of those ports has the same index. With no such port, an
+      exclusion list in NCCL_IB_HCA, or ports that differ, NCCL keeps its own choice.
       A value that is set (also -1, which is NCCL's own detection) stays as it is.
       When this call sets the index, it also sets ``TF_RDMA_GID_INDEX=-1`` (if that is unset) so that the RDMA
       gather keeps detecting each port itself.
@@ -42,8 +43,9 @@ def apply_nccl_defaults(devices: Sequence[str] = (), *, env: dict | None = None,
     for name, value in NCCL_DEFAULTS.items():
         if not _is_set(env, name):
             env[name] = done[name] = value
-    if devices and not _is_set(env, "NCCL_IB_GID_INDEX"):
-        found = {detect_gid_index(d, port, root=root) for d in devices}
+    ports = nccl_hca_ports(env, root=root) if not _is_set(env, "NCCL_IB_GID_INDEX") else None
+    if ports:
+        found = {detect_gid_index(d, p, root=root) for d, p in ports}
         if len(found) == 1 and None not in found:
             env["NCCL_IB_GID_INDEX"] = done["NCCL_IB_GID_INDEX"] = str(found.pop())
             # the RDMA gather reads NCCL_IB_GID_INDEX as the user's choice; this marker keeps its own detection on

@@ -23,11 +23,14 @@ EMPTY = "0000:0000:0000:0000:0000:0000:0000:0000"
 FADV_DONTNEED = 4                                    # the Linux value; Windows has no os.POSIX_FADV_DONTNEED
 
 
-def make_port(root: Path, device: str, entries: dict, port: int = 1) -> None:
+def make_port(root: Path, device: str, entries: dict, port: int = 1, *, state: str = "4: ACTIVE",
+              layer: str = "Ethernet") -> None:
     """A fake sysfs port: ``entries`` maps an index to (type, gid); a type of None leaves the type file out."""
 
     base = root / device / "ports" / str(port)
     (base / "gids").mkdir(parents=True)
+    (base / "state").write_text(state + "\n")
+    (base / "link_layer").write_text(layer + "\n")
     (base / "gid_attrs" / "types").mkdir(parents=True)
     for n, (kind, gid) in entries.items():
         (base / "gids" / str(n)).write_text(gid + "\n")
@@ -96,6 +99,13 @@ class GidScanTests(unittest.TestCase):
                                                       root=self.root), [(2, "fixed")])
         self.assertEqual(roce_gid.resolve_gid_indices(["a"], fixed=-1, env={}, root=self.root), [(4, "detected")])
 
+    def test_a_negative_argument_bypasses_the_variables(self):
+        make_port(self.root, "a", {4: ("RoCE v2", V4)})
+        for env in ({"NCCL_IB_GID_INDEX": "9"}, {"TF_RDMA_GID_INDEX": "9"}):
+            with self.subTest(env=env):
+                self.assertEqual(roce_gid.resolve_gid_indices(["a"], fixed=-1, env=env, root=self.root),
+                                 [(4, "detected")])
+
     def test_tf_variable_decides_before_the_nccl_variable(self):
         env = {"TF_RDMA_GID_INDEX": "6", "NCCL_IB_GID_INDEX": "3"}
         self.assertEqual(roce_gid.gid_override(env), 6)
@@ -112,6 +122,40 @@ class GidScanTests(unittest.TestCase):
             roce_gid.resolve_gid_indices(["a"], env={}, root=self.root)
 
 
+class DeviceListTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        make_port(self.root, "rocep1s0f0", {}, state="1: DOWN")
+        make_port(self.root, "rocep1s0f1", {})
+        make_port(self.root, "roceP2p1s0f1", {})
+        make_port(self.root, "mlx5_ib", {}, layer="InfiniBand")
+
+    def test_active_roce_devices_are_the_active_ethernet_ports(self):
+        self.assertEqual(roce_gid.active_roce_devices(root=self.root), ["roceP2p1s0f1", "rocep1s0f1"])
+        self.assertEqual(roce_gid.active_roce_devices(root=self.root / "none"), [])
+
+    def test_nccl_hca_ports(self):
+        both = [("roceP2p1s0f1", 1), ("rocep1s0f1", 1)]
+        cases = [
+            ({}, both),
+            ({"NCCL_IB_HCA": ""}, both),
+            ({"NCCL_IB_HCA": "rocep1s0f1"}, [("rocep1s0f1", 1)]),
+            ({"NCCL_IB_HCA": "=rocep1s0f1,roceP2p1s0f1"}, [("rocep1s0f1", 1), ("roceP2p1s0f1", 1)]),
+            ({"NCCL_IB_HCA": "rocep1s0f"}, [("rocep1s0f1", 1)]),                  # a prefix; f0 is down
+            ({"NCCL_IB_HCA": "=rocep1s0f"}, []),                                   # "=" is an exact match
+            ({"NCCL_IB_HCA": "rocep1s0f1:1"}, [("rocep1s0f1", 1)]),
+            ({"NCCL_IB_HCA": "rocep1s0f1:2"}, [("rocep1s0f1", 2)]),
+            ({"NCCL_IB_HCA": "mlx5"}, []),                                         # not RoCE
+            ({"NCCL_IB_HCA": "^rocep1s0f1"}, None),                                # an exclusion list is not followed
+            ({"NCCL_IB_HCA": "rocep1s0f1:x"}, None),
+        ]
+        for env, want in cases:
+            with self.subTest(env=env):
+                self.assertEqual(roce_gid.nccl_hca_ports(env, root=self.root), want)
+
+
 class NcclDefaultsTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -119,6 +163,9 @@ class NcclDefaultsTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         make_port(self.root, "a", {3: ("RoCE v2", V4)})
         make_port(self.root, "b", {3: ("RoCE v2", V4_B)})
+
+    def apply(self, env: dict) -> dict:
+        return hostenv.apply_nccl_defaults(env=env, root=self.root)
 
     def test_cumem_is_off_by_default(self):
         env: dict = {}
@@ -149,7 +196,7 @@ class NcclDefaultsTests(unittest.TestCase):
 
     def test_gid_index_is_set_from_the_table(self):
         env: dict = {}
-        done = hostenv.apply_nccl_defaults(["a", "b"], env=env, root=self.root)
+        done = self.apply(env)
         self.assertEqual(env["NCCL_IB_GID_INDEX"], "3")
         self.assertEqual(done["NCCL_IB_GID_INDEX"], "3")
         # the gather keeps its own per-port detection
@@ -161,27 +208,42 @@ class NcclDefaultsTests(unittest.TestCase):
         for value in ("5", "-1"):
             with self.subTest(value=value):
                 env = {"NCCL_IB_GID_INDEX": value}
-                hostenv.apply_nccl_defaults(["a"], env=env, root=self.root)
+                self.apply(env)
                 self.assertEqual(env["NCCL_IB_GID_INDEX"], value)
                 self.assertNotIn("TF_RDMA_GID_INDEX", env)
 
     def test_user_tf_variable_stays(self):
         env = {"TF_RDMA_GID_INDEX": "8"}
-        hostenv.apply_nccl_defaults(["a"], env=env, root=self.root)
+        self.apply(env)
         self.assertEqual(env["TF_RDMA_GID_INDEX"], "8")
 
-    def test_gid_index_stays_unset_when_devices_differ_or_have_no_entry(self):
+    def test_gid_index_comes_from_the_hcas_that_nccl_uses(self):
+        make_port(self.root, "c", {6: ("RoCE v2", V4)})
+        for hca, want in (("=c", "6"), ("c", "6"), ("=a", "3"), ("=a,b", "3")):
+            with self.subTest(hca=hca):
+                env = {"NCCL_IB_HCA": hca}
+                self.apply(env)
+                self.assertEqual(env["NCCL_IB_GID_INDEX"], want)
+
+    def test_gid_index_stays_unset_when_the_ports_differ_or_cannot_be_named(self):
         make_port(self.root, "c", {6: ("RoCE v2", V4)})
         make_port(self.root, "d", {0: ("IB/RoCE v1", V4)})
-        for devices in (["a", "c"], ["a", "d"], ["d"], ["missing"]):
-            with self.subTest(devices=devices):
-                env: dict = {}
-                hostenv.apply_nccl_defaults(devices, env=env, root=self.root)
+        for hca in ("=a,c", "a,c", "=d", "^a", "=none", "a:x"):
+            with self.subTest(hca=hca):
+                env = {"NCCL_IB_HCA": hca}
+                self.apply(env)
                 self.assertNotIn("NCCL_IB_GID_INDEX", env)
+                self.assertNotIn("TF_RDMA_GID_INDEX", env)
 
-    def test_no_devices_leave_the_gid_index_alone(self):
+    def test_all_active_ports_count_when_nccl_ib_hca_is_unset(self):
+        make_port(self.root, "c", {6: ("RoCE v2", V4)})
         env: dict = {}
-        hostenv.apply_nccl_defaults(env=env, root=self.root)
+        self.apply(env)                                       # a, b and c are active: 3, 3 and 6
+        self.assertNotIn("NCCL_IB_GID_INDEX", env)
+
+    def test_no_ports_leave_the_gid_index_alone(self):
+        env: dict = {}
+        hostenv.apply_nccl_defaults(env=env, root=self.root / "none")
         self.assertNotIn("NCCL_IB_GID_INDEX", env)
 
 

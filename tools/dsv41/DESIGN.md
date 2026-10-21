@@ -51,7 +51,8 @@ tokens; workspace and graphs ~3–4 GiB. The kit allocates ~99.5 GiB weights a r
   CX7) for decode-sized payloads, NCCL over RoCE (the CX7 HCA, `NCCL_IB_HCA=<HCA>`) for prompt chunks. Each port's GID index is the lowest RoCE v2 IPv4 entry
   of its sysfs GID table, read at start (`cuda/roce_gid.py`; a node's table can differ from the other node's, and a link flap can
   move an entry). `TF_RDMA_GID_INDEX` or `NCCL_IB_GID_INDEX` with a value of 0 or more fixes it; unset, empty or -1 means detect.
-  When `NCCL_IB_GID_INDEX` is unset, the engine sets it to the detected index, and it sets `NCCL_CUMEM_ENABLE=0` and
+  When `NCCL_IB_GID_INDEX` is unset, the engine sets it to the detected index of the ports that `NCCL_IB_HCA` lets NCCL use
+  (every active RoCE port when it is unset) if they agree, and it sets `NCCL_CUMEM_ENABLE=0` and
   `NCCL_CUMEM_HOST_ENABLE=0` (cuMem allocations in NCCL ran the GB10 driver out of memory under many streams) unless the user set them.
   Budget ≈ 2 ms a token at 84 gathers.
 - Prompt chunks overlap the gather of one micro-batch with the next one's compute (as in our GLM-5.3 fork).

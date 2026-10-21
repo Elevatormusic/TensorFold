@@ -194,11 +194,9 @@ class DsEngine:
     def _nccl_host_env(self) -> None:
         """NCCL's cuMem allocations off and its GID index set (hostenv.py); a value that the user set stays."""
 
-        from tensorfold.cuda.rdma import device_names
-
         from .hostenv import apply_nccl_defaults
 
-        done = apply_nccl_defaults(device_names())
+        done = apply_nccl_defaults()
         if done:
             print(f"[tensorfold] rank {self.rank}: NCCL settings by default: "
                   + " ".join(f"{k}={v}" for k, v in done.items()), flush=True)

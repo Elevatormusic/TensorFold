@@ -28,7 +28,7 @@ from pathlib import Path
 
 import torch
 
-from .roce_gid import resolve_gid_indices
+from .roce_gid import active_roce_devices, resolve_gid_indices
 
 
 @lru_cache(maxsize=1)
@@ -48,16 +48,7 @@ def device_names() -> list[str]:
     if named:
         return named
     first = (os.environ.get("NCCL_IB_HCA") or "").strip().lstrip("=^").split(",")[0].split(":")[0].strip()
-    root = Path("/sys/class/infiniband")
-    active = []
-    for d in sorted(p.name for p in root.iterdir()) if root.exists() else []:
-        try:
-            state = (root / d / "ports" / "1" / "state").read_text()
-            layer = (root / d / "ports" / "1" / "link_layer").read_text().strip()
-        except OSError:
-            continue
-        if "ACTIVE" in state and layer == "Ethernet":
-            active.append(d)
+    active = active_roce_devices()
     if first in active:
         active.remove(first)
         active.insert(0, first)
