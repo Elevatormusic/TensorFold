@@ -89,6 +89,14 @@ This section was added by the fork that adds the `deepseek_v41` family; see `NOT
   MIT License, Copyright (c) 2023 DeepSeek, without including that source.
 - The DSML tool-call parsing in `src/tensorfold/cuda/reply_text.py` follows the format that DeepSeek's encoding and
   chat template for the model write (MIT License, Copyright (c) 2023 DeepSeek), without including that source.
+- The containment rules for DSML tool calls (`src/tensorfold/dsml_calls.py`, `reply_text.py`, `tool_draft.py`)
+  follow [ashhart/TensorFold](https://github.com/ashhart/TensorFold) pull requests #684 ("Contain nested calls
+  within legacy DSML envelopes"), #650 and #489 (Apache-2.0, Copyright 2026 TensorFold contributors): a call counts
+  only when its block is complete and well formed at the top level, text in an open block is never a call, and a
+  call inside an argument is argument text. Only the text and diffs of those three pull requests were read, in the
+  server files of the Zig engine outside `families/deepseek_v41/` and `kernels/cuda/deepseek_v41/`. The Python is
+  written for this fork. No code is copied. The block scanner, its depth rule and the strict check of a block's
+  structure are this fork's own.
 - Upstream [vLLM](https://github.com/vllm-project/vllm)'s `deepseek_v41` model code (Apache-2.0, Copyright
   contributors to the vLLM project) was read only as a cross-check of that math. No code is taken from it.
 - The grouped EXL3 expert kernel additions (`src/tensorfold/cuda/exl3/experts_grouped.cuh`, `experts.cu`) follow

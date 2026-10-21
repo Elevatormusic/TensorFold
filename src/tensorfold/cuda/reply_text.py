@@ -6,57 +6,46 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
+from tensorfold.dsml_calls import (CALL_CLOSE as _CALL_CLOSE, CALL_OPEN as _CALL_OPEN, DSML_OPEN as _DSML_OPEN,
+                                   parse_calls_block, top_level_blocks)
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.tools import parse_glm_tool_call_block
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas
 
-_CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
-# any case: only the no-tools drop path uses these (the stream with tools keeps the exact tags, as before)
-_CALL_OPEN_ANY_RE = re.compile("<tool_call>", re.IGNORECASE)
-_CALL_CLOSE_ANY_RE = re.compile("</tool_call>", re.IGNORECASE)
-_CALL_OPEN_RE, _CALL_CLOSE_RE = re.compile(re.escape(_CALL_OPEN)), re.compile(re.escape(_CALL_CLOSE))
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
 # DeepSeek-V4.x DSML tool calls (the format DeepSeek's own encoding.py writes and its chat template asks for):
 #   <｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n<｜DSML｜ parameter name="k" string="true">v</｜DSML｜ parameter>\n
 #   </｜DSML｜ invoke>\n</｜DSML｜ calls>   (string="false": the value is JSON)
-_DSML = "\uff5cDSML\uff5c"
-_DSML_OPEN, _DSML_CLOSE = f"<{_DSML} calls>", f"</{_DSML} calls>"
-_DSML_BLOCK_RE = re.compile(re.escape(_DSML_OPEN) + r"\s*(.*?)\s*" + re.escape(_DSML_CLOSE), re.DOTALL)
-_DSML_INVOKE_RE = re.compile(rf'<{_DSML} invoke name="([^"]+)">\s*(.*?)\s*</{_DSML} invoke>', re.DOTALL)
-_DSML_PARAM_RE = re.compile(rf'<{_DSML} parameter name="([^"]+)"(?: string="(true|false)")?>(.*?)</{_DSML} parameter>',
-                            re.DOTALL)
+# ``tensorfold.dsml_calls`` finds the blocks: a call is a complete, well formed block at the top level of the reply.
 
 
-def dsml_to_tool_calls(text: str) -> str:
-    """Rewrite each complete DSML calls block as ``<tool_call>{json}</tool_call>`` blocks (one per invoke)."""
+def _segments(text: str) -> Iterator[str | tuple[str, str]]:
+    """The reply as text (a plain string) and call blocks ((its markup, its JSON payload)), in order.
 
-    if _DSML_OPEN not in text:
-        return text
+    A DSML invoke becomes the payload of a ``<tool_call>`` block. Only blocks at the top level are calls: an open
+    block, a block that is not well formed and everything inside a block stay text or argument text."""
 
-    def block(m: re.Match) -> str:
-        out = []
-        for inv in _DSML_INVOKE_RE.finditer(m.group(1)):
-            args: dict[str, Any] = {}
-            for p in _DSML_PARAM_RE.finditer(inv.group(2)):
-                key, is_str, value = p.group(1), p.group(2), p.group(3)
-                if is_str == "false":
-                    try:
-                        args[key] = json.loads(value)
-                        continue
-                    except json.JSONDecodeError:
-                        pass
-                args[key] = value
-            out.append(_CALL_OPEN + json.dumps({"name": inv.group(1), "arguments": args}, ensure_ascii=False)
-                       + _CALL_CLOSE)
-        return "".join(out)
-
-    return _DSML_BLOCK_RE.sub(block, text)
-
+    blocks, _ = top_level_blocks(text)
+    cursor = 0
+    for block in blocks:
+        yield text[cursor:block.start]
+        cursor = block.end
+        if block.kind == "tag":
+            yield text[block.start:block.end], block.inner.strip()
+            continue
+        invokes = parse_calls_block(block.inner)
+        if invokes is None:
+            yield text[block.start:block.end]
+            continue
+        for name, args in invokes:
+            payload = json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
+            yield _CALL_OPEN + payload + _CALL_CLOSE, payload
+    yield text[cursor:]
 
 
 def _partial_tag(text: str, tag: str, *, any_case: bool = False) -> int:
@@ -148,32 +137,25 @@ def answer_without_tools(answer: str, *, finished: bool) -> str:
 
 
 def hide_tool_calls(text: str, *, finished: bool, any_case: bool = False) -> str:
-    cut = text.find(_DSML_OPEN)                        # DeepSeek DSML: a calls block is hidden whole
-    if cut >= 0:
-        head = _hide_tagged(text[:cut], finished=True, any_case=any_case)
-        end = text.find(_DSML_CLOSE, cut)
-        if end < 0:
-            return head
-        return head + hide_tool_calls(text[end + len(_DSML_CLOSE):], finished=finished, any_case=any_case)
-    shown = _hide_tagged(text, finished=finished, any_case=any_case)
-    return shown if finished else shown[: len(shown) - _partial_tag(shown, _DSML_OPEN)]
+    """The text without its top-level tool-call blocks. A block that is still open hides the rest of the text, and
+    while streaming, so does a tail that may begin an opening tag. The parser finds the same blocks."""
 
-
-def _hide_tagged(text: str, *, finished: bool, any_case: bool = False) -> str:
-    open_re, close_re = (_CALL_OPEN_ANY_RE, _CALL_CLOSE_ANY_RE) if any_case else (_CALL_OPEN_RE, _CALL_CLOSE_RE)
+    blocks, open_at = top_level_blocks(text, any_case=any_case)
+    end = len(text) if open_at < 0 else open_at
     out: list[str] = []
     pos = 0
-    while True:
-        opened = open_re.search(text, pos)
-        if opened is None:
-            tail = text[pos:]
-            out.append(tail[: len(tail) - (0 if finished else _partial_tag(tail, _CALL_OPEN, any_case=any_case))])
-            return "".join(out)
-        out.append(text[pos:opened.start()])
-        closed = close_re.search(text, opened.end())
-        if closed is None:
-            return "".join(out)
-        pos = closed.end()
+    for block in blocks:
+        if block.start >= end:
+            break
+        out.append(text[pos:block.start])
+        pos = block.end
+    tail = text[pos:end]
+    if open_at >= 0:
+        return "".join(out) + tail
+    if not finished:
+        tail = tail[: len(tail) - _partial_tag(tail, _CALL_OPEN, any_case=any_case)]
+    shown = "".join(out) + tail
+    return shown if finished else shown[: len(shown) - _partial_tag(shown, _DSML_OPEN)]
 
 
 def _finite_json(value: Any) -> bool:
@@ -196,18 +178,17 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
 
     if not tools:
         return text, None
-    text = dsml_to_tool_calls(text)
     known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []
     residue: list[str] = []
-    cursor = 0
-    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
-        residue.append(text[cursor:match.start()])
-        cursor = match.end()
+    for segment in _segments(text):
+        if isinstance(segment, str):
+            residue.append(segment)
+            continue
+        markup, block = segment
         if max_calls is not None and len(calls) >= max_calls:
             continue
-        block = match.group(1).strip()
         name, args = None, {}
         parsed = False                                  # the whole payload parsed, not only its name
         try:
@@ -240,9 +221,9 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                     parsed = parse_glm_tool_call_block(block, tools, complete=True) is not None
         if not name or str(name).lower() not in known:
             if max_calls is None:
-                residue.append(keep_unoffered_call(match.group(0), name) if name and parsed else match.group(0))
+                residue.append(keep_unoffered_call(markup, name) if name and parsed else markup)
             elif name and parsed and drop_unoffered_calls():
-                keep_unoffered_call(match.group(0), name)    # single-call mode removes the block anyway: log it
+                keep_unoffered_call(markup, name)    # single-call mode removes the block anyway: log it
             continue
         if max_calls is not None:
             try:
@@ -254,7 +235,6 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
                       "function": {"name": known[str(name).lower()],
                                    "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}})
-    residue.append(text[cursor:])
     return "".join(residue).strip(), calls or None
 
 

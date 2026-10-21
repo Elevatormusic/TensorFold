@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Sequence
 
+from tensorfold.dsml_calls import DSML_OPEN, dsml_block_end
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
 
 _OPEN = "<tool_call>"
@@ -278,7 +279,13 @@ class ToolCallStreamer:
         while self.state != "abort":
             rest = text[self.pos:]
             if self.state == "outside":
-                j = rest.find(_OPEN)
+                j, d = rest.find(_OPEN), rest.find(DSML_OPEN)
+                if 0 <= d and (j < 0 or d < j):     # a DSML calls block holds no call of its own: skip it whole
+                    end = dsml_block_end(text, self.pos + d)
+                    if end < 0:
+                        break                       # it is still open: nothing in it is a call
+                    self.pos = end
+                    continue
                 if j < 0:
                     break
                 self.pos += j + len(_OPEN)
