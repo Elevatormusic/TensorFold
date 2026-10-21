@@ -137,7 +137,8 @@ def answer_without_tools(answer: str, *, finished: bool) -> str:
 
     if not drop_unoffered_calls():
         return answer
-    shown = hide_tool_calls(answer, finished=finished, any_case=True)   # the parser finds tags in any case
+    # the parser finds tags in any case, and keeps a block that is not well formed as text
+    shown = hide_tool_calls(answer, finished=finished, any_case=True, keep_ill_formed=True)
     if finished and shown != answer:
         print("[tensorfold] dropped tool-call markup from a request that offered no tools", flush=True)
     return shown

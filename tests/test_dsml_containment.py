@@ -15,6 +15,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from tensorfold.cuda.http import unsent_call_deltas
 from tensorfold.cuda.reply_text import answer_without_tools, hide_tool_calls, parse_tool_calls
 from tensorfold.dsml_calls import (dsml_block_end, parse_calls_block, reset_suppressed, suppressed_counts,
                                    top_level_blocks)
@@ -415,6 +416,33 @@ class StreamedCalls(Flag):
                     json.loads(sent)
             self.assertEqual(parse_tool_calls(text, self.STREAM_TOOLS)[1], None)
 
+    def test_a_call_that_never_closed_keeps_its_index_and_the_next_call_is_sent_after_it(self):
+        lone = "<tool_call><function=write>\n<parameter=path>x</tool_call>y</parameter>\n</function></tool_call>\n"
+        stuck = "<tool_call><function=write>\n</function>junk</tool_call>\n"
+        for first in (lone, stuck):
+            text = first + calls(invoke("read", param("path", "a")))
+            _, found = parse_tool_calls(text, self.STREAM_TOOLS)
+            self.assertEqual(names(found), ["read"])
+            streamer = ToolCallStreamer(self.STREAM_TOOLS)
+            started = [call for delta in streamer.feed(text) for call in delta["tool_calls"] if "id" in call]
+            self.assertEqual([call["index"] for call in started], [0])
+            self.assertEqual((streamer.completed, streamer.abandoned), (0, 1))
+            result = {"calls": found, "calls_streamed": streamer.completed, "calls_offset": streamer.abandoned}
+            sent = unsent_call_deltas(result)
+            self.assertEqual([d["tool_calls"][0]["index"] for d in sent], [1])
+            self.assertEqual(sent[0]["tool_calls"][0]["function"]["name"], "read")
+
+    def test_a_closed_streamed_call_is_not_sent_again(self):
+        text = self.XML_WRITE + "\n" + OPEN + "\n"
+        streamer = ToolCallStreamer(self.STREAM_TOOLS)
+        streamer.feed(text)
+        self.assertEqual((streamer.completed, streamer.abandoned), (1, 0))
+        _, found = parse_tool_calls(self.XML_WRITE, self.STREAM_TOOLS)
+        result = {"calls": found, "calls_streamed": streamer.completed, "calls_offset": streamer.abandoned}
+        self.assertEqual(unsent_call_deltas(result), [])
+        self.assertEqual(unsent_call_deltas({"calls": None}), [])
+        self.assertEqual([d["tool_calls"][0]["index"] for d in unsent_call_deltas({"calls": found * 2})], [0, 1])
+
     def test_a_tag_in_other_letter_case_is_not_streamed(self):
         self.check("<TOOL_CALL>" + self.XML_WRITE[len("<tool_call>"):-len("</tool_call>")] + "</tool_call>", 0)
 
@@ -483,6 +511,14 @@ class UnofferedCalls(Flag):
                 shown = hide_tool_calls(text[:cut], finished=False, any_case=True)
                 self.assertNotIn("tool_call", shown)
                 self.assertNotIn("DSML", shown)
+
+    def test_without_tools_the_flag_keeps_a_block_that_is_not_well_formed(self):
+        self.drop()
+        text = "A" + calls("junk\n") + "B"
+        self.assertEqual(answer_without_tools(text, finished=True), text)
+        for cut in range(len(text) + 1):
+            shown = answer_without_tools(text[:cut], finished=False)
+            self.assertTrue(text.startswith(shown))
 
     def test_without_tools_the_flag_drops_each_block_whole(self):
         self.drop()

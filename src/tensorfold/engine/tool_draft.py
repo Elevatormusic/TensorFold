@@ -266,7 +266,15 @@ class ToolCallStreamer:
         self.held = ""
         self.streamed = False
         self.call_start = -1    # where the call being streamed begins
+        self.completed = 0      # streamed calls whose block closed as the parser sees it
         self.scan: tuple[int, list, int] | None = None     # (text length, top-level blocks, open block)
+
+    @property
+    def abandoned(self) -> int:
+        """1 when a call was started and its block never closed as the parser sees it, else 0. The client holds
+        its deltas under an index, so the calls that follow it take the next indexes."""
+
+        return self.index + 1 - self.completed
 
     def _args(self, fragment: str) -> dict[str, Any]:
         return {"tool_calls": [{"index": self.index, "function": {"arguments": fragment}}]}
@@ -398,6 +406,7 @@ class ToolCallStreamer:
                     self.state = "abort"    # the parser ends this block elsewhere: its call is not complete
                     break
                 out.append(self._args(self.held))
+                self.completed += 1
                 self.held = ""
                 self.pos += m.end()
                 self.state = "outside"
