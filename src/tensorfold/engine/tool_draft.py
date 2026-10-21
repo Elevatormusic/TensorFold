@@ -5,10 +5,13 @@ from __future__ import annotations
 import re
 from typing import Any, Sequence
 
-from tensorfold.dsml_calls import top_level_blocks
+from tensorfold.dsml_calls import DSML_CLOSE, DSML_OPEN, top_level_blocks
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
 
 _OPEN = "<tool_call>"
+# the tags that decide where the top-level blocks are: a text that adds none of them leaves the blocks as they were
+_BLOCK_TAGS = re.compile(f"</?tool_call>|{re.escape(DSML_OPEN)}|{re.escape(DSML_CLOSE)}", re.IGNORECASE)
+_TAG_REACH = len(DSML_CLOSE)
 _END = "\x00end"  # placeholder: after a closed call the draft is the end-of-turn token
 _SINGLE_LINE = re.compile(r"path|file|dir|name|pattern|glob|url|query|id|mode|lang|cwd|limit|offset",
                           re.IGNORECASE)
@@ -262,6 +265,7 @@ class ToolCallStreamer:
         self.lead = False       # the framing newline after <parameter=NAME> has not arrived yet
         self.held = ""
         self.streamed = False
+        self.scan: tuple[int, list, int] | None = None     # (text length, top-level blocks, open block)
 
     def _args(self, fragment: str) -> dict[str, Any]:
         return {"tool_calls": [{"index": self.index, "function": {"arguments": fragment}}]}
@@ -272,13 +276,25 @@ class ToolCallStreamer:
 
         return json.dumps(text, ensure_ascii=False)[1:-1]
 
+    def _blocks(self, text: str) -> tuple[list, int]:
+        """The top-level blocks of ``text``. The text only grows, so a rescan waits for a new block tag."""
+
+        if self.scan is not None and len(text) >= self.scan[0]:
+            seen, blocks, open_at = self.scan
+            if not any(m.end() > seen for m in _BLOCK_TAGS.finditer(text, max(0, seen - _TAG_REACH))):
+                self.scan = (len(text), blocks, open_at)
+                return blocks, open_at
+        blocks, open_at = top_level_blocks(text)
+        self.scan = (len(text), blocks, open_at)
+        return blocks, open_at
+
     def _call_start(self, text: str) -> int | None:
         """Where the next call may start: a <tool_call> tag that is a top-level block, as the final parser counts it.
 
         A tag inside a DSML block or inside another tag block is never a start, and the tags must match in case.
         None: no start yet. -1: a block comes first that streaming can not follow, so the final parser decides."""
 
-        blocks, open_at = top_level_blocks(text)
+        blocks, open_at = self._blocks(text)
         for block in blocks:
             if block.start < self.pos or 0 <= open_at <= block.start:
                 continue
@@ -294,7 +310,7 @@ class ToolCallStreamer:
 
         out: list[dict[str, Any]] = []
         while self.state != "abort":
-            rest = text[self.pos:]
+            rest = text[self.pos:] if self.state != "outside" else ""
             if self.state == "outside":
                 start = self._call_start(text)
                 if start is None:

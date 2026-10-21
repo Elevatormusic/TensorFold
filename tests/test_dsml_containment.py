@@ -327,6 +327,30 @@ class StreamedCalls(Flag):
         self.check(call, 1)
         self.check(call + "\n" + self.XML_WRITE, 2)
 
+    def test_the_streamer_scans_again_only_when_a_block_tag_arrives(self):
+        from tensorfold.engine import tool_draft
+
+        scans = []
+
+        def counted(text, **kwargs):
+            scans.append(len(text))
+            return top_level_blocks(text, **kwargs)
+
+        with mock.patch.object(tool_draft, "top_level_blocks", counted):
+            streamer = ToolCallStreamer(self.STREAM_TOOLS)
+            text = ""
+            for _ in range(300):                     # prose with no tag, then a DSML block that stays open
+                text += "plain words and more words. "
+                streamer.feed(text)
+            self.assertEqual(len(scans), 1)
+            for piece in (OPEN, "\n<", D, " invoke name=\"read\">\n") + ("x " * 20,) * 300:
+                text += piece
+                self.assertEqual(streamer.feed(text), [])
+            self.assertLessEqual(len(scans), 6)
+            text += NESTED_XML
+            self.assertEqual(streamer.feed(text), [])
+            self.assertLessEqual(len(scans), 7)
+
     def test_a_tag_in_other_letter_case_is_not_streamed(self):
         self.check("<TOOL_CALL>" + self.XML_WRITE[len("<tool_call>"):-len("</tool_call>")] + "</tool_call>", 0)
 
