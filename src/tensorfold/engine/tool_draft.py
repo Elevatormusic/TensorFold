@@ -296,7 +296,7 @@ class ToolCallStreamer:
 
         blocks, open_at = self._blocks(text)
         for block in blocks:
-            if block.start < self.pos or 0 <= open_at <= block.start:
+            if block.start < self.pos:
                 continue
             if block.kind == "dsml" or not text.startswith(_OPEN, block.start):
                 return -1               # its calls come first in the reply and are not streamed

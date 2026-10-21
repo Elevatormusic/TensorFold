@@ -153,10 +153,14 @@ class OpenBlocks(Flag):
         self.assertEqual(names(found), ["read"])
         self.assertTrue(content.endswith(NESTED_JSON))
 
-    def test_a_tool_call_tag_that_never_closes_does_not_hide_a_later_block(self):
+    def test_a_tool_call_tag_that_never_closes_opens_a_block_that_holds_the_rest(self):
         text = "The <tool_call> tag starts a call.\n" + calls(invoke("read", param("path", "a")))
-        content, found = parse_tool_calls(text, TOOLS)
-        self.assertEqual((content, names(found)), ("The <tool_call> tag starts a call.", ["read"]))
+        self.assertEqual(parse_tool_calls(text, TOOLS), (text, None))
+        self.assertEqual(hide_tool_calls(text, finished=True), "The ")
+
+    def test_an_unfinished_xml_call_is_not_followed_by_a_dsml_call(self):
+        text = "<tool_call><function=write></function>\n" + calls(invoke("read", param("path", "a")))
+        self.assertEqual(parse_tool_calls(text, TOOLS), (text, None))
 
 
 class NestedCalls(Flag):
@@ -370,6 +374,16 @@ class StreamedCalls(Flag):
         sent = "".join(call["function"]["arguments"] for delta in streamer.feed(text) for call in delta["tool_calls"])
         self.assertEqual(json.loads(sent), {"path": "y"})
         self.assertEqual(arguments(parse_tool_calls(text, self.STREAM_TOOLS)[1]), [{"path": "y"}])
+
+    def test_an_unfinished_xml_call_never_sends_complete_arguments_when_a_dsml_call_follows(self):
+        text = "<tool_call><function=write></function>\n" + calls(invoke("read", param("path", "a")))
+        for cut in range(len(text) + 1):
+            streamer = ToolCallStreamer(self.STREAM_TOOLS)
+            sent = "".join(call["function"]["arguments"] for delta in streamer.feed(text[:cut])
+                           for call in delta["tool_calls"])
+            with self.assertRaises(ValueError, msg=cut):
+                json.loads(sent)
+        self.assertEqual(parse_tool_calls(text, self.STREAM_TOOLS), (text, None))
 
     def test_a_tag_in_other_letter_case_is_not_streamed(self):
         self.check("<TOOL_CALL>" + self.XML_WRITE[len("<tool_call>"):-len("</tool_call>")] + "</tool_call>", 0)

@@ -70,34 +70,31 @@ def dsml_block_end(text: str, start: int) -> int:
 def top_level_blocks(text: str, *, any_case: bool = True) -> tuple[list[Block], int]:
     """(the closed blocks at the top level, in order; where the first open block begins, or -1).
 
-    A block inside a closed block is part of it, and a block of the same kind inside a block does not close it. A
-    <tool_call> tag that never closes ends the search for <tool_call> blocks only: a closed DSML block after it
-    still counts. A DSML block that never closes ends the search."""
+    A block inside a closed block is part of it, and a block of the same kind inside a block does not close it. The
+    first block that never closes is open: it holds the rest of the text, and nothing in it is a block."""
 
     tag_tags = _TAG_TAGS_ANY if any_case else _TAG_TAGS
     blocks: list[Block] = []
-    open_at, pos, tags = -1, 0, True
+    pos = 0
     tag = tag_tags[0].search(text)
     dsml = text.find(DSML_OPEN)
     while True:
-        if tags and tag is not None and tag.start() < pos:
+        if tag is not None and tag.start() < pos:
             tag = tag_tags[0].search(text, pos)
         if 0 <= dsml < pos:
             dsml = text.find(DSML_OPEN, pos)
         if tag is None and dsml < 0:
-            return blocks, open_at
+            return blocks, -1
         if tag is not None and (dsml < 0 or tag.start() < dsml):
             closer = _close_of(text, tag.end(), tag_tags)
             if closer is None:
-                open_at = tag.start() if open_at < 0 else open_at
-                pos, tag, tags = tag.end(), None, False     # no later tag can close: look for DSML blocks only
-                continue
+                return blocks, tag.start()
             blocks.append(Block("tag", tag.start(), closer.end(), text[tag.end():closer.start()]))
             pos = closer.end()
         else:
             end = dsml_block_end(text, dsml)
             if end < 0:
-                return blocks, dsml if open_at < 0 else open_at
+                return blocks, dsml
             blocks.append(Block("dsml", dsml, end, text[dsml + len(DSML_OPEN):end - len(DSML_CLOSE)]))
             pos = end
 
