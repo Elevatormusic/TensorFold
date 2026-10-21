@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Sequence
 
-from tensorfold.dsml_calls import DSML_OPEN, dsml_block_end
+from tensorfold.dsml_calls import top_level_blocks
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
 
 _OPEN = "<tool_call>"
@@ -272,6 +272,23 @@ class ToolCallStreamer:
 
         return json.dumps(text, ensure_ascii=False)[1:-1]
 
+    def _call_start(self, text: str) -> int | None:
+        """Where the next call may start: a <tool_call> tag that is a top-level block, as the final parser counts it.
+
+        A tag inside a DSML block or inside another tag block is never a start, and the tags must match in case.
+        None: no start yet. -1: a block comes first that streaming can not follow, so the final parser decides."""
+
+        blocks, open_at = top_level_blocks(text)
+        for block in blocks:
+            if block.start < self.pos or 0 <= open_at <= block.start:
+                continue
+            if block.kind == "dsml" or not text.startswith(_OPEN, block.start):
+                return -1               # its calls come first in the reply and are not streamed
+            return block.start
+        if open_at >= self.pos and text.startswith(_OPEN, open_at):
+            return open_at              # an open top-level block may stream
+        return None
+
     def feed(self, text: str) -> list[dict[str, Any]]:
         import uuid
 
@@ -279,16 +296,13 @@ class ToolCallStreamer:
         while self.state != "abort":
             rest = text[self.pos:]
             if self.state == "outside":
-                j, d = rest.find(_OPEN), rest.find(DSML_OPEN)
-                if 0 <= d and (j < 0 or d < j):     # a DSML calls block holds no call of its own: skip it whole
-                    end = dsml_block_end(text, self.pos + d)
-                    if end < 0:
-                        break                       # it is still open: nothing in it is a call
-                    self.pos = end
-                    continue
-                if j < 0:
+                start = self._call_start(text)
+                if start is None:
                     break
-                self.pos += j + len(_OPEN)
+                if start < 0:
+                    self.state = "abort"            # a top-level block comes first that this streamer cannot follow
+                    break
+                self.pos = start + len(_OPEN)
                 self.state = "call"
             elif self.state == "call":
                 m = re.match(r"\s*<function=([^>\n]+)>\n?", rest)

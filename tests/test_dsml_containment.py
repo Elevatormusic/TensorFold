@@ -256,36 +256,63 @@ class StreamedText(Flag):
         self.assertEqual(hide_tool_calls(text, finished=True), "Go.\n")
         self.assertEqual(hide_tool_calls(text, finished=False), "Go.\n")
 
-    def test_the_streamed_call_deltas_never_start_inside_a_dsml_block(self):
-        tools = [tool("write")]
+
+class StreamedCalls(Flag):
+    """The streamed call deltas agree with the whole-reply parse at every chunk split: a call is streamed only from a
+    tag that the parser counts at the top level, and the streamed calls are the first calls of the parse."""
+
+    STREAM_TOOLS = [tool("read"), tool("write")]
+    XML_WRITE = "<tool_call><function=write>\n<parameter=path>y</parameter>\n</function></tool_call>"
+
+    def streamed(self, text, cuts):
+        streamer = ToolCallStreamer(self.STREAM_TOOLS)
+        found: dict[int, list] = {}
+        for cut in cuts:
+            for delta in streamer.feed(text[:cut]):
+                for call in delta["tool_calls"]:
+                    entry = found.setdefault(call["index"], ["", ""])
+                    entry[0] = call["function"].get("name") or entry[0]
+                    entry[1] += call["function"]["arguments"]
+            yield [name for name, _ in found.values()], found
+        self.last = [(name, json.loads(args)) for name, args in found.values()]
+
+    def check(self, text, expect_streamed):
+        _, parsed = parse_tool_calls(text, self.STREAM_TOOLS)
+        whole = list(zip(names(parsed), arguments(parsed)))
+        runs = [[len(text)], *([cut, len(text)] for cut in range(len(text) + 1)), range(1, len(text) + 1)]
+        for cuts in runs:
+            for so_far, _ in self.streamed(text, cuts):
+                self.assertEqual(so_far, names(parsed)[:len(so_far)], (text, list(cuts)[:2]))
+            self.assertEqual(self.last, whole[:len(self.last)], (text, list(cuts)[:2]))
+            self.assertEqual(len(self.last), expect_streamed, (text, list(cuts)[:2]))
+
+    def test_a_top_level_xml_call_streams_and_equals_the_parse(self):
+        self.check("Go.\n" + self.XML_WRITE, 1)
+
+    def test_a_tag_inside_a_dsml_block_is_never_streamed(self):
         for nested in (NESTED_XML, NESTED_XML.replace("</tool_call>", "")):
-            open_block = f'{OPEN}\n<{D} invoke name="read">\n<{D} parameter name="path" string="true">{nested}'
-            closed_block = open_block + f"</{D} parameter>\n</{D} invoke>\n{CLOSE}"
-            for text in (open_block, closed_block, "Go.\n" + closed_block + " After."):
-                for cut in range(len(text) + 1):
-                    streamer = ToolCallStreamer(tools)
-                    self.assertEqual(streamer.feed(text[:cut]), [], cut)
-                    self.assertEqual(streamer.feed(text), [], cut)
-                    self.assertFalse(streamer.streamed)
+            opened = f'{OPEN}\n<{D} invoke name="read">\n<{D} parameter name="path" string="true">{nested}'
+            closed = opened + f"</{D} parameter>\n</{D} invoke>\n{CLOSE}"
+            for text in (opened, closed, "Go.\n" + closed + " After."):
+                self.check(text, 0)
 
-    def test_a_call_after_a_dsml_block_streams_the_same_at_every_split(self):
-        tools = [tool("write")]
-        text = ("Go.\n" + calls(invoke("read", param("path", NESTED_XML))) + "\n"
-                + "<tool_call><function=write>\n<parameter=path>y</parameter>\n</function></tool_call>")
+    def test_a_tag_inside_another_tag_block_is_never_streamed(self):
+        self.check("<tool_call>note <tool_call><function=write>\n<parameter=path>y</parameter>\n</function>"
+                   "</tool_call>", 0)
+        self.check("<tool_call><tool_call><function=write>\n<parameter=path>y</parameter>\n</function></tool_call>", 0)
+        self.check("Use <tool_call> tags. " + self.XML_WRITE, 0)
 
-        def run(cuts):
-            streamer = ToolCallStreamer(tools)
-            out = []
-            for cut in cuts:
-                out += streamer.feed(text[:cut])
-            return re.sub(r"call_[0-9a-f]{24}", "call_", json.dumps(out))
+    def test_a_tag_in_other_letter_case_is_not_streamed(self):
+        self.check("<TOOL_CALL>" + self.XML_WRITE[len("<tool_call>"):-len("</tool_call>")] + "</tool_call>", 0)
 
-        whole = run([len(text)])
-        self.assertIn('"name": "write"', whole)
-        self.assertEqual(whole.count('"id"'), 1)
-        for cut in range(len(text) + 1):
-            self.assertEqual(run([cut, len(text)]), whole, cut)
-        self.assertEqual(run(range(1, len(text) + 1)), whole)
+    def test_a_dsml_call_before_a_tag_keeps_the_streamed_calls_a_prefix_of_the_parse(self):
+        self.check(calls(invoke("read", param("path", "a"))) + "\n" + self.XML_WRITE, 0)
+
+    def test_a_call_before_a_dsml_block_streams_and_the_block_does_not(self):
+        self.check(self.XML_WRITE + "\n" + calls(invoke("read", param("path", NESTED_XML))), 1)
+
+    def test_an_open_dsml_block_after_a_call_streams_nothing_more(self):
+        self.check(self.XML_WRITE + "\n" + OPEN + "\n" + NESTED_XML, 1)
 
 
 class UnofferedCalls(Flag):
