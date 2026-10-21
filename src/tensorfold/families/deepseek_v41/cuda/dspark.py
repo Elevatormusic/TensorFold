@@ -8,6 +8,7 @@ as one window and keeps the matching prefix plus its own next token, so every em
 
 from __future__ import annotations
 
+import math
 import os
 import struct
 from dataclasses import dataclass
@@ -292,11 +293,11 @@ class BatchDraftGraph:
         self.steps = max(1, min(drafter.size, steps or drafter.size))
         dev = "cuda"
         n = drafter.size
-        # one buffer, so one copy fills it: tokens, positions, slots, then (coupled drafts) each stream's seed, top_k
-        # and divisor (temperature x markov.COUPLED_SCALE as float64 bits; 0: greedy drafts)
-        self.inputs = torch.zeros((6, streams), dtype=torch.long, device=dev)
-        self.tokens, self.q0, self.slots, self.seed, self.top_k, div = self.inputs.unbind(0)
-        self.div = div.view(torch.float64)
+        # one buffer, so one copy fills it: tokens, positions, slots, then (coupled drafts) each stream's seed, top_k,
+        # and as float64 bits its divisor (temperature x markov.COUPLED_SCALE; 0: greedy drafts), top_p and ln min_p
+        self.inputs = torch.zeros((8, streams), dtype=torch.long, device=dev)
+        self.tokens, self.q0, self.slots, self.seed, self.top_k, div, top_p, min_log = self.inputs.unbind(0)
+        self.div, self.top_p, self.min_log = (x.view(torch.float64) for x in (div, top_p, min_log))
         self.bidx = (torch.arange(streams, device=dev)[:, None, None] * n +
                      torch.arange(n, device=dev)[None, None, :]).expand(streams, n, n).reshape(streams * n, n).contiguous()
         self.zero = torch.zeros((streams * n,), dtype=torch.long, device=dev)
@@ -409,7 +410,7 @@ class BatchDraftGraph:
         if self.mk is not None:
             # markov.py: fixed-order kernels a step (cached bias rows, the vocabulary split over the ranks), every
             # bias the cuBLAS loop's bits: the same drafts
-            samp = (self.seed, self.div, self.top_k, self.q0) if coupled else None
+            samp = (self.seed, self.div, self.top_k, self.q0, self.top_p, self.min_log) if coupled else None
             self.mk.steps(self.mk.logits_of(local), out, n, steps, samp)
             embs = d.dw.markov_embed[out[:, :steps]]                      # [N, steps, rank]: the rows the steps read
         else:
@@ -446,7 +447,7 @@ class BatchDraftGraph:
         same gathers."""
 
         N = self.N
-        seed, top_k, div = [0] * N, [0] * N, [0.0] * N
+        seed, top_k, div, top_p, min_log = [0] * N, [0] * N, [0.0] * N, [1.0] * N, [-math.inf] * N
         if self.coupled:
             for r, smp in enumerate(samplings or ()):
                 if smp is not None and smp.temperature > 0:
@@ -454,9 +455,11 @@ class BatchDraftGraph:
                     seed[r] = sd - (1 << 64) if sd >> 63 else sd
                     top_k[r] = min(int(smp.top_k or 0), 1 << 20)        # above the candidates: all of them
                     div[r] = max(float(smp.temperature), 1e-6) * _markov.COUPLED_SCALE   # exact_sampling's divisor
+                    top_p[r] = float(smp.top_p) if 0.0 < smp.top_p < 1.0 else 1.0       # choose_rows's rules
+                    min_log[r] = float(smp.min_log)
         coupled = any(x > 0 for x in div)
-        bits = list(struct.unpack(f"<{N}q", struct.pack(f"<{N}d", *div)))
-        host = torch.tensor([tokens, q0, slots, seed, top_k, bits], dtype=torch.long)
+        bits = [list(struct.unpack(f"<{N}q", struct.pack(f"<{N}d", *x))) for x in (div, top_p, min_log)]
+        host = torch.tensor([tokens, q0, slots, seed, top_k, *bits], dtype=torch.long)
         if _rounds.ONE_COPY:
             self.inputs.copy_(host.pin_memory(), non_blocking=True)
         else:

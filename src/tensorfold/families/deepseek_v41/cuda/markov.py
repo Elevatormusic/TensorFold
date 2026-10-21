@@ -25,7 +25,8 @@ output is widened and added, then torch.argmax). Here, a step is:
   on every rank. ``TF_DS_MARKOV_SPLIT=0``: the gathered logits, every column on every rank.
 - **Coupled drafts** (``TF_DS_DRAFT_COUPLED=1``, default; SPLIT or one rank): a sampled stream's draft is the token its
   own keyed draw (engine/exact_sampling.py ``choose_rows``: the top_k by (value down, id up), then the argmax of
-  value / temperature + G(seed, position, id)) gives on the drafter's scores, so a drafter that scores as the target
+  value / temperature + G(seed, position, id) over the candidates its top_p and min_p keep) gives on the drafter's
+  scores, so a drafter that scores as the target
   does drafts the sampled tokens. The same three launches a step and the same one gather: ``_score`` also keeps each
   program's CAND best (value, id) of a sampled row, ``_finish`` the row's CAND best of the programs' (sent beside the
   greedy best), ``_pick`` merges the ranks' candidates and draws. A greedy row (divisor 0) keeps the argmax. Drafts only
@@ -222,12 +223,14 @@ def _finish(PV, PI, n_part, OUT, o_stride, SEND, send, DIV, PK, BP: tl.constexpr
 
 
 @triton.jit(do_not_specialize=["n_rows", "o_stride", "step"])
-def _pick(G, n_rows, OUT, o_stride, DIV, SEED, TOPK, Q0, step, WORLD: tl.constexpr, CPL: tl.constexpr = False,
-          CAND: tl.constexpr = 32, BW: tl.constexpr = 64, SW: tl.constexpr = 4, PDL: tl.constexpr = False):
+def _pick(G, n_rows, OUT, o_stride, DIV, SEED, TOPK, Q0, TOPP, MINL, step, WORLD: tl.constexpr,
+          CPL: tl.constexpr = False, CAND: tl.constexpr = 32, BW: tl.constexpr = 64, SW: tl.constexpr = 4,
+          PDL: tl.constexpr = False):
     """Row r's token from the ranks' (value, index) bests [WORLD, rows, SW], in the same order. ``CPL``, a sampled
     row (DIV[r] > 0: temperature x COUPLED_SCALE): the ranks' candidates in the target's order, the first TOPK[r]
-    (0: all), and of them the argmax of value / DIV[r] + G(SEED[r], Q0[r] + 1 + step, id) (choose_rows's draw at the
-    position the draft takes)."""
+    (0: all), of them the prefix whose softmax mass before it is below TOPP[r] (1: all) and those within MINL[r] of
+    the first (ln min_p; -inf: all), and of these the argmax of value / DIV[r] + G(SEED[r], Q0[r] + 1 + step, id):
+    choose_rows's draw at the position the draft takes, with the drafter's scores."""
 
     if PDL:
         gdc_wait()
@@ -249,9 +252,17 @@ def _pick(G, n_rows, OUT, o_stride, DIV, SEED, TOPK, Q0, step, WORLD: tl.constex
             ci = tl.load(at + CAND, mask=qm, other=BIG).to(tl.int32)
             cv, ci = _unkey(tl.sort(_key(cv, ci), descending=True))
             top_k = tl.load(TOPK + r)
-            cut = tl.where(top_k > 0, top_k, WORLD * CAND)
-            drawn = cv.to(tl.float64) / div + _gumbel(tl.load(SEED + r), tl.load(Q0 + r) + 1 + step, ci)
-            drawn = tl.where((q < cut) & qm, drawn, float("-inf"))
+            keep = (q < tl.where(top_k > 0, top_k, WORLD * CAND)) & qm
+            scaled = cv.to(tl.float64) / div
+            first = tl.max(tl.where(keep, scaled, float("-inf")), 0)          # the first candidate's
+            drawn = scaled + _gumbel(tl.load(SEED + r), tl.load(Q0 + r) + 1 + step, ci)
+            top_p = tl.load(TOPP + r)
+            if top_p < 1.0:                                                   # choose_rows's top_p prefix
+                e = tl.where(keep, libdevice.exp(scaled - first), 0.0)
+                mass = tl.cumsum(e / tl.sum(e, 0), 0)
+                keep = keep & (q < tl.sum(((mass < top_p) & keep).to(tl.int32), 0) + 1)
+            keep = keep & (scaled >= first + tl.load(MINL + r))              # min_p (MINL -inf: every candidate)
+            drawn = tl.where(keep, drawn, float("-inf"))
             a = tl.argmax(drawn, 0)
             bi = tl.sum(tl.where(q == a, ci, 0), 0)
     tl.store(OUT + r * o_stride, bi.to(tl.int64))
@@ -381,19 +392,19 @@ class Markov:
 
         N = out.shape[0]
         if samp is None:
-            _pick[(N,)](g, N, out[:, i + 1], out.stride(0), g, g, g, g, i, WORLD=g.shape[0], num_warps=1,
+            _pick[(N,)](g, N, out[:, i + 1], out.stride(0), g, g, g, g, g, g, i, WORLD=g.shape[0], num_warps=1,
                         **K._pdl())
             return
-        seed, div, top_k, q0 = samp
-        _pick[(N,)](g, N, out[:, i + 1], out.stride(0), div, seed, top_k, q0, i, WORLD=g.shape[0], CPL=True,
-                    CAND=CAND, BW=triton.next_power_of_2(g.shape[0] * CAND), SW=SEND_W, num_warps=4, **K._pdl())
+        seed, div, top_k, q0, top_p, min_log = samp
+        _pick[(N,)](g, N, out[:, i + 1], out.stride(0), div, seed, top_k, q0, top_p, min_log, i, WORLD=g.shape[0],
+                    CPL=True, CAND=CAND, BW=triton.next_power_of_2(g.shape[0] * CAND), SW=SEND_W, num_warps=4, **K._pdl())
 
     def steps(self, lg: torch.Tensor, out: torch.Tensor, block: int, steps: int, samp=None) -> None:
         """out [N, steps + 1] int64 (out[:, 0] the last tokens) -> out[:, 1:] the drafts; lg: ``logits_of``'s tensor
         for N streams of ``block`` rows each (stream r's step i at row r * block + i). ``samp`` (only if ``couples``):
         (seed [N] int64, divisor [N] float64 (temperature x COUPLED_SCALE; 0: a greedy row), top_k [N] int64 (0: all
-        candidates), the last token's position q0 [N] int64): the sampled rows' drafts are their keyed draws, with
-        the same launches and the one gather a step."""
+        candidates), the last token's position q0 [N] int64, top_p [N] float64 (1: off), ln min_p [N] float64 (-inf:
+        off)): the sampled rows' drafts are their keyed draws, with the same launches and the one gather a step."""
 
         for i in range(steps):
             send = self.local_best(lg, out, block, i, samp=samp)

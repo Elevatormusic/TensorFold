@@ -7,6 +7,7 @@ samples) runs on the CPU."""
 
 from __future__ import annotations
 
+import math
 import struct
 from types import SimpleNamespace
 
@@ -23,7 +24,7 @@ from tensorfold.families.deepseek_v41.cuda import dspark, markov
 def graph_stub(N: int):
     g = object.__new__(dspark.BatchDraftGraph)
     g.N, g.steps, g.coupled, g.graph = N, 2, True, None
-    g.inputs = torch.zeros((6, N), dtype=torch.long)
+    g.inputs = torch.zeros((8, N), dtype=torch.long)
     g.ran = []
     g.packs = {False: torch.zeros((N, 4)), True: torch.ones((N, 4))}
     g._body = lambda coupled=False: g.ran.append(coupled)
@@ -39,12 +40,14 @@ def test_a_round_with_no_sampled_stream_runs_the_greedy_graph():
         g.run([1, 2, 3], [10, 20, 30], [0, 1, 2])
         assert g.ran == [False, False]
         assert g.inputs[3:].eq(0).all()
-        g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [None, Sampling(2**63 + 7, 0.7, 40), Sampling(9, 1.0, 0)])
+        g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [None, Sampling(2**63 + 7, 0.7, 40), Sampling(9, 1.0, 0, 1.0, 0.1)])
         assert g.ran[-1] is True
         assert g.inputs[3].tolist() == [0, 7 - 2**63, 9]   # a seed's 64 bits as int64
         assert g.inputs[4].tolist() == [0, 40, 0]
-        div = struct.unpack("<3d", struct.pack("<3q", *g.inputs[5].tolist()))
+        div, top_p, min_log = (struct.unpack("<3d", struct.pack("<3q", *g.inputs[i].tolist())) for i in (5, 6, 7))
         assert div == (0.0, 0.7 * markov.COUPLED_SCALE, 1.0 * markov.COUPLED_SCALE)
+        assert top_p == (1.0, 0.95, 1.0)                  # 1: off (Sampling's default top_p is 0.95)
+        assert min_log == (-math.inf, -math.inf, math.log(0.1))
         g.coupled = False                                 # a loop that cannot couple: greedy drafts in any case
         g.run([1, 2, 3], [10, 20, 30], [0, 1, 2], [Sampling(1, 1.0, 20)] * 3)
         assert g.ran[-1] is False
@@ -94,7 +97,7 @@ def drive(mks, lg, tok0, samp, steps):
     return outs[0].cpu()
 
 
-def check(out, lg, full, world, seeds, temps, top_k, q0):
+def check(out, lg, full, world, seeds, temps, top_k, q0, top_p=1.0, min_p=0.0):
     """Each step's draft from its own previous draft: the argmax (greedy row) or choose_rows's draw on the step's
     scores (logit + the token's bias row, fp32) over the candidates the ranks send (with top_k <= CAND: the whole
     vocabulary)."""
@@ -109,7 +112,7 @@ def check(out, lg, full, world, seeds, temps, top_k, q0):
             if temps[r] == 0:
                 assert out[r, i + 1] == int(np.argmax(score)), (r, i)
                 continue
-            s = Sampling(seeds[r], temps[r] * markov.COUPLED_SCALE, top_k, 1.0)
+            s = Sampling(seeds[r], temps[r] * markov.COUPLED_SCALE, top_k, top_p, min_p)
             if 0 < top_k <= markov.CAND:
                 vals, ids = score[None], ids_all[None]
             else:                                         # the ranks' CAND best each, then all of them
@@ -125,8 +128,10 @@ def check(out, lg, full, world, seeds, temps, top_k, q0):
 
 
 @cuda
-@pytest.mark.parametrize("top_k", [5, 20, 0])
-def test_coupled_drafts_are_the_sampled_tokens(top_k):
+@pytest.mark.parametrize("rule", [(5, 1.0, 0.0), (20, 1.0, 0.0), (0, 1.0, 0.0), (20, 0.95, 0.0), (20, 0.7, 0.1),
+                                  (0, 0.95, 0.05)])
+def test_coupled_drafts_are_the_sampled_tokens(rule):
+    top_k, top_p, min_p = rule
     head, emb = weights()
     cached = list(range(0, V, 2))                         # half the tokens cached: both bias paths
     full = markov_of(head, emb, 1, 0, list(range(V)))     # every token's row: the reference bias bits
@@ -141,12 +146,14 @@ def test_coupled_drafts_are_the_sampled_tokens(top_k):
     samp = (torch.tensor(seeds, dtype=torch.int64, device="cuda"),
             torch.tensor([t * markov.COUPLED_SCALE for t in temps], dtype=torch.float64, device="cuda"),
             torch.full((N,), top_k, dtype=torch.int64, device="cuda"),
-            torch.tensor(q0, dtype=torch.int64, device="cuda"))
+            torch.tensor(q0, dtype=torch.int64, device="cuda"),
+            torch.full((N,), top_p, dtype=torch.float64, device="cuda"),
+            torch.full((N,), math.log(min_p) if min_p > 0 else -math.inf, dtype=torch.float64, device="cuda"))
     tok0 = torch.tensor([1, 2, 3, 4], device="cuda")
     for world in (1, 2):
         mks = [markov_of(head, emb, world, rk, cached) for rk in range(world)]
         out = drive(mks, lg, tok0, samp, BLOCK)
-        check(out, lg, full, world, seeds, temps, top_k, q0)
+        check(out, lg, full, world, seeds, temps, top_k, q0, top_p, min_p)
         greedy = drive(mks, lg, tok0, None, BLOCK)       # no coupled steps: every row the argmax chain
         assert torch.equal(out[1], greedy[1])
         check(greedy, lg, full, world, seeds, [0.0] * N, top_k, q0)
