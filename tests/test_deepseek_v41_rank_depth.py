@@ -113,7 +113,7 @@ def test_rank_drafter_steps_stop_at_the_configured_drafts(monkeypatch):
             made.append(steps)
             self.tokens, self.q0, self.slots = (torch.zeros(streams, dtype=torch.long) for _ in range(3))
 
-        def run(self, tokens, q0, slots):
+        def run(self, tokens, q0, slots, samplings=None):
             return [[] for _ in tokens]
 
     monkeypatch.setattr(dspark, "BatchDraftGraph", Graph)
