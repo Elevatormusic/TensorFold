@@ -177,6 +177,38 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null };
 }
 
+/// Where the first DSML calls block that never closes begins (either spelling), outside the blocks before it; null when
+/// every DSML block closes.
+pub fn openDsml(a: Allocator, text: []const u8) Allocator.Error!?usize {
+    const envs = try envelopes(a, text);
+    var first: ?usize = null;
+    for ([_][2][]const u8{ .{ dsml_open, dsml_close }, .{ dsml41_open, dsml41_close } }) |tags| {
+        var pos: usize = 0;
+        while (find(text, tags[0], pos)) |s| {
+            pos = s + tags[0].len;
+            const inside = for (envs) |e| {
+                if (e.complete and s > e.start and s < e.end) break true;
+            } else false;
+            if (inside) continue;
+            if (find(text, tags[1], pos) == null) {
+                if (first == null or s < first.?) first = s;
+                break;
+            }
+        }
+    }
+    return first;
+}
+
+pub const Cut = struct { parsed: Parsed, open: bool };
+
+/// ``parse`` of a finished reply that may end inside a DSML calls block (max_tokens): that block is not a call and none
+/// of its markup is content, as the stream hides it (``reply_text.hideInto``); the complete blocks before it still parse.
+pub fn parseCut(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Cut {
+    const at = try openDsml(a, text);
+    const parsed = try parse(a, if (at) |i| text[0..i] else text, tools, max_calls);
+    return .{ .parsed = if (at != null) .{ .content = strip(parsed.content), .calls = parsed.calls } else parsed, .open = at != null };
+}
+
 /// What closes the call ``text`` ends inside (the model's end token came before its ``
 pub fn closeCall(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error![]const u8 {
     var pos: usize = 0;
@@ -672,4 +704,40 @@ fn dsmlCalls(a: Allocator, block: []const u8) Error![]Call {
     }
     if (calls.items.len == 0 or !allSpace(block[at..])) return error.Invalid;
     return calls.items;
+}
+
+test "a reply cut inside a DSML calls block makes no call from it and shows none of its markup" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}}}}}]")).ok.array;
+    const invoke1 = invoke41_open ++ "get_weather\">\n" ++ param41_open ++ "city\" string=\"true\">Paris" ++ param41_close ++ "\n" ++ invoke41_close ++ "\n";
+    const invoke2_cut = invoke41_open ++ "get_weather\">\n" ++ param41_open ++ "city\" string=\"true\">Os";
+    const one_block = "Checking.\n\n" ++ dsml41_open ++ "\n" ++ invoke1 ++ dsml41_close;
+    // a second call cut at max_tokens: the whole block is open, so no call and only the prose before it
+    const second = try parseCut(a, "Checking.\n\n" ++ dsml41_open ++ "\n" ++ invoke1 ++ invoke2_cut, tools, null);
+    try std.testing.expect(second.open and second.parsed.calls == null);
+    try std.testing.expectEqualStrings("Checking.", second.parsed.content);
+    // a cut inside the first invoke: the same
+    const first = try parseCut(a, dsml41_open ++ "\n" ++ invoke41_open ++ "get_weather\">\n" ++ param41_open ++ "ci", tools, null);
+    try std.testing.expect(first.open and first.parsed.calls == null);
+    try std.testing.expectEqualStrings("", first.parsed.content);
+    // a complete block, then a cut one: the complete call stays, the open block is gone
+    const after = try parseCut(a, one_block ++ "\n" ++ dsml41_open ++ "\n" ++ invoke2_cut, tools, null);
+    try std.testing.expect(after.open);
+    try std.testing.expectEqual(@as(usize, 1), after.parsed.calls.?.len);
+    try std.testing.expectEqualStrings("Checking.", after.parsed.content);
+    // the content the stream shows is the same text (reply_text.finishedProse hides the open block too)
+    for ([_][]const u8{ "Checking.\n\n" ++ dsml41_open ++ "\n" ++ invoke1 ++ invoke2_cut, one_block ++ "\n" ++ dsml41_open ++ "\n" ++ invoke2_cut }) |reply| {
+        const shown = strip(try reply_text.finishedProse(a, reply));
+        try std.testing.expectEqualStrings((try parseCut(a, reply, tools, null)).parsed.content, shown);
+    }
+    // the old V4 spelling, cut: no call, no markup
+    const v4 = try parseCut(a, "Go. " ++ dsml_open ++ invoke_open ++ "get_weather\">", tools, null);
+    try std.testing.expect(v4.open and v4.parsed.calls == null);
+    try std.testing.expectEqualStrings("Go.", v4.parsed.content);
+    // a reply with every block closed parses as before
+    const whole = try parseCut(a, one_block, tools, null);
+    try std.testing.expect(!whole.open);
+    try std.testing.expectEqual(@as(usize, 1), whole.parsed.calls.?.len);
 }
