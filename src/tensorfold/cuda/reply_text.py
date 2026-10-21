@@ -10,7 +10,8 @@ from collections.abc import Iterator
 from typing import Any
 
 from tensorfold.dsml_calls import (CALL_CLOSE as _CALL_CLOSE, CALL_OPEN as _CALL_OPEN, DSML_OPEN as _DSML_OPEN,
-                                   parse_calls_block, top_level_blocks)
+                                   ILL_FORMED, OPEN_DSML, OPEN_TAG, count_suppressed, parse_calls_block,
+                                   top_level_blocks)
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.tools import parse_glm_tool_call_block
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas
@@ -24,13 +25,18 @@ _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parame
 # ``tensorfold.dsml_calls`` finds the blocks: a call is a complete, well formed block at the top level of the reply.
 
 
-def _segments(text: str) -> Iterator[str | tuple[str, str]]:
+def _segments(text: str, suppressed: list[tuple[str, int]]) -> Iterator[str | tuple[str, str]]:
     """The reply as text (a plain string) and call blocks ((its markup, its JSON payload)), in order.
 
     A DSML invoke becomes the payload of a ``<tool_call>`` block. Only blocks at the top level are calls: an open
-    block, a block that is not well formed and everything inside a block stay text or argument text."""
+    block, a block that is not well formed and everything inside a block stay text or argument text. A block that
+    keeps a later call as text adds (reason, character offset) to ``suppressed``."""
 
-    blocks, _ = top_level_blocks(text)
+    blocks, open_at = top_level_blocks(text)
+    if open_at >= 0:
+        opener = _DSML_OPEN if text.startswith(_DSML_OPEN, open_at) else _CALL_OPEN
+        if top_level_blocks(text[open_at + len(opener):])[0]:        # a complete block that the open one holds
+            suppressed.append((OPEN_DSML if opener == _DSML_OPEN else OPEN_TAG, open_at))
     cursor = 0
     for block in blocks:
         yield text[cursor:block.start]
@@ -40,6 +46,7 @@ def _segments(text: str) -> Iterator[str | tuple[str, str]]:
             continue
         invokes = parse_calls_block(block.inner)
         if invokes is None:
+            suppressed.append((ILL_FORMED, block.start))
             yield text[block.start:block.end]
             continue
         for name, args in invokes:
@@ -182,7 +189,8 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []
     residue: list[str] = []
-    for segment in _segments(text):
+    suppressed: list[tuple[str, int]] = []
+    for segment in _segments(text, suppressed):
         if isinstance(segment, str):
             residue.append(segment)
             continue
@@ -235,6 +243,11 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
                       "function": {"name": known[str(name).lower()],
                                    "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}})
+    if suppressed:
+        reason, offset = min(suppressed, key=lambda found: found[1])
+        count_suppressed({reason for reason, _ in suppressed})
+        print(f"[tensorfold] WARNING: a tool call was kept as text: {reason} at character {offset} of the reply "
+              f"({len(suppressed)} such block{'s' if len(suppressed) > 1 else ''})", flush=True)
     return "".join(residue).strip(), calls or None
 
 

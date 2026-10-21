@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from typing import Any, NamedTuple
 
 DSML = "\uff5cDSML\uff5c"
@@ -30,6 +31,31 @@ CALL_OPEN, CALL_CLOSE = "<tool_call>", "</tool_call>"
 # the exact tags, and the tags in any case (the call parser finds them in any case)
 _TAG_TAGS = _pair(CALL_OPEN, CALL_CLOSE)
 _TAG_TAGS_ANY = _pair(CALL_OPEN, CALL_CLOSE, re.IGNORECASE)
+
+
+OPEN_TAG, OPEN_DSML, ILL_FORMED = "open_tool_call_tag", "open_dsml_block", "ill_formed_dsml_block"
+_suppressed: dict[str, int] = {}
+_suppressed_lock = threading.Lock()
+
+
+def count_suppressed(reasons: set[str]) -> None:
+    """Count one reply for each reason: a block that does not count kept a later tool call as text."""
+
+    with _suppressed_lock:
+        for reason in reasons:
+            _suppressed[reason] = _suppressed.get(reason, 0) + 1
+
+
+def suppressed_counts() -> dict[str, int]:
+    """The replies counted so far, by reason (the /metrics family tool_calls_suppressed_total)."""
+
+    with _suppressed_lock:
+        return dict(_suppressed)
+
+
+def reset_suppressed() -> None:
+    with _suppressed_lock:
+        _suppressed.clear()
 
 
 class Block(NamedTuple):

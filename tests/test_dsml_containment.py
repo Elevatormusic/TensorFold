@@ -12,11 +12,14 @@ import json
 import os
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from tensorfold.cuda.reply_text import answer_without_tools, hide_tool_calls, parse_tool_calls
-from tensorfold.dsml_calls import dsml_block_end, parse_calls_block, top_level_blocks
+from tensorfold.dsml_calls import (dsml_block_end, parse_calls_block, reset_suppressed, suppressed_counts,
+                                   top_level_blocks)
 from tensorfold.engine.tool_draft import ToolCallStreamer
+from tensorfold.server import metrics
 
 D = "｜DSML｜"
 OPEN, CLOSE = f"<{D} calls>", f"</{D} calls>"
@@ -68,6 +71,9 @@ class Flag(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         os.environ.pop(FLAG, None)
+        quiet = contextlib.ExitStack()
+        quiet.enter_context(contextlib.redirect_stdout(io.StringIO()))   # the warnings of the parser stay out of the run
+        self.addCleanup(quiet.close)
 
     def drop(self):
         os.environ[FLAG] = "1"
@@ -422,7 +428,7 @@ class UnofferedCalls(Flag):
             with contextlib.redirect_stdout(out):
                 result = parse_tool_calls(text, TOOLS)
             self.assertEqual(result, (text.strip(), None))
-            self.assertEqual(out.getvalue(), "")
+            self.assertNotIn("dropped", out.getvalue())          # only the warning for the open block
 
     def test_the_flag_keeps_an_unoffered_nested_call_as_argument_text(self):
         self.drop()
@@ -464,6 +470,74 @@ class UnofferedCalls(Flag):
                 self.assertNotIn("tool_call", shown)
                 self.assertNotIn("DSML", shown)
             self.assertEqual(answer_without_tools(text[:text.index(CLOSE)], finished=True), "Go.\n")
+
+
+class Suppressed(Flag):
+    """A block that does not count and keeps a later call as text is logged once for the reply and counted."""
+
+    def setUp(self):
+        super().setUp()
+        reset_suppressed()
+        self.addCleanup(reset_suppressed)
+
+    def parse(self, text):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = parse_tool_calls(text, TOOLS)
+        return result, out.getvalue()
+
+    def test_a_valid_call_and_a_cut_off_block_with_no_later_call_are_silent(self):
+        for text in (VALID, "Go.\n" + OPEN + "\n", "Go. <tool_call> only", f'{OPEN}\n<{D} invoke name="read">\n'):
+            _, log = self.parse(text)
+            self.assertEqual(log, "", text)
+        self.assertEqual(suppressed_counts(), {})
+        self.assertNotIn("tool_calls_suppressed_total", metrics.render(SimpleNamespace()))
+
+    def test_a_lone_tool_call_tag_before_a_dsml_call_is_logged_and_counted(self):
+        text = "Use <tool_call> tags.\n" + calls(invoke("read", param("path", "SECRET")))
+        (content, found), log = self.parse(text)
+        self.assertEqual((content, found), (text, None))
+        self.assertEqual(log.count("\n"), 1)
+        self.assertIn("WARNING", log)
+        self.assertIn("open_tool_call_tag at character 4", log)
+        self.assertNotIn("SECRET", log)
+        self.assertNotIn("Use", log)
+        self.assertEqual(suppressed_counts(), {"open_tool_call_tag": 1})
+
+    def test_a_cut_off_dsml_block_that_holds_a_complete_call_is_logged_and_counted(self):
+        text = "Go.\n" + OPEN + f'\n<{D} invoke name="read">\n<{D} parameter name="path">' + NESTED_JSON
+        _, log = self.parse(text)
+        self.assertIn("open_dsml_block at character 4", log)
+        self.assertEqual(suppressed_counts(), {"open_dsml_block": 1})
+
+    def test_a_lone_dsml_opener_before_a_dsml_call_is_logged_and_counted(self):
+        _, log = self.parse("The opener is " + OPEN + " here.\n" + calls(invoke("read")))
+        self.assertIn("open_dsml_block at character 14", log)
+
+    def test_a_block_that_is_not_well_formed_is_logged_and_counted(self):
+        _, log = self.parse("Go.\n" + calls(invoke("read"), "junk\n"))
+        self.assertIn("ill_formed_dsml_block at character 4", log)
+        self.assertEqual(suppressed_counts(), {"ill_formed_dsml_block": 1})
+
+    def test_one_line_and_one_count_for_each_reason_in_a_reply(self):
+        text = calls("junk\n") + calls("more junk\n") + "<tool_call> " + calls(invoke("read"))
+        _, log = self.parse(text)
+        self.assertEqual(log.count("\n"), 1)
+        self.assertIn("ill_formed_dsml_block at character 0", log)
+        self.assertIn("(3 such blocks)", log)
+        self.assertEqual(suppressed_counts(), {"ill_formed_dsml_block": 1, "open_tool_call_tag": 1})
+        self.parse(calls("junk\n"))
+        self.assertEqual(suppressed_counts()["ill_formed_dsml_block"], 2)
+
+    def test_the_metrics_text_shows_the_counter_by_reason(self):
+        self.parse("Use <tool_call> tags.\n" + calls(invoke("read")))
+        self.parse("Go.\n" + calls("junk\n"))
+        self.parse("Go.\n" + calls("junk\n"))
+        body = metrics.render(SimpleNamespace())
+        name = f"{metrics.PREFIX}tool_calls_suppressed_total"
+        self.assertIn(f"# TYPE {name} counter", body)
+        self.assertIn(f'{name}{{reason="ill_formed_dsml_block"}} 2', body)
+        self.assertIn(f'{name}{{reason="open_tool_call_tag"}} 1', body)
 
 
 class Blocks(unittest.TestCase):
