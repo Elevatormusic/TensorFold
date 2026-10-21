@@ -3,7 +3,8 @@
 //! > 0, the row's top_k + MARGIN largest logits (torch.topk's set; of equal values the lower ids) ordered by value, then
 //! id (np.lexsort), the first top_k of them; each candidate's score is its logit over the temperature plus a Gumbel draw
 //! keyed by (seed, position, token id) through a splitmix64 chain, so a verify row draws as the serial run at its
-//! position. top_p sets the scores past the smallest prefix whose probability mass reaches top_p to -inf (the scaled
+//! position. top_k 0 takes the nucleus rule instead (nucleusRow, cuda.sampling.nucleus_rows). top_p sets the scores
+//! past the smallest prefix whose probability mass reaches top_p to -inf (the scaled
 //! logits' exp over their sum: numpy's pairwise sum, then cumulative sums in order); min_p those under ln(min_p) of the
 //! top. The token is the first best score. float64 as numpy computes it on the served image (numpy 2.1: its exp and log
 //! are libm's, a row's sum of 20 its 8-accumulator pairwise sum; zrec np_libm.py).
@@ -100,7 +101,7 @@ pub fn argmax(row: []const f32) usize {
 /// sample_rows for one row of fp32 logits at absolute position `position`: the token.
 pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     if (s.temperature <= 0) return @intCast(argmax(row));
-    if (s.top_k == 0) return error.NotPortedYet; // the nucleus path (top_k off: a model setting only top_p)
+    if (s.top_k == 0) return nucleusRow(row, position, s);
     const count = @min(row.len, s.top_k + margin);
     if (count > max_candidates) return error.TooManyCandidates;
     var values: [max_candidates]f32 = undefined;
@@ -143,6 +144,152 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
         if (score[j] > score[best]) best = j;
     }
     return ids[best];
+}
+
+/// cuda.sampling.MASS: a token's share of the mass in fixed point (floor(exp(scaled - top) * 2^40)).
+pub const mass_unit = 0x1p40;
+
+/// ceil(Fraction(p) * total): the nucleus's mass need, exact (p's double as a rational, total < 2^58).
+pub fn massNeed(p: f64, total: u64) u64 {
+    const bits: u64 = @bitCast(p);
+    const exp_bits: u64 = (bits >> 52) & 0x7ff;
+    const frac: u64 = bits & ((@as(u64, 1) << 52) - 1);
+    const m: u128 = if (exp_bits == 0) frac else frac | (@as(u64, 1) << 52);
+    const e: i64 = if (exp_bits == 0) -1074 else @as(i64, @intCast(exp_bits)) - 1075;
+    const prod: u128 = m * total;
+    if (e >= 0) return @intCast(prod << @intCast(e));
+    const shift: u64 = @intCast(-e);
+    if (shift >= 120) return if (prod > 0) 1 else 0;
+    const s: u7 = @intCast(shift);
+    return @intCast((prod + ((@as(u128, 1) << s) - 1)) >> s);
+}
+
+const Candidate = struct { v: f64, id: u32, mass: u64 };
+
+fn candidateBefore(_: void, a: Candidate, b: Candidate) bool {
+    return a.v > b.v or (a.v == b.v and a.id < b.id);
+}
+
+/// nucleus_rows for one row (top_k off): the keyed draw over the top_p nucleus, then min_p. Each token's mass is
+/// floor(exp(scaled - top) * 2^40); the nucleus is the shortest prefix of the (value, then id) order whose mass sum
+/// reaches ceil(top_p * total); min_p keeps the prefix within ln(min_p) of the top; the token is the first best
+/// scaled + Gumbel score of the kept prefix. Without a top_p cut and min_p, every token of the row is kept.
+/// The whole row is on the host here, so the rule needs no candidate count (the Python one reads 1024 a rank first;
+/// its result is the same). Mass uses libm's exp; the Python rule uses torch's CUDA exp, which can differ in the last
+/// bit, so a token at a mass edge can differ from the Python engine; drafted and serial runs here use this one rule.
+pub fn nucleusRow(row: []const f32, position: u64, s: Sampling) !i64 {
+    const t = @max(s.temperature, 1e-6);
+    var top: f64 = -std.math.inf(f64);
+    for (row) |x| top = @max(top, @as(f64, x) / t);
+    const cut = 0.0 < s.top_p and s.top_p < 1.0;
+    const floor = if (s.min_p > 0.0) top + log(s.min_p) else -std.math.inf(f64);
+    if (!cut) {
+        // every token at or over the min_p floor (a prefix of the order); the first best score in that order
+        var best: ?usize = null;
+        var best_score: f64 = -std.math.inf(f64);
+        var best_v: f64 = 0;
+        for (row, 0..) |x, j| {
+            const v = @as(f64, x) / t;
+            if (v < floor) continue;
+            const sc = v - log(-log(uniform(s.seed, position, j)));
+            // equal scores: the earlier in (value, then id) order wins; ids rise with j
+            if (best == null or sc > best_score or (sc == best_score and v > best_v)) {
+                best = j;
+                best_score = sc;
+                best_v = v;
+            }
+        }
+        return @intCast(best orelse argmax(row));
+    }
+    // the tokens with mass (a prefix of the order: mass falls with the value), sorted; the cut ends among them
+    var total: u64 = 0;
+    var n: usize = 0;
+    for (row) |x| {
+        const m: u64 = @intFromFloat(@floor(exp(@as(f64, x) / t - top) * mass_unit));
+        total += m;
+        if (m > 0) n += 1;
+    }
+    const cands = try std.heap.page_allocator.alloc(Candidate, n);
+    defer std.heap.page_allocator.free(cands);
+    var i: usize = 0;
+    for (row, 0..) |x, j| {
+        const v = @as(f64, x) / t;
+        const m: u64 = @intFromFloat(@floor(exp(v - top) * mass_unit));
+        if (m == 0) continue;
+        cands[i] = .{ .v = v, .id = @intCast(j), .mass = m };
+        i += 1;
+    }
+    std.mem.sort(Candidate, cands, {}, candidateBefore);
+    const need = massNeed(s.top_p, total);
+    var keep: usize = cands.len;
+    var acc: u64 = 0;
+    for (cands, 0..) |c, j| {
+        acc += c.mass;
+        if (acc >= need) {
+            keep = j + 1;
+            break;
+        }
+    }
+    if (s.min_p > 0.0) {
+        var within: usize = 0;
+        for (cands[0..keep]) |c| {
+            if (c.v >= floor) within += 1;
+        }
+        keep = @min(keep, within);
+    }
+    if (keep == 0) return @intCast(argmax(row));
+    var best: usize = 0;
+    var best_score: f64 = -std.math.inf(f64);
+    for (cands[0..keep], 0..) |c, j| {
+        const sc = c.v - log(-log(uniform(s.seed, position, c.id)));
+        if (sc > best_score) {
+            best = j;
+            best_score = sc;
+        }
+    }
+    return cands[best].id;
+}
+
+test "nucleus need is ceil(top_p * total) as a rational" {
+    try std.testing.expectEqual(@as(u64, 95), massNeed(0.95, 100)); // 0.95's double is just under 0.95
+    try std.testing.expectEqual(@as(u64, 50), massNeed(0.5, 100));
+    try std.testing.expectEqual(@as(u64, 1), massNeed(0.5, 1));
+    try std.testing.expectEqual(@as(u64, 1), massNeed(1e-300, 1 << 40));
+}
+
+test "nucleus: a peaked row keeps its top token, top_p 1 keeps every token" {
+    var row: [64]f32 = undefined;
+    for (&row, 0..) |*x, j| x.* = -@as(f32, @floatFromInt(j));
+    row[7] = 40.0; // ~all of the mass
+    for (0..50) |p| {
+        try std.testing.expectEqual(@as(i64, 7), try nucleusRow(&row, p, .{ .seed = 3, .top_k = 0, .top_p = 0.9 }));
+    }
+    // a flat row with no cut: the draw spreads over the tokens and matches a direct keyed argmax
+    const flat: [16]f32 = @splat(0);
+    for (0..20) |p| {
+        var best: u64 = 0;
+        var bs: f64 = -std.math.inf(f64);
+        for (0..16) |j| {
+            const sc = -log(-log(uniform(5, p, j)));
+            if (sc > bs) {
+                bs = sc;
+                best = j;
+            }
+        }
+        try std.testing.expectEqual(@as(i64, @intCast(best)), try nucleusRow(&flat, p, .{ .seed = 5, .top_k = 0, .top_p = 1.0 }));
+    }
+}
+
+test "nucleus: the cut, then min_p, as nucleus_rows draws them" {
+    // scaled values 0, -ln 2, -ln 4, ...: masses 2^40, 2^39, 2^38, ...; top_p 0.7 needs 2 tokens (1 + 0.5 >= 0.7 * ~2)
+    var row: [12]f32 = undefined;
+    for (&row, 0..) |*x, j| x.* = -@as(f32, @floatFromInt(j)) * @as(f32, @floatCast(@log(@as(f64, 2.0))));
+    for (0..200) |p| {
+        const tok = try nucleusRow(&row, p, .{ .seed = 11, .top_k = 0, .top_p = 0.7 });
+        try std.testing.expect(tok == 0 or tok == 1);
+        const one = try nucleusRow(&row, p, .{ .seed = 11, .top_k = 0, .top_p = 0.7, .min_p = 0.75 });
+        try std.testing.expectEqual(@as(i64, 0), one);
+    }
 }
 
 test "splitmix64 draws as exact_sampling.uniform makes them" {
