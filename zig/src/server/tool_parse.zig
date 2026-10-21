@@ -115,14 +115,20 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
     return kept.items;
 }
 
-/// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
-pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
-    if (tools.len == 0) return .{ .content = text, .calls = null };
+/// The offered tools by their lower-case names.
+fn knownTools(a: Allocator, tools: []const Value) Allocator.Error!std.StringArrayHashMapUnmanaged([]const u8) {
     var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (tools) |tool| {
         const name = try tool_specs.toolName(a, tool);
         try known.put(a, try std.ascii.allocLowerString(a, name), name);
     }
+    return known;
+}
+
+/// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
+pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
+    if (tools.len == 0) return .{ .content = text, .calls = null };
+    var known = try knownTools(a, tools);
     if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
     const schemas = try tool_params.schemas(a, tools);
     const envs = try envelopes(a, text);
@@ -204,6 +210,11 @@ pub const Cut = struct { parsed: Parsed, open: bool };
 /// ``parse`` of a finished reply that may end inside a DSML calls block (max_tokens): that block is not a call and none
 /// of its markup is content, as the stream hides it (``reply_text.hideInto``); the complete blocks before it still parse.
 pub fn parseCut(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Cut {
+    // a reply that is one bare JSON call (or a list of them) is a call, also when an argument holds a DSML opener
+    if (tools.len > 0) {
+        var known = try knownTools(a, tools);
+        if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .parsed = .{ .content = "", .calls = calls }, .open = false };
+    }
     const at = try openDsml(a, text);
     const parsed = try parse(a, if (at) |i| text[0..i] else text, tools, max_calls);
     return .{ .parsed = if (at != null) .{ .content = strip(parsed.content), .calls = parsed.calls } else parsed, .open = at != null };
@@ -736,6 +747,10 @@ test "a reply cut inside a DSML calls block makes no call from it and shows none
     const v4 = try parseCut(a, "Go. " ++ dsml_open ++ invoke_open ++ "get_weather\">", tools, null);
     try std.testing.expect(v4.open and v4.parsed.calls == null);
     try std.testing.expectEqualStrings("Go.", v4.parsed.content);
+    // a bare JSON call whose argument holds a DSML opener is still the call
+    const bare = try parseCut(a, "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"" ++ dsml41_open ++ "\"}}", tools, null);
+    try std.testing.expect(!bare.open);
+    try std.testing.expectEqual(@as(usize, 1), bare.parsed.calls.?.len);
     // a reply with every block closed parses as before
     const whole = try parseCut(a, one_block, tools, null);
     try std.testing.expect(!whole.open);
