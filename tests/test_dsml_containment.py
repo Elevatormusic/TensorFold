@@ -351,6 +351,26 @@ class StreamedCalls(Flag):
             self.assertEqual(streamer.feed(text), [])
             self.assertLessEqual(len(scans), 7)
 
+    def test_a_block_cut_before_its_closing_tag_streams_no_complete_call(self):
+        text = "Go.\n" + self.XML_WRITE
+        for cut in range(len(text) + 1):
+            streamer = ToolCallStreamer(self.STREAM_TOOLS)
+            arguments_so_far = "".join(call["function"]["arguments"] for delta in streamer.feed(text[:cut])
+                                       for call in delta["tool_calls"])
+            if cut < len(text):
+                with self.assertRaises(ValueError, msg=cut):
+                    json.loads(arguments_so_far)
+                self.assertEqual(parse_tool_calls(text[:cut], self.STREAM_TOOLS), (text[:cut].strip(), None))
+            else:
+                self.assertEqual(json.loads(arguments_so_far), {"path": "y"})
+
+    def test_the_closing_tag_in_other_letter_case_closes_a_streamed_call(self):
+        text = self.XML_WRITE[:-len("</tool_call>")] + "</TOOL_CALL>"
+        streamer = ToolCallStreamer(self.STREAM_TOOLS)
+        sent = "".join(call["function"]["arguments"] for delta in streamer.feed(text) for call in delta["tool_calls"])
+        self.assertEqual(json.loads(sent), {"path": "y"})
+        self.assertEqual(arguments(parse_tool_calls(text, self.STREAM_TOOLS)[1]), [{"path": "y"}])
+
     def test_a_tag_in_other_letter_case_is_not_streamed(self):
         self.check("<TOOL_CALL>" + self.XML_WRITE[len("<tool_call>"):-len("</tool_call>")] + "</tool_call>", 0)
 

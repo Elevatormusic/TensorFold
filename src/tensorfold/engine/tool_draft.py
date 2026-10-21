@@ -355,7 +355,7 @@ class ToolCallStreamer:
                     continue
                 m = re.match(r"\s*</function>", rest)
                 if m is not None:
-                    out.append(self._args("}" if self.args_open else "{}"))
+                    self.held = "}" if self.args_open else "{}"     # sent when the block closes: a cut block stays invalid
                     self.pos += m.end()
                     self.state = "closing"
                     continue
@@ -388,9 +388,11 @@ class ToolCallStreamer:
                 self.pos += len(self._TAIL)
                 self.state = "function"
             elif self.state == "closing":
-                m = re.match(r"\s*</tool_call>", rest)
+                m = re.match(r"\s*</tool_call>", rest, re.IGNORECASE)
                 if m is None:
                     break
+                out.append(self._args(self.held))
+                self.held = ""
                 self.pos += m.end()
                 self.state = "outside"
         return out
