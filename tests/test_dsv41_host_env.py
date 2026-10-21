@@ -163,34 +163,35 @@ class NcclDefaultsTests(unittest.TestCase):
         self.root = Path(self._tmp.name)
         make_port(self.root, "a", {3: ("RoCE v2", V4)})
         make_port(self.root, "b", {3: ("RoCE v2", V4_B)})
+        self.nothing = self.root / "none"                      # a sysfs root with no device: the cumem tests only
 
     def apply(self, env: dict) -> dict:
         return hostenv.apply_nccl_defaults(env=env, root=self.root)
 
     def test_cumem_is_off_by_default(self):
         env: dict = {}
-        done = hostenv.apply_nccl_defaults(env=env)
+        done = hostenv.apply_nccl_defaults(env=env, root=self.nothing)
         self.assertEqual(env, {"NCCL_CUMEM_ENABLE": "0", "NCCL_CUMEM_HOST_ENABLE": "0"})
         self.assertEqual(done, env)
 
     def test_a_value_that_the_user_set_stays(self):
         env = {"NCCL_CUMEM_ENABLE": "1", "NCCL_CUMEM_HOST_ENABLE": "1"}
-        self.assertEqual(hostenv.apply_nccl_defaults(env=env), {})
+        self.assertEqual(hostenv.apply_nccl_defaults(env=env, root=self.nothing), {})
         self.assertEqual(env, {"NCCL_CUMEM_ENABLE": "1", "NCCL_CUMEM_HOST_ENABLE": "1"})
 
     def test_one_set_and_one_unset(self):
         env = {"NCCL_CUMEM_HOST_ENABLE": "1"}
-        hostenv.apply_nccl_defaults(env=env)
+        hostenv.apply_nccl_defaults(env=env, root=self.nothing)
         self.assertEqual(env, {"NCCL_CUMEM_ENABLE": "0", "NCCL_CUMEM_HOST_ENABLE": "1"})
 
     def test_an_empty_value_counts_as_unset(self):
         env = {"NCCL_CUMEM_ENABLE": " "}
-        hostenv.apply_nccl_defaults(env=env)
+        hostenv.apply_nccl_defaults(env=env, root=self.nothing)
         self.assertEqual(env["NCCL_CUMEM_ENABLE"], "0")
 
     def test_the_process_environment_is_the_default_target(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            hostenv.apply_nccl_defaults()
+            hostenv.apply_nccl_defaults(root=self.nothing)
             self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "0")
             self.assertEqual(os.environ["NCCL_CUMEM_HOST_ENABLE"], "0")
 
