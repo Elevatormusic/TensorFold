@@ -128,14 +128,20 @@ class ValidCalls(Flag):
 
 class OpenBlocks(Flag):
     def test_a_reply_cut_at_every_byte_makes_a_call_only_when_the_block_is_complete(self):
+        start = VALID.index(OPEN)
         end = VALID.index(CLOSE) + len(CLOSE)
         for cut in range(len(VALID) + 1):
             content, found = parse_tool_calls(VALID[:cut], TOOLS)
             if cut >= end:
                 self.assertEqual(names(found), ["read"], cut)
+                self.assertEqual(content, "Checking.", cut)
             else:
                 self.assertIsNone(found, cut)
-                self.assertEqual(content, VALID[:cut].strip(), cut)
+                # an open block is removed: no part of it stays in the content. A cut inside the opener tag is text.
+                opened = cut >= start + len(OPEN)
+                self.assertEqual(content, (VALID[:start] if opened else VALID[:cut]).strip(), cut)
+                if opened:
+                    self.assertNotIn(D, content, cut)
 
     def test_a_nested_call_in_a_cut_off_block_is_text(self):
         for nested in NESTED:
@@ -145,20 +151,22 @@ class OpenBlocks(Flag):
                         f'{OPEN}\n<{D} invoke name="read">\n<{D} parameter name="path" string="true">x'
                         + f"</{D} parameter>\n</{D} invoke>\n" + nested):
                 text = "Before.\n" + cut
-                self.assertEqual(parse_tool_calls(text, TOOLS), (text.strip(), None), nested)
-                self.assertEqual(parse_tool_calls(text, TOOLS, max_calls=1), (text.strip(), None), nested)
+                self.assertEqual(parse_tool_calls(text, TOOLS), ("Before.", None), nested)
+                self.assertEqual(parse_tool_calls(text, TOOLS, max_calls=1), ("Before.", None), nested)
 
     def test_a_nested_complete_block_does_not_close_a_cut_off_outer_block(self):
         outer = f'{OPEN}\n<{D} invoke name="read">\n<{D} parameter name="path" string="true">see '
+        text = "Before.\n" + outer + NESTED_DSML + "\n"
+        self.assertEqual(parse_tool_calls(text, TOOLS), ("Before.", None))
         text = outer + NESTED_DSML + "\n"
-        self.assertEqual(parse_tool_calls(text, TOOLS), (text.strip(), None))
+        self.assertEqual(parse_tool_calls(text, TOOLS), ("", None))
         self.assertEqual(dsml_block_end(text, 0), -1)
 
-    def test_an_open_block_after_a_valid_one_is_text_and_the_valid_call_stays(self):
+    def test_an_open_block_after_a_valid_one_is_removed_and_the_valid_call_stays(self):
         text = VALID + "\n" + f'{OPEN}\n<{D} invoke name="write">\n' + NESTED_JSON
         content, found = parse_tool_calls(text, TOOLS)
         self.assertEqual(names(found), ["read"])
-        self.assertTrue(content.endswith(NESTED_JSON))
+        self.assertEqual(content, "Checking.")
 
     def test_a_tool_call_tag_that_never_closes_opens_a_block_that_holds_the_rest(self):
         text = "The <tool_call> tag starts a call.\n" + calls(invoke("read", param("path", "a")))
@@ -480,7 +488,7 @@ class UnofferedCalls(Flag):
         self.assertEqual(result, ("Go.", None))
         self.assertIn("apply_patch", out.getvalue())
 
-    def test_the_flag_keeps_an_open_block_and_does_not_drop_its_nested_call(self):
+    def test_the_flag_removes_an_open_block_and_does_not_drop_its_nested_call(self):
         self.drop()
         unoffered = NESTED_JSON.replace("write", "apply_patch")
         for text in ("Go.\n" + OPEN + f'\n<{D} invoke name="read">\n<{D} parameter name="p">' + unoffered,
@@ -488,7 +496,7 @@ class UnofferedCalls(Flag):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 result = parse_tool_calls(text, TOOLS)
-            self.assertEqual(result, (text.strip(), None))
+            self.assertEqual(result, ("Go.", None))
             self.assertNotIn("dropped", out.getvalue())          # only the warning for the open block
 
     def test_the_flag_keeps_an_unoffered_nested_call_as_argument_text(self):

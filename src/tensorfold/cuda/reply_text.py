@@ -29,14 +29,17 @@ def _segments(text: str, suppressed: list[tuple[str, int]]) -> Iterator[str | tu
     """The reply as text (a plain string) and call blocks ((its markup, its JSON payload)), in order.
 
     A DSML invoke becomes the payload of a ``<tool_call>`` block. Only blocks at the top level are calls: an open
-    block, a block that is not well formed and everything inside a block stay text or argument text. A block that
-    keeps a later call as text adds (reason, character offset) to ``suppressed``."""
+    ``<tool_call>`` block, a block that is not well formed and everything inside a block stay text or argument text.
+    An open DSML calls block (the reply ended inside it) is removed with everything after it: it is not a call, and
+    the stream hides it too. A block that keeps a later call as text adds (reason, character offset) to
+    ``suppressed``."""
 
     blocks, open_at = top_level_blocks(text)
+    dsml_open = open_at >= 0 and text.startswith(_DSML_OPEN, open_at)
     if open_at >= 0:
-        opener = _DSML_OPEN if text.startswith(_DSML_OPEN, open_at) else _CALL_OPEN
+        opener = _DSML_OPEN if dsml_open else _CALL_OPEN
         if top_level_blocks(text[open_at + len(opener):])[0]:        # a complete block that the open one holds
-            suppressed.append((OPEN_DSML if opener == _DSML_OPEN else OPEN_TAG, open_at))
+            suppressed.append((OPEN_DSML if dsml_open else OPEN_TAG, open_at))
     cursor = 0
     for block in blocks:
         yield text[cursor:block.start]
@@ -52,7 +55,7 @@ def _segments(text: str, suppressed: list[tuple[str, int]]) -> Iterator[str | tu
         for name, args in invokes:
             payload = json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
             yield _CALL_OPEN + payload + _CALL_CLOSE, payload
-    yield text[cursor:]
+    yield text[cursor:open_at] if dsml_open else text[cursor:]
 
 
 def _partial_tag(text: str, tag: str, *, any_case: bool = False) -> int:

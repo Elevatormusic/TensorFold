@@ -173,8 +173,11 @@ client.
 
 On the CUDA server, a DeepSeek-V4.1 DSML call counts only when its `calls` block is complete and well formed at
 the top level of the reply. The block holds invokes and white space only, and each invoke holds parameters and white
-space only. Text in a block that is still open (a `<tool_call>` tag that never closes opens one too) is never a call: a reply that stops inside a block (`max_tokens`, a
-stop string) keeps that text, and a `<tool_call>` block in it does not run. A `<tool_call>` block or a DSML block
+space only. Text in a block that is still open (a `<tool_call>` tag that never closes opens one too) is never a call. A reply that stops inside a DSML `calls` block (`max_tokens`, a
+stop string) loses that open block from `content`, the stream and the whole reply alike, and makes no call from it. The
+text before the block stays, and so do complete `calls` blocks before it (their calls run). `finish_reason` is what the
+engine reports: `length` for a `max_tokens` cut, or `tool_calls` when a complete block before the cut made a call. A reply
+that stops inside a `<tool_call>` block keeps that text, and a `<tool_call>` block in it does not run. A `<tool_call>` block or a DSML block
 inside an argument value is argument text. A block that is not well formed is not a call and keeps its text. This
 holds for the whole reply, for the stream, and with `TF_DROP_UNOFFERED_TOOL_CALLS=1`. A value ends at its closing tag,
 and a complete block of the same kind inside it is skipped; so is a complete `<tool_call>` block inside a `<tool_call>` block. A lone closing tag in a value therefore makes the block
