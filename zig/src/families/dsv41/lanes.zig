@@ -20,6 +20,7 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
+const peer_watch = @import("peer_watch.zig");
 const cuda = @import("cuda");
 
 const be = lanes.backend;
@@ -295,6 +296,7 @@ pub const Lanes = struct {
     gpa: std.mem.Allocator,
     m: *Model,
     peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
+    watch: ?*peer_watch.Watch = null, // the links to the followers, watched for a rank that dies (peer_watch.zig)
     vision: ?*@import("vision.zig").Vision = null, // rank 0's tower (a vision checkpoint served with its kit's vision/)
     step: u64 = 0,
     wire: Wire = .{},
@@ -317,6 +319,7 @@ pub const Lanes = struct {
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+        if (m.world > 1) ln.watch = watchLinks(gpa, m, m.followers());
         // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
         const t = m.round_ms;
         for (&ln.wc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
@@ -331,6 +334,7 @@ pub const Lanes = struct {
             self.gpa.destroy(sn);
         }
         self.snaps.deinit(self.gpa);
+        if (self.watch) |w| w.stop(self.gpa); // before the done frame: the links' close is expected from now on
         if (self.peer != null) self.send(.done) catch {};
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
@@ -935,9 +939,28 @@ fn refused(err: anyerror) void {
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
 pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
 
+/// A watch on `links` (null: it could not start; the ranks then run as before, without it).
+fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*peer_watch.Watch {
+    var fds: [3]std.posix.fd_t = undefined;
+    var n: usize = 0;
+    for (links) |l| if (l) |x| if (n < fds.len) {
+        fds[n] = x.fd;
+        n += 1;
+    };
+    if (n == 0) return null;
+    return peer_watch.Watch.start(gpa, fds[0..n], m.ring, m.rank) catch |err| {
+        std.debug.print("[tensorfold] the peer link watch did not start ({s})
+", .{@errorName(err)});
+        return null;
+    };
+}
+
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
+    // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig)
+    const watch = watchLinks(gpa, m, &.{peer});
+    defer if (watch) |w| w.stop(gpa);
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
