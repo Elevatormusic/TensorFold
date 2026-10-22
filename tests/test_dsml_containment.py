@@ -657,6 +657,28 @@ class Suppressed(Flag):
         self.assertIn("reason=unresolved_tool_call", log)
         self.assertEqual(suppressed_counts(), {"unresolved_tool_call": 1})
 
+    def test_a_call_that_does_not_run_is_told_with_the_place_and_the_length_of_its_source_block(self):
+        block = calls(invoke("apply_patch", param("p", "x")), invoke("read"))
+        text = "Go.\n" + block + "\nThen " + '<tool_call>{"arguments": {}}</tool_call>'
+        (_, found), log = self.parse(text)
+        self.assertEqual(names(found), ["read"])
+        first, second = log.splitlines()
+        self.assertIn(f"reason=unoffered_tool_call (the call names a tool that the request did not offer), "
+                      f"length={len(block)} characters, at character 4", first)
+        tag = text.index("<tool_call>")
+        self.assertIn(f"reason=unresolved_tool_call (the call has no usable name or no arguments as a JSON object), "
+                      f"length={len(text) - tag} characters, at character {tag}", second)
+
+    def test_with_one_call_allowed_a_later_malformed_block_is_unresolved_not_extra(self):
+        text = (calls(invoke("read")) + "\n<tool_call>not json</tool_call>\n" + calls(invoke("apply_patch"))
+                + "\n" + calls(invoke("write")))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            content, found = parse_tool_calls(text, TOOLS, max_calls=1, request_id="req-abc123def456")
+        self.assertEqual(names(found), ["read"])
+        self.assertEqual(suppressed_counts(), {"unresolved_tool_call": 1, "unoffered_tool_call": 1,
+                                               "extra_call_removed": 1})
+
     def test_with_one_call_allowed_the_extra_calls_are_logged_and_counted(self):
         text = calls(invoke("read", param("path", "a")), invoke("write", param("path", "b")))
         out = io.StringIO()

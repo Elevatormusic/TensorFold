@@ -68,8 +68,9 @@ def report_unrun(events: list[Unrun], request_id: str = "") -> None:
               f"in this reply", flush=True)
 
 
-def _segments(text: str, suppressed: list[Unrun]) -> Iterator[str | tuple[str, str]]:
-    """The reply as text (a plain string) and call blocks ((its markup, its JSON payload)), in order.
+def _segments(text: str, suppressed: list[Unrun]) -> Iterator[str | tuple[str, str, tuple[int, int]]]:
+    """The reply as text (a plain string) and call blocks ((its markup, its JSON payload, its place in the reply)), in
+    order. The place is the start and end of the block in ``text``; all invokes of one DSML block share it.
 
     A DSML invoke becomes the payload of a ``<tool_call>`` block. Only blocks at the top level are calls: an open
     ``<tool_call>`` block, a block that is not well formed and everything inside a block stay text or argument text.
@@ -92,7 +93,7 @@ def _segments(text: str, suppressed: list[Unrun]) -> Iterator[str | tuple[str, s
         yield text[cursor:block.start]
         cursor = block.end
         if block.kind == "tag":
-            yield text[block.start:block.end], block.inner.strip()
+            yield text[block.start:block.end], block.inner.strip(), (block.start, block.end)
             continue
         invokes = parse_calls_block(block.inner)
         if invokes is None:
@@ -101,7 +102,7 @@ def _segments(text: str, suppressed: list[Unrun]) -> Iterator[str | tuple[str, s
             continue
         for name, args in invokes:
             payload = json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
-            yield _CALL_OPEN + payload + _CALL_CLOSE, payload
+            yield _CALL_OPEN + payload + _CALL_CLOSE, payload, (block.start, block.end)
     yield text[cursor:open_at] if dsml_open else text[cursor:]
 
 
@@ -253,10 +254,10 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
         if isinstance(segment, str):
             residue.append(segment)
             continue
-        markup, block = segment
-        if max_calls is not None and len(calls) >= max_calls:
-            suppressed.append(Unrun(EXTRA_CALL, "removed", -1, len(markup)))
-            continue
+        markup, block, (start, end) = segment
+
+        def unrun(reason: str, action: str = "removed") -> Unrun:
+            return Unrun(reason, action, start, end - start)
         name, args = None, {}
         parsed = False                                  # the whole payload parsed, not only its name
         try:
@@ -273,7 +274,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
             if m:
                 if max_calls is not None and _TOOL_PARAMETER_BLOCK_RE.sub("", m.group(2)).strip():
-                    suppressed.append(Unrun(UNRESOLVED, "removed", -1, len(markup)))
+                    suppressed.append(unrun(UNRESOLVED))
                     continue
                 name = m.group(1).strip()
                 # typed parameters (array, object, number...) decode per the tool's schema, as the Mac server does
@@ -296,7 +297,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                 action = "kept_as_text" if kept else "removed"
             else:
                 action = "removed"                       # single-call mode removes the block anyway
-            suppressed.append(Unrun(UNOFFERED if whole else UNRESOLVED, action, -1, len(markup)))
+            suppressed.append(unrun(UNOFFERED if whole else UNRESOLVED, action))
             continue
         if max_calls is not None:
             try:
@@ -304,7 +305,10 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                     raise ValueError("the arguments are not an object")
                 json.dumps(args, allow_nan=False)
             except (ValueError, TypeError):
-                suppressed.append(Unrun(UNRESOLVED, "removed", -1, len(markup)))
+                suppressed.append(unrun(UNRESOLVED))
+                continue
+            if len(calls) >= max_calls:                  # a good call after the one that the request allows
+                suppressed.append(unrun(EXTRA_CALL))
                 continue
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
                       "function": {"name": known[str(name).lower()],
