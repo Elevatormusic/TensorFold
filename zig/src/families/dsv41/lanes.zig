@@ -288,6 +288,7 @@ pub const Lanes = struct {
     m: *Model,
     peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
     watch: ?*peer_watch.Watch = null, // the links to the followers, watched for a rank that dies (peer_watch.zig)
+    stop_requested: bool = false, // set by the server's stop (native.zig deinitFn): deinit then ends the watch orderly
     vision: ?*@import("vision.zig").Vision = null, // rank 0's tower (a vision checkpoint served with its kit's vision/)
     step: u64 = 0,
     wire: Wire = .{},
@@ -308,9 +309,9 @@ pub const Lanes = struct {
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
 
-    pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
+    pub fn init(gpa: std.mem.Allocator, m: *Model) !Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
-        if (m.world > 1) ln.watch = watchLinks(gpa, m, m.followers());
+        if (m.world > 1) ln.watch = try watchLinks(gpa, m, m.followers());
         // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
         const t = m.round_ms;
         for (&ln.wc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
@@ -332,11 +333,12 @@ pub const Lanes = struct {
             self.gpa.destroy(sn);
         }
         self.snaps.deinit(self.gpa);
-        // a follower that the watch found gone before the done frame is a fault, and so is a done frame that cannot go
+        // a requested stop (the server's SIGTERM) is orderly even when a follower went away during it (both ranks got
+        // the signal). Else a follower gone before the done frame is a fault, and so is a done frame that cannot go
         // out; the followers' close after a done frame that went out is expected (within the watch's one-second wait)
         const lost = if (self.watch) |w| w.faulted() else false;
         const sent = if (self.peer != null) (if (self.send(.done)) |_| true else |_| false) else true;
-        self.endWatch(if (!lost and sent) .done else .failed);
+        self.endWatch(if (self.stop_requested or (!lost and sent)) .done else .failed);
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
@@ -891,8 +893,9 @@ fn refused(err: anyerror) void {
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
 pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
 
-/// A watch on `links` (null: it could not start; the ranks then run as before, without it).
-fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*peer_watch.Watch {
+/// A watch on `links`. If it cannot start: with TF_DS_EXIT_ON_FAULT=1 the error (the exit 75 contract needs the watch,
+/// so the start fails); else null, and the ranks run as before, without it.
+fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) !?*peer_watch.Watch {
     var fds: [3]std.posix.fd_t = undefined;
     var n: usize = 0;
     for (links) |l| if (l) |x| if (n < fds.len) {
@@ -902,8 +905,10 @@ fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*pe
     if (n == 0) return null;
     // every ring a GPU wait of this rank reads (the same list that Model.synchronize checks)
     var rings: [6]*rdma.Ring = undefined;
-    return peer_watch.Watch.start(gpa, fds[0..n], m.rdmaRings(&rings), m.rank) catch |err| {
+    const grace = peer_watch.faultGrace();
+    return peer_watch.Watch.start(gpa, fds[0..n], m.rdmaRings(&rings), m.rank, grace) catch |err| {
         std.debug.print("[tensorfold] the peer link watch did not start ({s})\n", .{@errorName(err)});
+        if (grace != null) return err;
         return null;
     };
 }
@@ -911,12 +916,6 @@ fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*pe
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
-    // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig); the done
-    // frame ends the watch orderly, an error ends it failed (exit 75 when rank 0 is gone), before Model.close
-    const watch = watchLinks(gpa, m, &.{peer});
-    errdefer {
-        if (watch) |w| _ = w.end(gpa, .failed);
-    }
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
@@ -933,6 +932,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         var ki = kept.valueIterator();
         while (ki.next()) |b| b.free();
         kept.deinit(gpa);
+    }
+    // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig); the done
+    // frame ends the watch orderly, an error ends it failed (exit 75 when rank 0 is gone). The watch starts after the
+    // kept states, so on an error it ends (rings aborted, exit 75) before their device memory is freed
+    const watch = try watchLinks(gpa, m, &.{peer});
+    errdefer {
+        if (watch) |w| _ = w.end(gpa, .failed);
     }
     while (true) {
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond

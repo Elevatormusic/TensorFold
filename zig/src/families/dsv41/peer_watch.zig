@@ -12,8 +12,9 @@ const Allocator = std.mem.Allocator;
 
 /// POLLRDHUP (Linux): the peer closed its end.
 const rdhup: i16 = 0x2000;
-/// The peer closed its end, or the connection failed (a keepalive or a send got no answer).
-const gone: i16 = rdhup | posix.POLL.HUP | posix.POLL.ERR;
+/// The peer closed its end, or the connection failed (a keepalive or a send got no answer), or the descriptor is no
+/// longer open (POLLNVAL: a poll on it would return at once, again and again).
+const gone: i16 = rdhup | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
 const max_links = 3;
 /// TP2's ring, world 4's three rings (ring2d.zig), or the neighbor gather's two (neighbor.zig).
 const max_rings = 6;
@@ -49,24 +50,26 @@ pub const Watch = struct {
     lost: std.atomic.Value(bool) = .init(false),
     /// Held while a thread aborts the rings (a spin: it is taken at most twice).
     rings_busy: std.atomic.Value(bool) = .init(false),
+    /// The exit 75 on a peer fault, after this grace in ms (faultGrace: TF_DS_EXIT_ON_FAULT=1); null: no exit.
+    exit_grace: ?u64,
     thread: ?std.Thread = null,
 
     /// A watch thread on `fds` (rank 0's links to its followers, or a follower's one link to rank 0) that aborts
-    /// `rings` (every RDMA ring this rank's GPU waits on) when a peer is gone.
-    pub fn start(gpa: Allocator, fds: []const posix.fd_t, rings: []const *rdma.Ring, rank: u32) !*Watch {
+    /// `rings` (every RDMA ring this rank's GPU waits on) when a peer is gone. `exit_grace`: faultGrace() (tests: null).
+    pub fn start(gpa: Allocator, fds: []const posix.fd_t, rings: []const *rdma.Ring, rank: u32, exit_grace: ?u64) !*Watch {
         const w = try gpa.create(Watch);
         errdefer gpa.destroy(w);
-        w.* = .{ .rank = rank, .n = @min(fds.len, max_links), .n_rings = @min(rings.len, max_rings) };
+        w.* = .{ .rank = rank, .n = @min(fds.len, max_links), .n_rings = @min(rings.len, max_rings), .exit_grace = exit_grace };
         @memcpy(w.fds[0..w.n], fds[0..w.n]);
         @memcpy(w.rings[0..w.n_rings], rings[0..w.n_rings]);
         w.thread = try std.Thread.spawn(.{}, loop, .{w});
         return w;
     }
 
-    /// True when the poll found a link's end: rank 0 reads it before its done frame (a done frame after it is no
-    /// orderly stop).
+    /// True when a peer's link has ended (the watch thread saw it, or a poll that does not wait finds it now, before
+    /// the thread sees it): rank 0 reads it before its done frame (a done frame after it is no orderly stop).
     pub fn faulted(w: *Watch) bool {
-        return w.seen.load(.acquire);
+        return w.seen.load(.acquire) or w.linkGone();
     }
 
     /// The one teardown, for every way a rank ends (rank 0's Lanes.deinit, a follower's done frame or error, a start
@@ -82,12 +85,13 @@ pub const Watch = struct {
         if (w.thread) |t| t.join();
         const out: Outcome = switch (how) {
             .done => .orderly,
-            .failed => if (w.seen.load(.acquire) or w.linkGone()) .peer_fault else .failed,
+            .failed => if (w.faulted()) .peer_fault else .failed,
         };
         const rank = w.rank;
+        const exit_on_fault = w.exit_grace != null;
         gpa.destroy(w);
-        if (out == .peer_fault and exitGrace() != null) {
-            std.debug.print("[tensorfold] rank {d}: a peer rank is gone; exit 75 (TF_DS_EXIT_ON_FAULT): a supervisor restarts both ranks\n", .{rank});
+        if (out == .peer_fault and exit_on_fault) {
+            note("[tensorfold] rank {d}: a peer rank is gone; exit 75 (TF_DS_EXIT_ON_FAULT): a supervisor restarts both ranks\n", .{rank});
             std.c._exit(75);
         }
         return out;
@@ -129,7 +133,10 @@ pub const Watch = struct {
         var pfds: [max_links]posix.pollfd = undefined;
         for (pfds[0..w.n], w.fds[0..w.n]) |*p, fd| p.* = .{ .fd = fd, .events = rdhup, .revents = 0 };
         while (!w.quiet()) {
-            const k = posix.poll(pfds[0..w.n], 200) catch continue;
+            const k = posix.poll(pfds[0..w.n], 200) catch {
+                sleepMs(200); // no spin on a poll that fails at once
+                continue;
+            };
             if (k == 0) continue;
             for (pfds[0..w.n]) |p| if (p.revents & gone != 0) {
                 w.seen.store(true, .release);
@@ -143,19 +150,32 @@ pub const Watch = struct {
         // rank 0's done frame and the close of its link come together: a second for this rank to call end
         if (w.stopped(1000)) return;
         w.lost.store(true, .release);
-        std.debug.print("[tensorfold] rank {d}: a peer rank's link closed (its process or node is gone); the waits of its {d} RDMA ring(s) are aborted\n", .{ w.rank, w.n_rings });
+        // the abort first: no log comes before it
         w.abortRings("a peer rank is gone (its link closed)");
-        const grace_ms = exitGrace() orelse return;
+        note("[tensorfold] rank {d}: a peer rank's link closed (its process or node is gone); the waits of its {d} RDMA ring(s) are aborted\n", .{ w.rank, w.n_rings });
+        const grace_ms = w.exit_grace orelse return;
         // a live round fails first: its error goes out, then this rank calls end, or the lane host ends the process
         if (w.stopped(grace_ms + 2000)) return;
-        std.debug.print("[tensorfold] rank {d}: exit 75 (TF_DS_EXIT_ON_FAULT): a supervisor restarts both ranks\n", .{w.rank});
+        note("[tensorfold] rank {d}: exit 75 (TF_DS_EXIT_ON_FAULT): a supervisor restarts both ranks\n", .{w.rank});
         // a stream may hold kernels that wait on the gone rank (NCCL's), which a normal exit would join
         std.c._exit(75);
     }
 };
 
-/// TF_DS_EXIT_ON_FAULT=1: the grace in ms (TF_DS_EXIT_GRACE seconds, default 5), as lane_host.faultExit reads it.
-fn exitGrace() ?u64 {
+/// A log line to stderr that never blocks: it is written only when stderr can take it now (a write up to PIPE_BUF to
+/// a pipe that poll reports writable goes out whole), else it is dropped. The abort and the exit never wait on a log.
+fn note(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    var p = [1]posix.pollfd{.{ .fd = 2, .events = posix.POLL.OUT, .revents = 0 }};
+    const k = posix.poll(&p, 0) catch return;
+    if (k == 0 or p[0].revents & posix.POLL.OUT == 0) return;
+    _ = std.c.write(2, line.ptr, line.len);
+}
+
+/// TF_DS_EXIT_ON_FAULT=1: the grace in ms (TF_DS_EXIT_GRACE seconds, default 5), as lane_host.faultExit reads it. The
+/// exit 75 of a watch (Watch.start's exit_grace); null when the variable is not 1.
+pub fn faultGrace() ?u64 {
     const on = std.c.getenv("TF_DS_EXIT_ON_FAULT") orelse return null;
     if (!std.mem.eql(u8, std.mem.span(on), "1")) return null;
     const g = std.c.getenv("TF_DS_EXIT_GRACE") orelse return 5000;
@@ -197,7 +217,7 @@ test "a start that fails ends the watch with no fault while the peer is up" {
     const port = testPort();
     const t = try std.Thread.spawn(.{}, Peer.run, .{Peer{ .port = port, .die_ms = null }});
     var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
-    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 0);
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 0, null);
     // native.open fails after Lanes.init: end runs before Model.close frees the rings
     try std.testing.expectEqual(Outcome.failed, w.end(std.testing.allocator, .failed));
     l.close();
@@ -209,7 +229,7 @@ test "an idle follower whose rank 0 dies: the watch acts, then end finds the pee
     const t = try std.Thread.spawn(.{}, Peer.run, .{Peer{ .port = port, .die_ms = 300 }});
     var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
     defer l.close();
-    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 1);
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 1, null);
     t.join();
     // no receive runs: the watch alone finds the end (and aborts the rings) after its one-second wait
     var waited: u32 = 0;
@@ -223,7 +243,7 @@ test "a sending leader whose follower dies gets PeerDown, and end finds the peer
     const t = try std.Thread.spawn(.{}, Peer.run, .{Peer{ .port = port, .die_ms = 0 }});
     var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
     defer l.close();
-    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 0);
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 0, null);
     t.join();
     // the first send after the close can still go out; a later one fails (no SIGPIPE: link.zig sends with NOSIGNAL)
     var err: ?anyerror = null;
@@ -243,7 +263,7 @@ test "a follower that gets PeerDown calls end before the watch acts, and end sti
     const t = try std.Thread.spawn(.{}, Peer.run, .{Peer{ .port = port, .die_ms = 200 }});
     var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
     defer l.close();
-    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 1);
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 1, null);
     var buf: [64]u8 = undefined;
     try std.testing.expectError(error.PeerDown, l.recv(&buf));
     // within the watch's one-second wait: the watch has not acted, end acts for it
@@ -257,11 +277,37 @@ test "a done frame, then the peer's close: end is orderly" {
     const t = try std.Thread.spawn(.{}, Peer.run, .{Peer{ .port = port, .die_ms = null }});
     var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
     defer l.close();
-    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 0);
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 0, null);
     try std.testing.expect(!w.faulted());
     try l.send("done");
     t.join(); // the peer took done and closed its end: the watch may have seen it
     sleepMs(300);
     try std.testing.expect(!w.lost.load(.acquire));
     try std.testing.expectEqual(Outcome.orderly, w.end(std.testing.allocator, .done));
+}
+
+test "a descriptor that is no longer open counts as a link end (POLLNVAL), not as a poll to repeat" {
+    const fds = try posix.pipe();
+    defer posix.close(fds[1]);
+    const w = try Watch.start(std.testing.allocator, &.{fds[0]}, &.{}, 1, null);
+    posix.close(fds[0]);
+    var waited: u32 = 0;
+    while (!w.lost.load(.acquire) and waited < 40) : (waited += 1) sleepMs(100);
+    try std.testing.expect(w.lost.load(.acquire));
+    try std.testing.expectEqual(Outcome.peer_fault, w.end(std.testing.allocator, .failed));
+}
+
+test "the exit 75 comes from Watch.start's grace alone: TF_DS_EXIT_ON_FAULT in the test's environment has no effect" {
+    try std.testing.expectEqual(@as(c_int, 0), std.c.setenv("TF_DS_EXIT_ON_FAULT", "1", 1));
+    defer _ = std.c.unsetenv("TF_DS_EXIT_ON_FAULT");
+    try std.testing.expectEqual(@as(?u64, 5000), faultGrace());
+    const port = testPort() + 2000;
+    const t = try std.Thread.spawn(.{}, Peer.run, .{Peer{ .port = port, .die_ms = 0 }});
+    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    defer l.close();
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 1, null);
+    t.join();
+    sleepMs(100);
+    // a peer fault with no grace: end returns (the test runner goes on) instead of exit 75
+    try std.testing.expectEqual(Outcome.peer_fault, w.end(std.testing.allocator, .failed));
 }
