@@ -50,11 +50,17 @@ pub const Shards = struct {
             n += 1;
             var names = sh.files[n - 1].names.iterator();
             while (names.next()) |kv| {
-                // a name in two shards (for example a dtype-override file next to the pack) has no single source
                 const slot = try sh.names.getOrPut(gpa, kv.key_ptr.*);
                 if (slot.found_existing) {
-                    std.log.err("tensor {s} is in two shards: {s} and {s}", .{ kv.key_ptr.*, paths.items[slot.value_ptr.*], p });
-                    return error.DuplicateTensor;
+                    // the 1017 packs repeat the Engram q / k tables in two shards with the same dtype and shape: the
+                    // later shard is used, as before. A name in two shards with another dtype or shape (for example
+                    // a dtype-override file next to the pack) has no single source.
+                    const was = sh.files[slot.value_ptr.*].get(kv.key_ptr.*).?;
+                    const now = sh.files[n - 1].get(kv.key_ptr.*).?;
+                    if (was.dtype != now.dtype or was.rank != now.rank or !std.mem.eql(usize, was.shape[0..was.rank], now.shape[0..now.rank])) {
+                        std.log.warn("tensor {s} is in two shards with another dtype or shape: {s} and {s}", .{ kv.key_ptr.*, paths.items[slot.value_ptr.*], p });
+                        return error.DuplicateTensor;
+                    }
                 }
                 slot.value_ptr.* = @intCast(n - 1);
             }
@@ -390,8 +396,25 @@ test "a 2.8 bpw pack: bf16 router weights read as f16, f32 router bias as f32, a
         try read(&sh, "layers.0.ffn.gate.bias|torch.float32", &bias);
         try std.testing.expectEqualSlices(u8, body[8..16], &bias);
     }
-    // the same names again in a second shard: no single source, so the open fails
-    try tmp.dir.writeFile(io, .{ .sub_path = "zz-override.safetensors", .data = file.items });
+    // the same names again in a second shard, the same dtypes and shapes (the 1017 packs' repeated Engram tables): the
+    // later shard is used
+    try tmp.dir.writeFile(io, .{ .sub_path = "layer-01.safetensors", .data = file.items });
+    {
+        var sh = try Shards.open(a, io, dir);
+        defer sh.close(io);
+        var bias: [8]u8 = undefined;
+        try read(&sh, "layers.0.ffn.gate.bias|torch.float32", &bias);
+        try std.testing.expectEqualSlices(u8, body[8..16], &bias);
+    }
+    // the router weight again in f16 (a dtype-override file next to the pack): no single source, so the open fails
+    const json16 = "{\"layers.0.ffn.gate.weight\":{\"dtype\":\"F16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}";
+    var over: std.ArrayList(u8) = .empty;
+    defer over.deinit(a);
+    std.mem.writeInt(u64, &len, json16.len, .little);
+    try over.appendSlice(a, &len);
+    try over.appendSlice(a, json16);
+    try over.appendSlice(a, body[0..8]);
+    try tmp.dir.writeFile(io, .{ .sub_path = "zz-override.safetensors", .data = over.items });
     try std.testing.expectError(error.DuplicateTensor, Shards.open(a, io, dir));
 }
 
