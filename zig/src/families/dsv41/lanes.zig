@@ -331,8 +331,20 @@ pub const Lanes = struct {
             self.gpa.destroy(sn);
         }
         self.snaps.deinit(self.gpa);
-        self.stopWatch(); // before the done frame: the links' close is expected from now on
-        if (self.peer != null) self.send(.done) catch {};
+        // a peer that the watch found gone before the done frame is a fault, and so is a done frame that cannot go out
+        const w = self.watch;
+        self.watch = null;
+        const lost = if (w) |x| x.faulted() else false;
+        const sent = if (self.peer != null) (if (self.send(.done)) |_| true else |_| false) else true;
+        if (w) |x| {
+            if (!lost and sent) {
+                x.stop(self.gpa); // within the watch's one-second wait: the followers' close after the done frame is expected
+            } else {
+                // the model frees the rings next; the exit 75 stays armed and comes before this rank's own return
+                x.release("rank 0 ends after a peer fault");
+                x.hold();
+            }
+        }
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
