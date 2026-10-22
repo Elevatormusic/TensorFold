@@ -318,9 +318,10 @@ pub const Lanes = struct {
         return ln;
     }
 
-    /// Stops the peer link watch (an orderly stop, or a start that fails after init: it holds the model's links and rings).
-    pub fn stopWatch(self: *Lanes) void {
-        if (self.watch) |w| w.stop(self.gpa);
+    /// Ends the peer link watch (Watch.end, the one teardown: before the model frees its links and rings). `failed`:
+    /// with a follower gone and TF_DS_EXIT_ON_FAULT=1, it does not return (exit 75).
+    pub fn endWatch(self: *Lanes, how: peer_watch.How) void {
+        if (self.watch) |w| _ = w.end(self.gpa, how);
         self.watch = null;
     }
 
@@ -331,20 +332,11 @@ pub const Lanes = struct {
             self.gpa.destroy(sn);
         }
         self.snaps.deinit(self.gpa);
-        // a peer that the watch found gone before the done frame is a fault, and so is a done frame that cannot go out
-        const w = self.watch;
-        self.watch = null;
-        const lost = if (w) |x| x.faulted() else false;
+        // a follower that the watch found gone before the done frame is a fault, and so is a done frame that cannot go
+        // out; the followers' close after a done frame that went out is expected (within the watch's one-second wait)
+        const lost = if (self.watch) |w| w.faulted() else false;
         const sent = if (self.peer != null) (if (self.send(.done)) |_| true else |_| false) else true;
-        if (w) |x| {
-            if (!lost and sent) {
-                x.stop(self.gpa); // within the watch's one-second wait: the followers' close after the done frame is expected
-            } else {
-                // the model frees the rings next; the exit 75 stays armed and comes before this rank's own return
-                x.release("rank 0 ends after a peer fault");
-                x.hold();
-            }
-        }
+        self.endWatch(if (!lost and sent) .done else .failed);
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
@@ -932,11 +924,10 @@ fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*pe
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
-    // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig); only the
-    // done frame stops the watch: an error unwinds with it still running, so its exit 75 stays if the exit hangs
+    // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig); the done
+    // frame ends the watch orderly, an error ends it failed (exit 75 when rank 0 is gone), before Model.close
     const watch = watchLinks(gpa, m, &.{peer});
-    // Model.close frees the rings next: the watch lets them go first (and aborts their waits, so close does not hang)
-    errdefer if (watch) |w| w.release("this rank ends on an error");
+    errdefer if (watch) |w| _ = w.end(gpa, .failed);
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
@@ -1081,7 +1072,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 }
             },
             .done => {
-                if (watch) |w| w.stop(gpa);
+                if (watch) |w| _ = w.end(gpa, .done);
                 return;
             },
         }
