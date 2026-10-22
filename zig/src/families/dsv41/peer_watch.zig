@@ -14,11 +14,14 @@ const rdhup: i16 = 0x2000;
 /// The peer closed its end, or the connection failed (a keepalive or a send got no answer).
 const gone: i16 = rdhup | posix.POLL.HUP | posix.POLL.ERR;
 const max_links = 3;
+/// TP2's ring, world 4's three rings (ring2d.zig), or the neighbor gather's two (neighbor.zig).
+const max_rings = 6;
 
 pub const Watch = struct {
     fds: [max_links]posix.fd_t = @splat(-1),
     n: usize = 0,
-    ring: ?*rdma.Ring,
+    rings: [max_rings]*rdma.Ring = undefined,
+    n_rings: usize = 0,
     rank: u32,
     running: std.atomic.Value(bool) = .init(true),
     orderly: std.atomic.Value(bool) = .init(false),
@@ -26,12 +29,14 @@ pub const Watch = struct {
     lost: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
-    /// A watch thread on `fds`: rank 0's links to its followers, or a follower's one link to rank 0.
-    pub fn start(gpa: Allocator, fds: []const posix.fd_t, ring: ?*rdma.Ring, rank: u32) !*Watch {
+    /// A watch thread on `fds` (rank 0's links to its followers, or a follower's one link to rank 0) that aborts
+    /// `rings` (every RDMA ring this rank's GPU waits on) when a peer is gone.
+    pub fn start(gpa: Allocator, fds: []const posix.fd_t, rings: []const *rdma.Ring, rank: u32) !*Watch {
         const w = try gpa.create(Watch);
         errdefer gpa.destroy(w);
-        w.* = .{ .ring = ring, .rank = rank, .n = @min(fds.len, max_links) };
+        w.* = .{ .rank = rank, .n = @min(fds.len, max_links), .n_rings = @min(rings.len, max_rings) };
         @memcpy(w.fds[0..w.n], fds[0..w.n]);
+        @memcpy(w.rings[0..w.n_rings], rings[0..w.n_rings]);
         w.thread = try std.Thread.spawn(.{}, loop, .{w});
         return w;
     }
@@ -73,8 +78,8 @@ pub const Watch = struct {
         // rank 0's done frame and the close of its link come together: a second for this rank to take the stop
         if (w.stopped(1000)) return;
         w.lost.store(true, .release);
-        std.debug.print("[tensorfold] rank {d}: a peer rank's link closed (its process or node is gone); the RDMA ring's waits are aborted\n", .{w.rank});
-        if (w.ring) |r| r.abort("a peer rank is gone (its link closed)");
+        std.debug.print("[tensorfold] rank {d}: a peer rank's link closed (its process or node is gone); the waits of its {d} RDMA ring(s) are aborted\n", .{ w.rank, w.n_rings });
+        for (w.rings[0..w.n_rings]) |r| r.abort("a peer rank is gone (its link closed)");
         const grace_ms = exitGrace() orelse return;
         // a live round fails first and the lane host ends the process itself after the same grace
         if (w.stopped(grace_ms + 2000)) return;
@@ -114,7 +119,7 @@ test "a peer that closes its link without a done frame is found within two secon
     const t = try std.Thread.spawn(.{}, Peer.run, .{port});
     var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
     defer l.close();
-    const w = try Watch.start(std.testing.allocator, &.{l.fd}, null, 0);
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 0);
     defer w.stop(std.testing.allocator);
     t.join();
     // a frame waiting unread is no end: the watch asks for the peer's close alone
@@ -139,7 +144,7 @@ test "an orderly stop before the link closes is no fault" {
     const t = try std.Thread.spawn(.{}, Peer.run, .{port});
     var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
     defer l.close();
-    const w = try Watch.start(std.testing.allocator, &.{l.fd}, null, 1);
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 1);
     w.orderly.store(true, .release); // the done frame came: the close that follows is expected
     t.join();
     const ts: std.c.timespec = .{ .sec = 1, .nsec = 500 * std.time.ns_per_ms };

@@ -21,6 +21,7 @@ const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const peer_watch = @import("peer_watch.zig");
+const rdma = @import("rdma.zig");
 const cuda = @import("cuda");
 
 const be = lanes.backend;
@@ -327,6 +328,12 @@ pub const Lanes = struct {
         return ln;
     }
 
+    /// Stops the peer link watch (an orderly stop, or a start that fails after init: it holds the model's links and rings).
+    pub fn stopWatch(self: *Lanes) void {
+        if (self.watch) |w| w.stop(self.gpa);
+        self.watch = null;
+    }
+
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
     pub fn deinit(self: *Lanes) void {
         for (self.snaps.items) |sn| {
@@ -334,7 +341,7 @@ pub const Lanes = struct {
             self.gpa.destroy(sn);
         }
         self.snaps.deinit(self.gpa);
-        if (self.watch) |w| w.stop(self.gpa); // before the done frame: the links' close is expected from now on
+        self.stopWatch(); // before the done frame: the links' close is expected from now on
         if (self.peer != null) self.send(.done) catch {};
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
@@ -948,7 +955,22 @@ fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*pe
         n += 1;
     };
     if (n == 0) return null;
-    return peer_watch.Watch.start(gpa, fds[0..n], m.ring, m.rank) catch |err| {
+    // every ring a GPU wait of this rank reads: TP2's, world 4's three, or the neighbor gather's two
+    var rings: [6]*rdma.Ring = undefined;
+    var k: usize = 0;
+    if (m.ring) |r| {
+        rings[k] = r;
+        k += 1;
+    }
+    if (m.rdma_rings) |rr| for ([_]*rdma.Ring{ rr.all4, rr.col, rr.pair }) |r| {
+        rings[k] = r;
+        k += 1;
+    };
+    if (m.neighbor_gather) |ng| for ([_]*rdma.Ring{ ng.first, ng.second }) |r| {
+        rings[k] = r;
+        k += 1;
+    };
+    return peer_watch.Watch.start(gpa, fds[0..n], rings[0..k], m.rank) catch |err| {
         std.debug.print("[tensorfold] the peer link watch did not start ({s})
 ", .{@errorName(err)});
         return null;
