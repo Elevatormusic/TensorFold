@@ -186,6 +186,11 @@ pub fn faultGrace() ?u64 {
 
 const Link = @import("link.zig").Link;
 
+// libc calls that the tests need and std.c does not declare
+extern "c" fn pipe(fds: *[2]c_int) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
 fn testPort() u16 {
     return 29500 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(std.testing.io, .awake).nanoseconds, 400)));
 }
@@ -287,10 +292,11 @@ test "a done frame, then the peer's close: end is orderly" {
 }
 
 test "a descriptor that is no longer open counts as a link end (POLLNVAL), not as a poll to repeat" {
-    const fds = try posix.pipe();
-    defer posix.close(fds[1]);
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), pipe(&fds));
+    defer _ = std.c.close(fds[1]);
     const w = try Watch.start(std.testing.allocator, &.{fds[0]}, &.{}, 1, null);
-    posix.close(fds[0]);
+    _ = std.c.close(fds[0]);
     var waited: u32 = 0;
     while (!w.lost.load(.acquire) and waited < 40) : (waited += 1) sleepMs(100);
     try std.testing.expect(w.lost.load(.acquire));
@@ -298,8 +304,8 @@ test "a descriptor that is no longer open counts as a link end (POLLNVAL), not a
 }
 
 test "the exit 75 comes from Watch.start's grace alone: TF_DS_EXIT_ON_FAULT in the test's environment has no effect" {
-    try std.testing.expectEqual(@as(c_int, 0), std.c.setenv("TF_DS_EXIT_ON_FAULT", "1", 1));
-    defer _ = std.c.unsetenv("TF_DS_EXIT_ON_FAULT");
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TF_DS_EXIT_ON_FAULT", "1", 1));
+    defer _ = unsetenv("TF_DS_EXIT_ON_FAULT");
     try std.testing.expectEqual(@as(?u64, 5000), faultGrace());
     const port = testPort() + 2000;
     const t = try std.Thread.spawn(.{}, Peer.run, .{Peer{ .port = port, .die_ms = 0 }});
