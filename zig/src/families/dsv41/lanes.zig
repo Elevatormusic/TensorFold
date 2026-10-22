@@ -899,9 +899,9 @@ fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*pe
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
-    // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig)
+    // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig); only the
+    // done frame stops the watch: an error unwinds with it still running, so its exit 75 stays if the exit hangs
     const watch = watchLinks(gpa, m, &.{peer});
-    defer if (watch) |w| w.stop(gpa);
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
@@ -1045,7 +1045,10 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     b.free();
                 }
             },
-            .done => return,
+            .done => {
+                if (watch) |w| w.stop(gpa);
+                return;
+            },
         }
     }
 }
