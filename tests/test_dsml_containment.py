@@ -629,14 +629,14 @@ class Suppressed(Flag):
         self.assertEqual(suppressed_counts(), {"ill_formed_dsml_block": 1})
 
     def test_the_line_never_holds_the_block_text_or_the_arguments(self):
-        secret = "SECRET-ARGUMENT-VALUE"
-        for text in (calls(invoke("read", param("path", secret)), "junk\n"),
-                     "Go.\n" + OPEN + f'\n<{D} invoke name="read">\n<{D} parameter name="path">{secret}',
-                     calls(invoke("apply_patch", param("path", secret))),
-                     "<tool_call>" + json.dumps({"arguments": {"path": secret}}) + "</tool_call>"):
+        canary = "ARGUMENT-CANARY-VALUE"
+        for text in (calls(invoke("read", param("path", canary)), "junk\n"),
+                     "Go.\n" + OPEN + f'\n<{D} invoke name="read">\n<{D} parameter name="path">{canary}',
+                     calls(invoke("apply_patch", param("path", canary))),
+                     "<tool_call>" + json.dumps({"arguments": {"path": canary}}) + "</tool_call>"):
             _, log = self.parse(text)
             self.assertIn("WARNING", log)
-            self.assertNotIn(secret, log)
+            self.assertNotIn(canary, log)
             self.assertNotIn("｜", log)
 
     def test_a_complete_call_to_a_tool_that_is_not_offered_is_kept_as_text_logged_and_counted(self):

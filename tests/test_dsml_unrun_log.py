@@ -15,7 +15,7 @@ from tests.test_dsml_cut_parity import (CLOSE, COMPLETE_THEN_OPEN, D, ONE, OPEN,
                                         Replies, block, invoke, param, served)
 
 ID = re.compile(r"req-[0-9a-f]{12}")
-SECRET = "SECRET-ARGUMENT-VALUE"
+CANARY = "ARGUMENT-CANARY-VALUE"
 
 
 @pytest.fixture
@@ -110,7 +110,7 @@ def test_an_open_block_that_holds_a_complete_call_says_so(replies, capsys, mode)
 
 @pytest.mark.parametrize("mode", MODES)
 def test_a_block_that_is_not_well_formed_is_logged_as_kept_text(replies, capsys, mode):
-    reply_text = "Go.\n" + block(invoke("read", param("path", SECRET)), "junk\n")
+    reply_text = "Go.\n" + block(invoke("read", param("path", CANARY)), "junk\n")
     with served(replies) as port:
         capsys.readouterr()
         run(replies, port, reply_text, len(reply_text) + 1, mode)
@@ -118,19 +118,19 @@ def test_a_block_that_is_not_well_formed_is_logged_as_kept_text(replies, capsys,
     assert len(warnings) == 1
     assert "was kept in the reply as text and did not run" in warnings[0]
     assert "reason=ill_formed_dsml_block" in warnings[0] and "at character 4" in warnings[0]
-    assert SECRET not in warnings[0] and "junk" not in warnings[0]
+    assert CANARY not in warnings[0] and "junk" not in warnings[0]
     assert suppressed_counts() == {"ill_formed_dsml_block": 1}
 
 
 @pytest.mark.parametrize("mode", MODES)
 def test_a_call_to_a_tool_that_is_not_offered_is_logged(replies, capsys, mode):
-    reply_text = "Go.\n" + block(invoke("apply_patch", param("path", SECRET)))
+    reply_text = "Go.\n" + block(invoke("apply_patch", param("path", CANARY)))
     with served(replies) as port:
         capsys.readouterr()
         run(replies, port, reply_text, len(reply_text) + 1, mode)
     warnings, _ = lines(capsys)
     assert len(warnings) == 1 and "reason=unoffered_tool_call" in warnings[0]
-    assert SECRET not in warnings[0]
+    assert CANARY not in warnings[0]
     assert suppressed_counts() == {"unoffered_tool_call": 1}
 
 
