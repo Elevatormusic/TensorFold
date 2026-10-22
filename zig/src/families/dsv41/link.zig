@@ -15,12 +15,18 @@ pub const Link = struct {
 
     /// TCP_NODELAY, and SO_BUSY_POLL: a read polls the NIC's receive queue itself (up to 50 us) instead of waiting for
     /// its interrupt, whose core may be leaving a deep idle state (node to node, 64-byte frames: round trip 1.0 ms
-    /// blocking, 0.72 ms polling the socket, 11 us with SO_BUSY_POLL).
+    /// blocking, 0.72 ms polling the socket, 11 us with SO_BUSY_POLL). A keepalive (10 s idle, then 3 probes 3 s
+    /// apart) shows a peer whose node vanished (no FIN) within about 20 s, to a read and to peer_watch.zig.
     fn tune(fd: c.fd_t) void {
         const one: c_int = 1;
         const busy_us: c_int = 50;
         _ = c.setsockopt(fd, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
         _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.BUSY_POLL, std.mem.asBytes(&busy_us), @sizeOf(c_int));
+        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.KEEPALIVE, std.mem.asBytes(&one), @sizeOf(c_int));
+        for ([_][2]u32{ .{ std.posix.TCP.KEEPIDLE, 10 }, .{ std.posix.TCP.KEEPINTVL, 3 }, .{ std.posix.TCP.KEEPCNT, 3 } }) |o| {
+            const v: c_int = @intCast(o[1]);
+            _ = c.setsockopt(fd, c.IPPROTO.TCP, o[0], std.mem.asBytes(&v), @sizeOf(c_int));
+        }
     }
 
     fn addr(ip: [4]u8, port: u16) c.sockaddr.in {
