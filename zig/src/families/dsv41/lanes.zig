@@ -927,7 +927,9 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig); the done
     // frame ends the watch orderly, an error ends it failed (exit 75 when rank 0 is gone), before Model.close
     const watch = watchLinks(gpa, m, &.{peer});
-    errdefer if (watch) |w| _ = w.end(gpa, .failed);
+    errdefer {
+        if (watch) |w| _ = w.end(gpa, .failed);
+    }
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
