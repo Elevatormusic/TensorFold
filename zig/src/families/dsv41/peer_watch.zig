@@ -27,6 +27,8 @@ pub const Watch = struct {
     orderly: std.atomic.Value(bool) = .init(false),
     /// Set when the watch found a peer gone (before it acts).
     lost: std.atomic.Value(bool) = .init(false),
+    /// Held while the watch aborts the rings, so release() never frees them under it (a spin: it is taken at most twice).
+    rings_busy: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
     /// A watch thread on `fds` (rank 0's links to its followers, or a follower's one link to rank 0) that aborts
@@ -47,6 +49,19 @@ pub const Watch = struct {
         w.running.store(false, .release);
         if (w.thread) |t| t.join();
         gpa.destroy(w);
+    }
+
+    /// A rank that ends on an error (its rings are freed next): aborts the rings and forgets them, so the watch never
+    /// reads freed rings. It keeps the links watched and the exit 75 armed: an error is no orderly stop.
+    pub fn release(w: *Watch, why: []const u8) void {
+        w.lockRings();
+        defer w.rings_busy.store(false, .release);
+        for (w.rings[0..w.n_rings]) |r| r.abort(why);
+        w.n_rings = 0;
+    }
+
+    fn lockRings(w: *Watch) void {
+        while (w.rings_busy.swap(true, .acquire)) std.atomic.spinLoopHint();
     }
 
     fn quiet(w: *Watch) bool {
@@ -78,8 +93,12 @@ pub const Watch = struct {
         // rank 0's done frame and the close of its link come together: a second for this rank to take the stop
         if (w.stopped(1000)) return;
         w.lost.store(true, .release);
-        std.debug.print("[tensorfold] rank {d}: a peer rank's link closed (its process or node is gone); the waits of its {d} RDMA ring(s) are aborted\n", .{ w.rank, w.n_rings });
-        for (w.rings[0..w.n_rings]) |r| r.abort("a peer rank is gone (its link closed)");
+        {
+            w.lockRings();
+            defer w.rings_busy.store(false, .release);
+            std.debug.print("[tensorfold] rank {d}: a peer rank's link closed (its process or node is gone); the waits of its {d} RDMA ring(s) are aborted\n", .{ w.rank, w.n_rings });
+            for (w.rings[0..w.n_rings]) |r| r.abort("a peer rank is gone (its link closed)");
+        }
         const grace_ms = exitGrace() orelse return;
         // a live round fails first and the lane host ends the process itself after the same grace
         if (w.stopped(grace_ms + 2000)) return;
@@ -128,6 +147,33 @@ test "a peer that closes its link without a done frame is found within two secon
         const ts: std.c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
         _ = std.c.nanosleep(&ts, null);
     }
+    try std.testing.expect(w.lost.load(.acquire));
+}
+
+test "a released watch forgets its rings and still finds the peer gone" {
+    const port = testPort() + 800;
+    const Peer = struct {
+        fn run(p: u16) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            const ts: std.c.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            l.close();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Peer.run, .{port});
+    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    defer l.close();
+    const w = try Watch.start(std.testing.allocator, &.{l.fd}, &.{}, 1);
+    defer w.stop(std.testing.allocator);
+    w.release("the test ends on an error");
+    try std.testing.expectEqual(@as(usize, 0), w.n_rings);
+    t.join();
+    var waited: u32 = 0;
+    while (!w.lost.load(.acquire) and waited < 40) : (waited += 1) {
+        const ts: std.c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    // an error is no orderly stop: the watch still acts on the peer's end
     try std.testing.expect(w.lost.load(.acquire));
 }
 
