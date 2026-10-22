@@ -202,7 +202,8 @@ fn candidateBefore(_: void, a: Candidate, b: Candidate) bool {
 /// reaches ceil(top_p * total); min_p keeps the prefix within ln(min_p) of the top; the token is the first best
 /// scaled + Gumbel score of the kept prefix. Without a top_p cut and min_p, every token of the row is kept.
 /// The whole row is on the host here, so the rule needs no candidate count (the Python one reads 1024 a rank first;
-/// its result is the same). Mass uses libm's exp; the Python rule uses torch's CUDA exp, which can differ in the last
+/// its result is the same). Like it, this one first keeps the best 1,024 tokens with mass in a bounded heap and sorts
+/// only those; a nucleus that is longer (a flat row) sorts every token with mass. Mass uses libm's exp; the Python rule uses torch's CUDA exp, which can differ in the last
 /// bit, so a token at a mass edge can differ from the Python engine; drafted and serial runs here use this one rule.
 pub fn nucleusRow(row: []const f32, position: u64, s: Sampling) !i64 {
     const t = @max(s.temperature, 1e-6);
@@ -228,35 +229,93 @@ pub fn nucleusRow(row: []const f32, position: u64, s: Sampling) !i64 {
         }
         return @intCast(best orelse argmax(row));
     }
-    // the tokens with mass (a prefix of the order: mass falls with the value), sorted; the cut ends among them
+    // One pass: the row's total mass, and the best top_cap tokens with mass in a bounded heap (the worst one on top).
+    // The cut nearly always ends among them, so the full row needs no sort.
     var total: u64 = 0;
     var n: usize = 0;
-    for (row) |x| {
-        const m: u64 = @intFromFloat(@floor(exp(@as(f64, x) / t - top) * mass_unit));
-        total += m;
-        if (m > 0) n += 1;
-    }
-    const cands = try std.heap.page_allocator.alloc(Candidate, n);
-    defer std.heap.page_allocator.free(cands);
-    var i: usize = 0;
+    var heap: [top_cap]Candidate = undefined;
+    var hn: usize = 0;
     for (row, 0..) |x, j| {
         const v = @as(f64, x) / t;
         const m: u64 = @intFromFloat(@floor(exp(v - top) * mass_unit));
+        total += m;
         if (m == 0) continue;
-        cands[i] = .{ .v = v, .id = @intCast(j), .mass = m };
-        i += 1;
+        n += 1;
+        const c = Candidate{ .v = v, .id = @intCast(j), .mass = m };
+        if (hn < top_cap) {
+            heap[hn] = c;
+            hn += 1;
+            heapUp(heap[0..hn], hn - 1);
+        } else if (candidateBefore({}, c, heap[0])) {
+            heap[0] = c;
+            heapDown(heap[0..hn], 0);
+        }
     }
-    std.mem.sort(Candidate, cands, {}, candidateBefore);
     const need = massNeed(s.top_p, total);
-    var keep: usize = cands.len;
+    std.mem.sort(Candidate, heap[0..hn], {}, candidateBefore);
+    var cands: []Candidate = heap[0..hn];
+    var owned = false;
+    defer if (owned) std.heap.page_allocator.free(cands);
+    var keep = cutLength(cands, need);
+    if (keep == null and n > hn) {
+        // the nucleus is longer than top_cap (a flat row): sort every token with mass
+        cands = try std.heap.page_allocator.alloc(Candidate, n);
+        owned = true;
+        var i: usize = 0;
+        for (row, 0..) |x, j| {
+            const v = @as(f64, x) / t;
+            const m: u64 = @intFromFloat(@floor(exp(v - top) * mass_unit));
+            if (m == 0) continue;
+            cands[i] = .{ .v = v, .id = @intCast(j), .mass = m };
+            i += 1;
+        }
+        std.mem.sort(Candidate, cands, {}, candidateBefore);
+        keep = cutLength(cands, need);
+    }
+    return drawNucleus(row, cands, keep orelse cands.len, floor, position, s);
+}
+
+/// The candidates held for the top_p cut at most (the bounded heap's size).
+const top_cap = 1024;
+
+/// The shortest prefix of `cands` (in order) whose mass reaches `need`, or null when all of them do not.
+fn cutLength(cands: []const Candidate, need: u64) ?usize {
     var acc: u64 = 0;
     for (cands, 0..) |c, j| {
         acc += c.mass;
-        if (acc >= need) {
-            keep = j + 1;
-            break;
-        }
+        if (acc >= need) return j + 1;
     }
+    return null;
+}
+
+/// The heap's order: the worst candidate (the last in the sort order) at the root.
+fn heapUp(h: []Candidate, start: usize) void {
+    var i = start;
+    while (i > 0) {
+        const p = (i - 1) / 2;
+        if (!candidateBefore({}, h[p], h[i])) break;
+        std.mem.swap(Candidate, &h[p], &h[i]);
+        i = p;
+    }
+}
+
+fn heapDown(h: []Candidate, start: usize) void {
+    var i = start;
+    while (true) {
+        var w = i;
+        const l = 2 * i + 1;
+        const r = l + 1;
+        if (l < h.len and candidateBefore({}, h[w], h[l])) w = l;
+        if (r < h.len and candidateBefore({}, h[w], h[r])) w = r;
+        if (w == i) return;
+        std.mem.swap(Candidate, &h[w], &h[i]);
+        i = w;
+    }
+}
+
+/// min_p over the first `keep` of the sorted `cands`, then the first best scaled + Gumbel score among them.
+fn drawNucleus(row: []const f32, cands: []const Candidate, keep_in: usize, floor: f64, position: u64, s: Sampling) i64 {
+    var keep = keep_in;
     if (s.min_p > 0.0) {
         var within: usize = 0;
         for (cands[0..keep]) |c| {
@@ -356,4 +415,45 @@ test "top candidates by value, then id" {
     try std.testing.expectEqual(@as(usize, 4), topCandidates(&row, 4, &v, &ids));
     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 5, 2 }, &ids);
     try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 3 }, &v);
+}
+
+/// The first nucleus rule: every token with mass sorted at once (the reference for the heap-first rule above).
+fn nucleusRowSorted(row: []const f32, position: u64, s: Sampling) !i64 {
+    const t = @max(s.temperature, 1e-6);
+    var top: f64 = -std.math.inf(f64);
+    for (row) |x| top = @max(top, @as(f64, x) / t);
+    const floor = if (s.min_p > 0.0) top + log(s.min_p) else -std.math.inf(f64);
+    var cands = std.ArrayList(Candidate).empty;
+    defer cands.deinit(std.testing.allocator);
+    var total: u64 = 0;
+    for (row, 0..) |x, j| {
+        const v = @as(f64, x) / t;
+        const m: u64 = @intFromFloat(@floor(exp(v - top) * mass_unit));
+        total += m;
+        if (m > 0) try cands.append(std.testing.allocator, .{ .v = v, .id = @intCast(j), .mass = m });
+    }
+    std.mem.sort(Candidate, cands.items, {}, candidateBefore);
+    const keep = cutLength(cands.items, massNeed(s.top_p, total)) orelse cands.items.len;
+    return drawNucleus(row, cands.items, keep, floor, position, s);
+}
+
+test "nucleus: the heap-first rule draws as the full sort does, peaked and flat rows" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    const row = try std.testing.allocator.alloc(f32, 6000);
+    defer std.testing.allocator.free(row);
+    // spread 0.2: a flat row (the nucleus is longer than top_cap); 4: a medium row; 30: a peaked row
+    for ([_]f32{ 0.2, 4.0, 30.0 }) |spread| {
+        for (0..12) |round| {
+            for (row) |*x| x.* = (rnd.float(f32) - 0.5) * spread;
+            // ties on purpose: some tokens share one value
+            for (0..40) |k| row[k * 7 + 1] = row[3];
+            for ([_]f64{ 0.5, 0.95, 0.999 }) |top_p| {
+                for ([_]f64{ 0.0, 0.05 }) |min_p| {
+                    const s = Sampling{ .seed = 9 + round, .top_k = 0, .top_p = top_p, .min_p = min_p, .temperature = 1.0 };
+                    try std.testing.expectEqual(try nucleusRowSorted(row, round, s), try nucleusRow(row, round, s));
+                }
+            }
+        }
+    }
 }
