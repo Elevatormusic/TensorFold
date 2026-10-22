@@ -448,6 +448,29 @@ pub const Model = struct {
     fn synchronize(m: *Model) !void {
         try m.stream.synchronize();
         if (m.neighbor_gather) |*ng| try ng.check();
+        // a ring aborted while this work ran (a peer gone, peer_watch.zig): its collects left their waits and may have
+        // copied stale peer slots, so the results of this work must not be used
+        var buf: [6]*rdma.Ring = undefined;
+        if (rdma.anyFailed(m.rdmaRings(&buf))) return error.RdmaTransportFailed;
+    }
+
+    /// Every RDMA ring that a GPU wait of this rank reads: TP2's ring, world 4's three rings (ring2d.zig), and the
+    /// neighbor gather's two (neighbor.zig). The peer watch aborts these; synchronize checks them.
+    pub fn rdmaRings(m: *Model, buf: *[6]*rdma.Ring) []*rdma.Ring {
+        var k: usize = 0;
+        if (m.ring) |r| {
+            buf[k] = r;
+            k += 1;
+        }
+        if (m.rdma_rings) |rr| for ([_]*rdma.Ring{ rr.all4, rr.col, rr.pair }) |r| {
+            buf[k] = r;
+            k += 1;
+        };
+        if (m.neighbor_gather) |ng| for ([_]*rdma.Ring{ ng.first, ng.second }) |r| {
+            buf[k] = r;
+            k += 1;
+        };
+        return buf[0..k];
     }
 
     /// TP2's RDMA ring for the decode gathers: created on both ranks, the queue-pair infos exchanged over NCCL,
