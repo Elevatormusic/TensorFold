@@ -291,10 +291,11 @@ const Loader = struct {
         return L.upload(tensor, try L.entry(try plan.plainKey(&kb, tensor, dtype)));
     }
 
-    /// The MTP markov head, which the kernel reads as fp16: a pack that holds it in bf16 (the 1017 checkpoint's own
-    /// dtype; the converter casts it to f16, a community quant may not) is converted exactly at load, and an f16 head
-    /// is uploaded as it is. The cache key stays the checkpoint's own dtype, so no rank cache is invalidated.
-    fn markovHead(L: *Loader, tensor: []const u8) !u64 {
+    /// A plain tensor the kernels read as fp16 (the MTP markov head, the DSpark confidence head): a pack that holds it
+    /// in bf16 (the 1017 checkpoint's own dtype; the converter casts it to f16, the 2.8 bpw pack does not) is converted
+    /// exactly at load, and an f16 tensor is uploaded as it is. The cache key stays the checkpoint's own dtype, so no
+    /// rank cache is invalidated.
+    fn halfAtLoad(L: *Loader, tensor: []const u8) !u64 {
         var kb: [256]u8 = undefined;
         const key = try plan.plainKey(&kb, tensor, null);
         const src = try L.entry(key);
@@ -638,8 +639,8 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
             .main_norm = try L.plain("mtp.0.main_norm.weight", null),
             .norm = try L.plain(try std.fmt.bufPrint(&tb, "{s}.norm.weight", .{last}), null),
             .markov_embed = try L.plain(try std.fmt.bufPrint(&tb, "{s}.markov_head.embed.weight", .{last}), null),
-            .markov_head = try L.markovHead(try std.fmt.bufPrint(&tb, "{s}.markov_head.head.weight", .{last})),
-            .conf = try L.plain(try std.fmt.bufPrint(&tb, "{s}.confidence_head.proj.weight", .{last}), null),
+            .markov_head = try L.halfAtLoad(try std.fmt.bufPrint(&tb, "{s}.markov_head.head.weight", .{last})),
+            .conf = try L.halfAtLoad(try std.fmt.bufPrint(&tb, "{s}.confidence_head.proj.weight", .{last})),
         };
     }
     if (L.span_bytes > 0) std.log.info("rank cache: {d:.1} GiB of expert entries read whole in {d:.1} s", .{ @as(f64, @floatFromInt(L.span_bytes)) / (1 << 30), @as(f64, @floatFromInt(L.span_ns)) / 1e9 });
