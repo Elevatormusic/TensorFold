@@ -70,7 +70,8 @@ pub const Link = struct {
     fn writeAll(l: Link, bytes: []const u8) !void {
         var done: usize = 0;
         while (done < bytes.len) {
-            const n = c.send(l.fd, bytes.ptr + done, bytes.len - done, 0);
+            // NOSIGNAL: a send to a gone peer fails with PeerDown (no SIGPIPE, which would end the rank with no exit 75)
+            const n = c.send(l.fd, bytes.ptr + done, bytes.len - done, c.MSG.NOSIGNAL);
             if (n <= 0) {
                 if (n < 0 and c.errno(n) == .INTR) continue;
                 return error.PeerDown;
