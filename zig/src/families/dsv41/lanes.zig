@@ -912,8 +912,7 @@ fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*pe
         k += 1;
     };
     return peer_watch.Watch.start(gpa, fds[0..n], rings[0..k], m.rank) catch |err| {
-        std.debug.print("[tensorfold] the peer link watch did not start ({s})
-", .{@errorName(err)});
+        std.debug.print("[tensorfold] the peer link watch did not start ({s})\n", .{@errorName(err)});
         return null;
     };
 }
