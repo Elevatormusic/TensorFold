@@ -51,6 +51,7 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
     var scratch: Cx = .{ .a = cx.a };
     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
     const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object) or DSML calls, and this one does not: send \"auto\"");
+    if (s == .dsml41 and !try dsmlNamesOk(cx.a, tools)) return cx.refuse("tool_choice \"required\" or a named function cannot write a tool or argument name with a double quote in a DSML call: send \"auto\"");
     const text = try build(cx.a, s, tools, parallel);
     return srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
 }
@@ -100,38 +101,92 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
     return node(a, "sequence", &.{.{ "elements", elements }});
 }
 
-/// One DSML invoke: the name, each required argument in the schema's order, then any optional ones, the close. A
-/// string argument is the template's string="true" form (text up to the parameter's close); any other is string="false"
-/// with its value as JSON in the property's schema (tool_parse.zig dsml41Calls reads both).
+/// One DSML invoke: the name, each required argument in the schema's order, then each optional one at most once (in the
+/// schema's order), the close. A plain string argument is the template's string="true" form (text up to the parameter's
+/// close); any other is string="false" with its value as JSON in the property's schema, a string that has enum, const,
+/// pattern or length limits too (tool_parse.zig dsml41Calls reads both). A schema that is more than direct
+/// `properties` (a $ref, allOf, anyOf, oneOf, patternProperties, a schema for additionalProperties, or a required name
+/// no property declares) goes whole to xgrammar's own DeepSeek-V4.1 parameter style.
 fn dsmlInvoke(a: Allocator, name: []const u8, schema: Value) Allocator.Error!Value {
     const ws = try node(a, "regex", &.{.{ "pattern", .{ .string = blanks } }});
     var parts: std.ArrayList(Value) = .empty;
     try parts.append(a, try constant(a, try std.fmt.allocPrint(a, "<" ++ dsml ++ " invoke name=\"{s}\">", .{name})));
     const props: ?Value = if (schema.get("properties")) |pv| (if (pv == .object) pv else null) else null;
-    var required: std.ArrayList([]const u8) = .empty;
-    if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string) try required.append(a, x.string);
-    if (props) |ps| {
+    if (needsFullSchema(schema, props)) {
+        try parts.appendSlice(a, &.{ ws, try arguments(a, schema, "deepseek_v4_1_xml") });
+    } else if (props) |ps| {
+        var required: std.ArrayList([]const u8) = .empty;
+        if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string) try required.append(a, x.string);
         // the required arguments in order, each once
         for (ps.object.keys(), ps.object.values()) |k, v| {
             if (!contains(required.items, k)) continue;
             try parts.appendSlice(a, &.{ ws, try dsmlParameter(a, k, v) });
         }
-        // the optional ones: each may come, after the required ones
+        // the optional ones: each may come once, after the required ones
         for (ps.object.keys(), ps.object.values()) |k, v| {
             if (contains(required.items, k)) continue;
             const one = try node(a, "sequence", &.{.{ "elements", try list(a, &.{ ws, try dsmlParameter(a, k, v) }) }});
-            try parts.append(a, try node(a, "star", &.{.{ "content", one }}));
+            try parts.append(a, try node(a, "or", &.{.{ "elements", try list(a, &.{ one, try constant(a, "") }) }}));
         }
     }
     try parts.appendSlice(a, &.{ ws, try constant(a, "</" ++ dsml ++ " invoke>") });
     return .{ .array = parts.items };
 }
 
+/// Whether the call's arguments need more than the direct `properties` of the parameter schema.
+fn needsFullSchema(schema: Value, props: ?Value) bool {
+    for ([_][]const u8{ "$ref", "allOf", "anyOf", "oneOf", "patternProperties" }) |k| if (schema.get(k) != null) return true;
+    if (schema.get("additionalProperties")) |ap| if (ap == .object) return true;
+    if (schema.get("required")) |r| if (r == .array) for (r.array) |x| {
+        if (x != .string) continue;
+        if (props == null or props.?.get(x.string) == null) return true;
+    };
+    return false;
+}
+
+/// The schema keywords that describe a string without limiting it.
+const plain_keywords = [_][]const u8{ "type", "description", "title", "default", "examples", "example", "$comment", "deprecated", "readOnly", "writeOnly" };
+
+/// A string schema with nothing but its type and notes: its value is raw text. enum, const, pattern, minLength,
+/// maxLength, format and the rest limit it, and only the JSON form carries those limits.
+fn plainString(schema: Value) bool {
+    const t = schema.get("type") orelse return false;
+    if (t != .string or !std.mem.eql(u8, t.string, "string")) return false;
+    for (schema.object.keys()) |k| if (!contains(&plain_keywords, k)) return false;
+    return true;
+}
+
 fn dsmlParameter(a: Allocator, key_name: []const u8, schema: Value) Allocator.Error!Value {
-    const is_string = if (schema.get("type")) |t| (t == .string and std.mem.eql(u8, t.string, "string")) else false;
+    const is_string = plainString(schema);
     const begin = try std.fmt.allocPrint(a, "<" ++ dsml ++ " parameter name=\"{s}\" string=\"{s}\">", .{ key_name, if (is_string) "true" else "false" });
     const content = if (is_string) try node(a, "regex", &.{.{ "pattern", .{ .string = string_value } }}) else try arguments(a, schema, "json");
     return node(a, "tag", &.{ .{ "begin", .{ .string = begin } }, .{ "content", content }, .{ "end", .{ .string = "</" ++ dsml ++ " parameter>" } } });
+}
+
+/// DSML writes a name inside double quotes and dsml41Calls ends it at the first one: a name with a quote cannot be a call.
+fn quoteFree(name: []const u8) bool {
+    return std.mem.indexOfScalar(u8, name, '"') == null;
+}
+
+/// Whether the schema's argument names (its `properties` keys, also in allOf, anyOf, oneOf and $defs) can be DSML attributes.
+fn argNamesOk(schema: Value) bool {
+    if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!quoteFree(k)) return false;
+    for ([_][]const u8{ "allOf", "anyOf", "oneOf" }) |kw| if (schema.get(kw)) |members| if (members == .array) for (members.array) |m| {
+        if (m == .object and !argNamesOk(m)) return false;
+    };
+    for ([_][]const u8{ "$defs", "definitions" }) |kw| if (schema.get(kw)) |defs| if (defs == .object) for (defs.object.values()) |m| {
+        if (m == .object and !argNamesOk(m)) return false;
+    };
+    return true;
+}
+
+/// Whether every offered tool name and argument name can be written in DSML attributes.
+fn dsmlNamesOk(a: Allocator, tools: []const Value) Allocator.Error!bool {
+    for (tools) |t| {
+        if (!quoteFree(try tool_specs.toolName(a, t))) return false;
+        if (!argNamesOk(try parameters(a, t))) return false;
+    }
+    return true;
 }
 
 fn contains(names: []const []const u8, name: []const u8) bool {
@@ -206,8 +261,48 @@ test "a DSML required call: one calls block, the invoke's name, string and JSON 
     // a string value is the regex that keeps end-tag look-alikes out, not any text
     try std.testing.expect(std.mem.indexOf(u8, g, "\"type\":\"any_text\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, g, "\"type\":\"regex\",\"pattern\":\"([^<]|<(") != null);
-    // the optional unit may come after the required ones (a star); one call without parallel: the star is the unit's
+    // the optional unit may come once, after the required ones (an or with an empty choice, not a star)
     const unit = std.mem.indexOf(u8, g, "parameter name=\\\"unit\\\"").?;
     try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"days\\\"").? < unit);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, g, "\"type\":\"star\""));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, g, "\"type\":\"star\""));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, g, "{\"type\":\"const_string\",\"value\":\"\"}"));
+}
+
+test "a DSML string argument with enum, pattern or length limits is a JSON value in its schema" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"properties\": {\"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}, \"city\": {\"type\": \"string\", \"description\": \"a city\"}, \"code\": {\"type\": \"string\", \"maxLength\": 3}}, \"required\": [\"unit\", \"city\", \"code\"]}}}]")).ok;
+    const g = try build(a, .dsml41, tools.array, false);
+    try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"unit\\\" string=\\\"false\\\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "\"enum\":[\"celsius\",\"fahrenheit\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"code\\\" string=\\\"false\\\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "\"maxLength\":3") != null);
+    // a string with only a note stays raw text
+    try std.testing.expect(std.mem.indexOf(u8, g, "parameter name=\\\"city\\\" string=\\\"true\\\">") != null);
+}
+
+test "a DSML schema that is not direct properties goes whole to the DeepSeek-V4.1 parameter style" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"r\", \"parameters\": {\"$ref\": \"#/$defs/args\", \"$defs\": {\"args\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"m\", \"parameters\": {\"type\": \"object\", \"additionalProperties\": {\"type\": \"integer\"}}}}, {\"type\": \"function\", \"function\": {\"name\": \"d\", \"parameters\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"integer\"}}, \"required\": [\"x\"]}}}]")).ok;
+    const g = try build(a, .dsml41, tools.array, false);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, g, "\"style\":\"deepseek_v4_1_xml\""));
+    // the direct-properties tool keeps the hand-written parameter
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, g, "parameter name=\\\"x\\\" string=\\\"false\\\">"));
+}
+
+test "a DSML name with a double quote is refused, not written as a broken attribute" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fine = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}}}]")).ok;
+    try std.testing.expect(try dsmlNamesOk(a, fine.array));
+    const tool = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"a\\\"b\"}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, tool.array));
+    const prop = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\\\"b\": {\"type\": \"string\"}}}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, prop.array));
+    const nested = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"allOf\": [{\"type\": \"object\", \"properties\": {\"a\\\"b\": {\"type\": \"string\"}}}]}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, nested.array));
 }
