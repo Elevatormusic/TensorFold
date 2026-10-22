@@ -900,22 +900,9 @@ fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) ?*pe
         n += 1;
     };
     if (n == 0) return null;
-    // every ring a GPU wait of this rank reads: TP2's, world 4's three, or the neighbor gather's two
+    // every ring a GPU wait of this rank reads (the same list that Model.synchronize checks)
     var rings: [6]*rdma.Ring = undefined;
-    var k: usize = 0;
-    if (m.ring) |r| {
-        rings[k] = r;
-        k += 1;
-    }
-    if (m.rdma_rings) |rr| for ([_]*rdma.Ring{ rr.all4, rr.col, rr.pair }) |r| {
-        rings[k] = r;
-        k += 1;
-    };
-    if (m.neighbor_gather) |ng| for ([_]*rdma.Ring{ ng.first, ng.second }) |r| {
-        rings[k] = r;
-        k += 1;
-    };
-    return peer_watch.Watch.start(gpa, fds[0..n], rings[0..k], m.rank) catch |err| {
+    return peer_watch.Watch.start(gpa, fds[0..n], m.rdmaRings(&rings), m.rank) catch |err| {
         std.debug.print("[tensorfold] the peer link watch did not start ({s})\n", .{@errorName(err)});
         return null;
     };

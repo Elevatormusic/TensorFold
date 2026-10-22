@@ -502,6 +502,12 @@ pub const Ring = struct {
     }
 };
 
+/// True when one of `rings` failed or was aborted: the work that waited on it may hold stale peer data.
+pub fn anyFailed(rings: []const *Ring) bool {
+    for (rings) |r| if (r.failure() != null) return true;
+    return false;
+}
+
 fn postRecv(ctx: *vabi.Context, qp: *vabi.Qp) Error!void {
     var wr: vabi.RecvWr = .{};
     var bad: ?*vabi.RecvWr = null;
@@ -545,4 +551,26 @@ test "a failed neighbor stage releases both local stages' device waits" {
     try std.testing.expectEqualStrings("peer failed", second.failure().?);
     try std.testing.expectEqual(@as(u64, 1), first.abortWord().*);
     try std.testing.expectEqual(@as(u64, 1), second.abortWord().*);
+}
+
+test "anyFailed finds a ring that the peer watch aborted" {
+    var rings: [3]Ring = undefined;
+    var meta0: [32]u64 align(std.heap.page_size_min) = @splat(0);
+    var meta1: [32]u64 align(std.heap.page_size_min) = @splat(0);
+    var meta2: [32]u64 align(std.heap.page_size_min) = @splat(0);
+    var ptrs: [3]*Ring = undefined;
+    for (&rings, [_][]u64{ &meta0, &meta1, &meta2 }, &ptrs) |*r, meta, *p| {
+        r.s.slots = 4;
+        r.world = 2;
+        r.meta.mem = @alignCast(std.mem.sliceAsBytes(meta));
+        r.failed = .init(false);
+        r.why = @splat(0);
+        r.failure_peer = null;
+        p.* = r;
+    }
+    try std.testing.expect(!anyFailed(&ptrs));
+    try std.testing.expect(!anyFailed(&.{}));
+    rings[2].abort("a peer rank is gone (its link closed)");
+    try std.testing.expect(anyFailed(&ptrs));
+    try std.testing.expect(!anyFailed(ptrs[0..2]));
 }
