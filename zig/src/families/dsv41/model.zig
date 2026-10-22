@@ -448,8 +448,12 @@ pub const Model = struct {
     fn synchronize(m: *Model) !void {
         try m.stream.synchronize();
         if (m.neighbor_gather) |*ng| try ng.check();
-        // a ring aborted while this work ran (a peer gone, peer_watch.zig): its collects left their waits and may have
-        // copied stale peer slots, so the results of this work must not be used
+        try m.ringsOk();
+    }
+
+    /// After a stream sync, before its results are used: a ring aborted while the work ran (a peer gone,
+    /// peer_watch.zig) made its collects leave their waits, maybe with stale peer slots, so the work fails.
+    fn ringsOk(m: *Model) !void {
         var buf: [6]*rdma.Ring = undefined;
         if (rdma.anyFailed(m.rdmaRings(&buf))) return error.RdmaTransportFailed;
     }
@@ -854,5 +858,7 @@ pub const Model = struct {
         const pool = &m.dpool.?;
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+        // the drafter syncs its stream itself (draft.zig), so its drafts get the same ring check as synchronize
+        try m.ringsOk();
     }
 };
