@@ -452,6 +452,7 @@ class App:
         """One reply; once ``cancelled()`` holds, a waiting request raises ``RequestCancelled`` unstarted, a running one stops at its next round and raises it after ``generate``."""
 
         arrived = time.perf_counter()
+        request_id = f"req-{uuid.uuid4().hex[:12]}"        # the id of the ``done`` line and of the tool-call warnings
         prepared = prepared if prepared is not None else self.prepare(body, chat)
         prompt, max_tokens = prepared.prompt, prepared.max_tokens
         tools, thinking = prepared.tools, prepared.thinking
@@ -486,7 +487,7 @@ class App:
                 if policy.single:             # one-call mode also hides the namespaced tool_call blocks
                     answer = policy.content(answer, finished=finished)
             else:                                 # TF_DROP_UNOFFERED_TOOL_CALLS=1: every call is unoffered
-                answer = answer_without_tools(answer, finished=finished)
+                answer = answer_without_tools(answer, finished=finished, request_id=request_id)
             return reasoning, answer
 
         serving: list[Any] = [None]
@@ -616,7 +617,8 @@ class App:
         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
         text = stops.visible(raw_text)
         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
-        content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+        content, calls = (parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls, request_id=request_id)
+                          if tools else (answer, None))
         content = policy.content(content) if tools else content
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
         if tail:
@@ -629,7 +631,7 @@ class App:
             print(f"[tensorfold] loop guard: the reasoning stopped saying anything new; thinking closed after "
                   f"{reasoning_count(out, loop.think_end)} reasoning tokens", flush=True)
             stats = {**stats, "loop_guard": True}
-        print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request)
+        print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request, request_id)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
@@ -715,14 +717,15 @@ def token_sha(tokens: list[int]) -> str:
 
 
 def print_done(prompt: int, cached: int, thinking: bool, out: list[int], finish: str, stats: dict[str, Any],
-               request: Any) -> None:
+               request: Any, request_id: str = "") -> None:
     """The Mac server's ``done`` line for a finished reply; tok/s runs from the first token to the last."""
 
     ended = time.perf_counter()
     first, started = getattr(request, "first", None), getattr(request, "started", ended)
     decode = ended - first if first is not None else 0.0
     rate = (len(out) - 1) / decode if decode > 0 and len(out) > 1 else 0.0
-    print(f"[tensorfold] done req-{uuid.uuid4().hex[:12]} prompt={prompt} cached={cached} thinking={thinking} "
+    request_id = request_id or f"req-{uuid.uuid4().hex[:12]}"
+    print(f"[tensorfold] done {request_id} prompt={prompt} cached={cached} thinking={thinking} "
           f"tokens={len(out)} sha={token_sha(out)} finish={finish} tok/s={rate:.1f} "
           f"ttft={(first - started) if first is not None else -1:.2f}s prefill={stats.get('prefill_s', -1):.2f}s "
           f"rounds={stats.get('rounds', 0)} accepted={stats.get('accepted', 0)}/{stats.get('drafted', 0)}",

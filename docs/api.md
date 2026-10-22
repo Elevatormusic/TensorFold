@@ -182,10 +182,17 @@ inside an argument value is argument text. A block that is not well formed is no
 holds for the whole reply, for the stream, and with `TF_DROP_UNOFFERED_TOOL_CALLS=1`. A value ends at its closing tag,
 and a complete block of the same kind inside it is skipped; so is a complete `<tool_call>` block inside a `<tool_call>` block. A lone closing tag in a value therefore makes the block
 not well formed, and the call does not run. A streamed XML call closes its arguments only when its `</tool_call>` arrives, so a call
-that stops before it never has complete arguments. When a block that does not count keeps a later call as text,
-the server prints one `WARNING` line for the reply (the reason and the character offset, no reply text) and
-counts it in `tensorfold:tool_calls_suppressed_total{reason=...}` on `/metrics`. The reasons are
-`open_tool_call_tag`, `open_dsml_block` and `ill_formed_dsml_block`.
+that stops before it never has complete arguments. Every tool-call block that is removed from a reply or kept in it as
+text, and does not run, is told in the server log and counted, streamed or not. Each block has one `WARNING` line (at
+most five lines for one reply, then one line with the number of the rest) with the request id (the id of the `done`
+line), the action (`was removed from the reply` or `was kept in the reply as text`), the reason, the length in
+characters and the character where it begins, never the text of the block or its arguments. Each block adds one to
+`tensorfold:tool_calls_suppressed_total{reason=...}` on `/metrics`. The reasons are `open_dsml_block` (the reply ended
+inside a DSML `calls` block; removed), `open_tool_call_tag` (a `<tool_call>` tag that never closed and holds a
+complete call; a lone tag with no call in it is plain text and is not told), `ill_formed_dsml_block`,
+`unoffered_tool_call` (a whole call to a tool the request did not offer), `unresolved_tool_call` (a call with no usable
+name or arguments), `extra_call_removed` (`parallel_tool_calls: false` and the reply made more than one call) and
+`markup_without_tools` (`TF_DROP_UNOFFERED_TOOL_CALLS=1` and a request with no tools).
 
 With `parallel_tool_calls: false`, the server buffers tool deltas until it can return the first valid
 completed call. Prose and reasoning can still stream. Usage counts the entire decoded reply, including
@@ -326,8 +333,8 @@ over `generation_tokens_total` is the decode rate), all under the `tensorfold:` 
 `tensorfold:` prefix for the metric name. `client_disconnections_total` (requests the client walked away from)
 and `preemptions_total` (background work that gave up a lane to a later request) are published where the
 server counts those events, and never at a fabricated zero.
-`tool_calls_suppressed_total{reason=...}` (replies where a block that does not count kept a later tool call
-as text) appears once the CUDA server has counted one.
+`tool_calls_suppressed_total{reason=...}` (tool-call blocks that were removed from a reply or kept in it as text and
+did not run) appears once the CUDA server has counted one.
 
 ## The Responses API
 
