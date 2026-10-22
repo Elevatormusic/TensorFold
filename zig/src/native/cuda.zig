@@ -477,6 +477,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision) else null,
         .lane_vision = if (@hasField(@TypeOf(loaded), "lane_vision")) loaded.lane_vision else null,
         .efforts = familyEfforts(F),
+        .plain_message_text = @hasDecl(F, "plain_assistant_keep"),
+        .plain_assistant_keep = if (@hasDecl(F, "plain_assistant_keep")) F.plain_assistant_keep else &.{},
     }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };

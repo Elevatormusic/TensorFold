@@ -261,6 +261,10 @@ pub const Info = struct {
     /// A lane-vision family's image input (LaneVision: each image part its placeholder, the family's prepare its span);
     /// null: none (upstream's image input is `vision`).
     lane_vision: ?LaneVision = null,
+    /// An added-token spelling in request text is plain text, not its token (server/plain_text.zig; DeepSeek's encoding).
+    plain_message_text: bool = false,
+    /// With plain_message_text: the spellings that stay tokens in an assistant's content and reasoning.
+    plain_assistant_keep: []const []const u8 = &.{},
     /// A prompt-only request (max_tokens 0) keeps its end state: the server prefills each reply for the next turn.
     warm_turns: bool = false,
     /// The engine decodes plain whatever a request asks: no drafter loaded, or this chip is faster plain.

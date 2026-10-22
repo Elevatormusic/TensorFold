@@ -161,6 +161,63 @@ pub const Tokenizer = struct {
         return a.dupe(u32, ids.items);
     }
 
+    /// What encodeCut does to the text between two cuts before it encodes it: a shielded request's markers spelled again.
+    pub const Restore = struct {
+        ctx: *const anyopaque,
+        spelled: *const fn (ctx: *const anyopaque, a: Allocator, text: []const u8) Allocator.Error![]const u8,
+    };
+
+    /// Ids of a rendered prompt as Python's PlainText.encode makes them: each added token that `text` spells exactly
+    /// is a cut and its token; the text between two cuts, after `restore`, is encoded with no added token matched.
+    pub fn encodeCut(t: *const Tokenizer, a: Allocator, text: []const u8, restore: Restore) Error![]u32 {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+        var valid = text;
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            var fixed: std.ArrayList(u8) = .empty;
+            try unicode.appendLossy(&fixed, ctx.a, text);
+            valid = fixed.items;
+        }
+        var ids: std.ArrayList(u32) = .empty;
+        var at: usize = 0;
+        // the raw trie's tokens, then the normalized trie's in the text between them, both on the text as written
+        for (try t.splitAdded(&ctx, &t.raw, valid)) |seg| {
+            if (seg.id) |id| {
+                if (!t.spells(valid[seg.start..seg.end], id)) continue;
+                try t.encodeRegion(&ctx, valid[at..seg.start], restore, &ids);
+                try ids.append(ctx.a, id);
+                at = seg.end;
+                continue;
+            }
+            for (try t.splitAdded(&ctx, &t.normalized, valid[seg.start..seg.end])) |sub| {
+                const id = sub.id orelse continue;
+                if (!t.spells(valid[seg.start + sub.start .. seg.start + sub.end], id)) continue; // found through a strip: plain text
+                try t.encodeRegion(&ctx, valid[at .. seg.start + sub.start], restore, &ids);
+                try ids.append(ctx.a, id);
+                at = seg.start + sub.end;
+            }
+        }
+        try t.encodeRegion(&ctx, valid[at..], restore, &ids);
+        return a.dupe(u32, ids.items);
+    }
+
+    /// Whether `span` is the added token `id`'s own text.
+    fn spells(t: *const Tokenizer, span: []const u8, id: u32) bool {
+        return std.mem.eql(u8, span, t.id_to_token.get(id) orelse return false);
+    }
+
+    /// One region of encodeCut: restored, then encoded as its own text (Python's plain tokenizer on each region).
+    fn encodeRegion(t: *const Tokenizer, ctx: *steps.Context, region: []const u8, restore: Restore, ids: *std.ArrayList(u32)) Error!void {
+        if (region.len == 0) return;
+        const text = try restore.spelled(restore.ctx, ctx.a, region);
+        if (text.len == 0) return;
+        // text that spells no added token encodes the same with or without them: the memo's ids are good
+        const plain = t.raw.next(text, 0) == null and t.normalized.next(text, 0) == null and (t.normalizer == null or t.normalizer.?.isIdentity());
+        if (plain and t.memo != null and text.len >= @import("memo.zig").min_bytes) return t.encodeSegment(ctx, text, true, ids);
+        return t.encodeTextWith(ctx, text, true, ids, false);
+    }
+
     fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
         return t.encodeTextWith(ctx, text, first, ids, true);
     }
@@ -384,6 +441,38 @@ test "byte-level BPE with merges, added tokens and decode" {
     const unknown = (try t.tokenBytes(a, 99)).?;
     defer a.free(unknown);
     try std.testing.expectEqualStrings("", unknown);
+}
+
+test "a cut encode: the text's own added tokens are tokens, the restored text between them is plain text" {
+    const json =
+        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        \\  {"id":8,"content":"<t>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],
+        \\ "normalizer":{"type":"Sequence","normalizers":[]},
+        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        \\ "decoder":{"type":"ByteLevel"},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6,"<":9,"t":10,">":11},"merges":[["Ġ","a"],"a b","Ġa b"]}}
+    ;
+    const a = std.testing.allocator;
+    var t = try parse(a, json);
+    defer t.deinit();
+    const Marks = struct {
+        fn spelled(_: *const anyopaque, al: Allocator, text: []const u8) Allocator.Error![]const u8 {
+            return std.mem.replaceOwned(u8, al, text, "@0@", "<t>");
+        }
+    };
+    const restore: Tokenizer.Restore = .{ .ctx = &t, .spelled = Marks.spelled };
+    const ids = try t.encodeCut(a, "ab<|end|>a@0@b<t>c", restore);
+    defer a.free(ids);
+    // "<t>" from the marker is three plain tokens; the text's own "<t>" is token 8
+    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 0, 9, 10, 11, 1, 8, 6 }, ids);
+    // no marker and no added token: the same ids as encode, through the memo too
+    t.memo = try Memo.create(a, 1 << 20);
+    const plain = try t.encode(a, "ab abc");
+    defer a.free(plain);
+    const cut = try t.encodeCut(a, "ab abc", restore);
+    defer a.free(cut);
+    try std.testing.expectEqualSlices(u32, plain, cut);
 }
 
 test "with the memo, long segments encode as without it, and the second encode takes their kept ids" {
