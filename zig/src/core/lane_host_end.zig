@@ -58,11 +58,12 @@ pub fn failQueued(h: *LaneHost, message: []const u8) void {
     h.lock();
     // submissions stop first: a request that arrives during the grace sleep gets Closed, not a lost connection
     h.closing = true;
-    const jobs = h.gpa.dupe(*Job, h.queued.items) catch &.{};
-    h.queued.clearRetainingCapacity();
+    // the queue itself moves out: no allocation that could fail and drop a job
+    var taken = h.queued;
+    h.queued = .empty;
     h.unlock();
-    for (jobs) |job| h.finish(job, .failed, message);
-    h.gpa.free(jobs);
+    for (taken.items) |job| h.finish(job, .failed, message);
+    taken.deinit(h.gpa);
 }
 
 pub fn closeAll(h: *LaneHost) void {
