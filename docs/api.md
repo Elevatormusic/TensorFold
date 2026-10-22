@@ -186,7 +186,7 @@ that stops before it never has complete arguments. Every tool-call block that is
 text, and does not run, is told in the server log and counted, streamed or not. Each block has one `WARNING` line (at
 most five lines for one reply, then one line with the number of the rest) with the request id (the id of the `done`
 line), the action (`was removed from the reply` or `was kept in the reply as text`), the reason, the length in
-characters and the character where it begins, never the text of the block or its arguments. Each block adds one to
+characters and the character where it begins, never the text of the block, a tool name or an argument. Each block adds one to
 `tensorfold:tool_calls_suppressed_total{reason=...}` on `/metrics`. The reasons are `open_dsml_block` (the reply ended
 inside a DSML `calls` block; removed), `open_tool_call_tag` (a `<tool_call>` tag that never closed and holds a
 complete call; a lone tag with no call in it is plain text and is not told), `ill_formed_dsml_block`,

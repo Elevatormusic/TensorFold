@@ -486,7 +486,8 @@ class UnofferedCalls(Flag):
         with contextlib.redirect_stdout(out):
             result = parse_tool_calls("Go.\n" + calls(invoke("apply_patch", param("p", "x"))), TOOLS)
         self.assertEqual(result, ("Go.", None))
-        self.assertIn("apply_patch", out.getvalue())
+        self.assertIn("reason=unoffered_tool_call", out.getvalue())
+        self.assertNotIn("apply_patch", out.getvalue())          # the log has no tool name
 
     def test_the_flag_removes_an_open_block_and_does_not_drop_its_nested_call(self):
         self.drop()
@@ -707,10 +708,30 @@ class Suppressed(Flag):
             answer_without_tools(text, finished=False, request_id="req-abc123def456")
             self.assertEqual(out.getvalue(), "")                  # a stream that is still going says nothing
             self.assertEqual(answer_without_tools(text, finished=True, request_id="req-abc123def456"), "Go.\n Bye.")
-        self.assertIn("WARNING: req-abc123def456 dropped tool-call markup from a request that offered no tools",
+        self.assertIn("WARNING: req-abc123def456 a tool call block was removed from the reply and did not run",
                       out.getvalue())
-        self.assertIn("reason=markup_without_tools", out.getvalue())
+        self.assertIn("reason=markup_without_tools (the request offered no tools)", out.getvalue())
         self.assertEqual(suppressed_counts(), {"markup_without_tools": 1})
+
+    def test_each_block_removed_from_a_request_with_no_tools_has_its_line_and_its_count(self):
+        self.drop()
+        text = ("Go.\n" + calls(invoke("read", param("p", "x"))) + " Then " + NESTED_JSON + " and " + OPEN + "\n"
+                + "<tool_call>open")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(answer_without_tools(text, finished=True, request_id="req-abc123def456"),
+                             "Go.\n Then  and ")
+        self.assertEqual(out.getvalue().count("\n"), 3)
+        self.assertEqual(suppressed_counts(), {"markup_without_tools": 3})
+
+    def test_the_flag_caps_the_lines_for_unoffered_calls_and_counts_every_block(self):
+        self.drop()
+        text = "Go." + "".join(calls(invoke("apply_patch")) for _ in range(8))
+        (content, found), log = self.parse(text)
+        self.assertEqual((content, found), ("Go.", None))
+        self.assertEqual(log.count("\n"), 6)
+        self.assertIn("3 more tool call blocks did not run in this reply", log)
+        self.assertEqual(suppressed_counts(), {"unoffered_tool_call": 8})
 
     def test_the_flag_logs_the_dropped_call_once_with_the_request_id(self):
         self.drop()
@@ -718,8 +739,9 @@ class Suppressed(Flag):
         (content, found), log = self.parse(text)
         self.assertEqual((content, found), ("Go.", None))
         self.assertEqual(log.count("\n"), 1)
-        self.assertIn("WARNING: req-abc123def456 dropped a call to a tool the request did not offer: 'apply_patch'", log)
+        self.assertIn("WARNING: req-abc123def456 a tool call block was removed from the reply and did not run", log)
         self.assertIn("reason=unoffered_tool_call", log)
+        self.assertNotIn("apply_patch", log)
         self.assertEqual(suppressed_counts(), {"unoffered_tool_call": 1})
 
     def test_the_metrics_text_shows_the_counter_by_reason(self):

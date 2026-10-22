@@ -33,7 +33,6 @@ class Unrun(NamedTuple):
     offset: int            # character where the block begins in the reply, or -1 when the parser does not know
     length: int            # characters of the block (an open block: through the end of the reply)
     holds_call: bool = False    # an open block that holds a complete call
-    logged: bool = False        # a log line already told this block
 
 
 _WHY = {
@@ -43,28 +42,29 @@ _WHY = {
     UNOFFERED: "the call names a tool that the request did not offer",
     UNRESOLVED: "the call has no usable name or no arguments as a JSON object",
     EXTRA_CALL: "the request allows one call and the reply made more",
+    NO_TOOLS: "the request offered no tools",
 }
 _VERB = {"removed": "was removed from the reply", "kept_as_text": "was kept in the reply as text"}
 _MAX_LINES = 5                    # lines for one reply; the rest are counted and summed in one more line
 
 
 def report_unrun(events: list[Unrun], request_id: str = "") -> None:
-    """Count each block that did not run and print one ``WARNING`` line for it. The lines hold the reason, the place
-    and the length, never the text of a block or its arguments."""
+    """Count each block that did not run and print one ``WARNING`` line for it. A line holds the request id, the
+    action, the reason, the length and the place, and nothing from the reply: no text of a block, no tool name, no
+    argument."""
 
     if not events:
         return
     count_suppressed(event.reason for event in events)
     who = request_id or "req-?"
-    lines = [event for event in events if not event.logged]
-    for event in lines[:_MAX_LINES]:
+    for event in events[:_MAX_LINES]:
         where = f", at character {event.offset}" if event.offset >= 0 else ""
         holds = ", it holds a complete call" if event.holds_call else ""
         print(f"[tensorfold] WARNING: {who} a tool call block {_VERB[event.action]} and did not run: "
               f"reason={event.reason} ({_WHY[event.reason]}), length={event.length} characters{where}{holds}",
               flush=True)
-    if len(lines) > _MAX_LINES:
-        print(f"[tensorfold] WARNING: {who} {len(lines) - _MAX_LINES} more tool call blocks did not run "
+    if len(events) > _MAX_LINES:
+        print(f"[tensorfold] WARNING: {who} {len(events) - _MAX_LINES} more tool call blocks did not run "
               f"in this reply", flush=True)
 
 
@@ -171,29 +171,28 @@ def drop_unoffered_calls() -> bool:
     return os.environ.get("TF_DROP_UNOFFERED_TOOL_CALLS", "0") == "1"
 
 
-def keep_unoffered_call(text: str, name: Any, request_id: str = "") -> str:
+def keep_unoffered_call(text: str) -> str:
     """The content kept for a parsed call to a tool the request did not offer: its text, or nothing with the flag."""
 
-    if not drop_unoffered_calls():
-        return text
-    print(f"[tensorfold] WARNING: {request_id or 'req-?'} dropped a call to a tool the request did not offer: "
-          f"{str(name)[:80]!r} (reason={UNOFFERED}, length={len(text)} characters)", flush=True)
-    return ""
+    return "" if drop_unoffered_calls() else text
 
 
 def answer_without_tools(answer: str, *, finished: bool, request_id: str = "") -> str:
     """The answer of a request that offers no tools: as it is, or with the flag, without its tool-call blocks (each
     call is unoffered). While streaming, a block that has begun waits until it ends, as with tools. The finished
-    answer logs that blocks were dropped."""
+    answer logs and counts each block that was removed."""
 
     if not drop_unoffered_calls():
         return answer
     # the parser finds tags in any case, and keeps a block that is not well formed as text
     shown = hide_tool_calls(answer, finished=finished, any_case=True, keep_ill_formed=True)
     if finished and shown != answer:
-        count_suppressed([NO_TOOLS])
-        print(f"[tensorfold] WARNING: {request_id or 'req-?'} dropped tool-call markup from a request that offered no "
-              f"tools (reason={NO_TOOLS}, {len(answer) - len(shown)} characters removed)", flush=True)
+        blocks, open_at = top_level_blocks(answer, any_case=True)
+        removed = [Unrun(NO_TOOLS, "removed", b.start, b.end - b.start) for b in blocks
+                   if not (b.kind == "dsml" and parse_calls_block(b.inner) is None)]
+        if open_at >= 0:
+            removed.append(Unrun(NO_TOOLS, "removed", open_at, len(answer) - open_at))
+        report_unrun(removed, request_id)
     return shown
 
 
@@ -291,17 +290,13 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                     parsed = parse_glm_tool_call_block(block, tools, complete=True) is not None
         if not name or str(name).lower() not in known:
             whole = bool(name and parsed)                # a whole call to a tool that is not offered
-            told = False
             if max_calls is None:
-                kept = keep_unoffered_call(markup, name, request_id) if whole else markup
+                kept = keep_unoffered_call(markup) if whole else markup
                 residue.append(kept)
-                action, told = ("kept_as_text" if kept else "removed"), bool(whole and not kept)
+                action = "kept_as_text" if kept else "removed"
             else:
-                if whole and drop_unoffered_calls():
-                    keep_unoffered_call(markup, name, request_id)    # single-call mode removes the block anyway: log it
-                    told = True
-                action = "removed"
-            suppressed.append(Unrun(UNOFFERED if whole else UNRESOLVED, action, -1, len(markup), logged=told))
+                action = "removed"                       # single-call mode removes the block anyway
+            suppressed.append(Unrun(UNOFFERED if whole else UNRESOLVED, action, -1, len(markup)))
             continue
         if max_calls is not None:
             try:
