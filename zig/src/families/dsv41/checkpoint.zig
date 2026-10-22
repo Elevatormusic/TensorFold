@@ -49,7 +49,15 @@ pub const Shards = struct {
             sh.files[n] = try st.File.open(gpa, io, p);
             n += 1;
             var names = sh.files[n - 1].names.iterator();
-            while (names.next()) |kv| try sh.names.put(gpa, kv.key_ptr.*, @intCast(n - 1));
+            while (names.next()) |kv| {
+                // a name in two shards (for example a dtype-override file next to the pack) has no single source
+                const slot = try sh.names.getOrPut(gpa, kv.key_ptr.*);
+                if (slot.found_existing) {
+                    std.log.err("tensor {s} is in two shards: {s} and {s}", .{ kv.key_ptr.*, paths.items[slot.value_ptr.*], p });
+                    return error.DuplicateTensor;
+                }
+                slot.value_ptr.* = @intCast(n - 1);
+            }
         }
         return sh;
     }
@@ -200,6 +208,9 @@ pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u
         // the 1017 quants hold the Engram q_weight / k_weight tables in bf16; the engine reads them as f32, and the
         // widening is exact (bf16 is an f32's top 16 bits), as the Python loader's .to(torch.float32) is.
         if (from == .bf16 and k.dtype.? == .f32) return widenBfloat(t.bytes, out);
+        // the 2.8 bpw pack holds the router weights (ffn.gate.weight) in bf16; the engine reads them as f16, as the
+        // Python loader's .to(torch.float16) does (round to nearest even, exact for every value f16 holds).
+        if (from == .bf16 and k.dtype.? == .f16) return narrowBfloat(t.bytes, out);
         return error.UnsupportedConversion;
     }
     const es = (try dtypeOf(t.dtype)).size();
@@ -338,6 +349,50 @@ test "a 1017 pack: converter markov names and bf16 Engram read as the engine's k
         const bits = std.mem.readInt(u16, body[24 + 2 * i ..][0..2], .little);
         try std.testing.expectEqual(@as(u32, bits) << 16, std.mem.readInt(u32, wide_k[4 * i ..][0..4], .little));
     }
+}
+
+test "a 2.8 bpw pack: bf16 router weights read as f16, f32 router bias as f32, a name in two shards fails" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // the router weight in bf16 (0.5, -2.0, 0.0234375, 1.0) and the bias in f32 (0.25, -1.5)
+    const vals = [_]f32{ 0.5, -2.0, 0.0234375, 1.0 };
+    var body: [16]u8 = undefined;
+    for (vals, 0..) |v, i| std.mem.writeInt(u16, body[2 * i ..][0..2], @truncate(@as(u32, @bitCast(v)) >> 16), .little);
+    std.mem.writeInt(u32, body[8..12], @bitCast(@as(f32, 0.25)), .little);
+    std.mem.writeInt(u32, body[12..16], @bitCast(@as(f32, -1.5)), .little);
+    const json = "{\"layers.0.ffn.gate.weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}," ++
+        "\"layers.0.ffn.gate.bias\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[8,16]}}";
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, json.len, .little);
+    try file.appendSlice(a, &len);
+    try file.appendSlice(a, json);
+    try file.appendSlice(a, &body);
+    try tmp.dir.writeFile(io, .{ .sub_path = "layer-00.safetensors", .data = file.items });
+    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+    {
+        var sh = try Shards.open(a, io, dir);
+        defer sh.close(io);
+        const w = try describe(&sh, "layers.0.ffn.gate.weight|torch.float16");
+        try std.testing.expectEqual(DType.f16, w.dtype);
+        try std.testing.expectEqual(@as(usize, 8), w.bytes);
+        var half: [8]u8 = undefined;
+        try read(&sh, "layers.0.ffn.gate.weight|torch.float16", &half);
+        for (vals, 0..) |v, i| {
+            const h: f16 = @bitCast(std.mem.readInt(u16, half[2 * i ..][0..2], .little));
+            try std.testing.expectEqual(v, @as(f32, h));
+        }
+        var bias: [8]u8 = undefined;
+        try read(&sh, "layers.0.ffn.gate.bias|torch.float32", &bias);
+        try std.testing.expectEqualSlices(u8, body[8..16], &bias);
+    }
+    // the same names again in a second shard: no single source, so the open fails
+    try tmp.dir.writeFile(io, .{ .sub_path = "zz-override.safetensors", .data = file.items });
+    try std.testing.expectError(error.DuplicateTensor, Shards.open(a, io, dir));
 }
 
 test "a pack with the engine's own names reads them as before: the converter's name never wins" {
