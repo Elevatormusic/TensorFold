@@ -56,6 +56,8 @@ pub fn failAll(h: *LaneHost, message: []const u8) void {
 /// goes (failAll holds the admitted ones only).
 pub fn failQueued(h: *LaneHost, message: []const u8) void {
     h.lock();
+    // submissions stop first: a request that arrives during the grace sleep gets Closed, not a lost connection
+    h.closing = true;
     const jobs = h.gpa.dupe(*Job, h.queued.items) catch &.{};
     h.queued.clearRetainingCapacity();
     h.unlock();

@@ -87,4 +87,7 @@ test "a fault exit ends the queued requests with the error too" {
     try std.testing.expectEqual(Reason.failed, second.wait());
     try std.testing.expectEqualStrings("GpuFailed", second.message);
     try std.testing.expectEqual(@as(usize, 0), host.queued.items.len);
+    // later submissions are refused
+    var late: Box = .{};
+    try std.testing.expectError(error.Closed, e.submit(3, &request, .{ .ctx = &late, .event = Box.event }));
 }
