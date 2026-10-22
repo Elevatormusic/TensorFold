@@ -25,8 +25,12 @@ pub const Watch = struct {
     rank: u32,
     running: std.atomic.Value(bool) = .init(true),
     orderly: std.atomic.Value(bool) = .init(false),
+    /// Set when the poll found a link's end (before the one-second wait for an orderly stop).
+    seen: std.atomic.Value(bool) = .init(false),
     /// Set when the watch found a peer gone (before it acts).
     lost: std.atomic.Value(bool) = .init(false),
+    /// Set when the watch thread ends.
+    finished: std.atomic.Value(bool) = .init(false),
     /// Held while the watch aborts the rings, so release() never frees them under it (a spin: it is taken at most twice).
     rings_busy: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
@@ -60,6 +64,22 @@ pub const Watch = struct {
         w.n_rings = 0;
     }
 
+    /// True when the watch found a link's end: a stop after it is no orderly stop.
+    pub fn faulted(w: *Watch) bool {
+        return w.seen.load(.acquire);
+    }
+
+    /// A released watch on a rank that ends after a peer fault: with TF_DS_EXIT_ON_FAULT=1, waits (at most the grace
+    /// plus 4 s) for the watch's exit 75, so the rank's normal return does not end the process with another code first.
+    pub fn hold(w: *Watch) void {
+        const grace_ms = exitGrace() orelse return;
+        var left = grace_ms + 4000;
+        while (left > 0 and !w.finished.load(.acquire)) : (left -|= 100) {
+            const ts: std.c.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+        }
+    }
+
     fn lockRings(w: *Watch) void {
         while (w.rings_busy.swap(true, .acquire)) std.atomic.spinLoopHint();
     }
@@ -80,12 +100,16 @@ pub const Watch = struct {
     }
 
     fn loop(w: *Watch) void {
+        defer w.finished.store(true, .release);
         var pfds: [max_links]posix.pollfd = undefined;
         for (pfds[0..w.n], w.fds[0..w.n]) |*p, fd| p.* = .{ .fd = fd, .events = rdhup, .revents = 0 };
         while (!w.quiet()) {
             const k = posix.poll(pfds[0..w.n], 200) catch continue;
             if (k == 0) continue;
-            for (pfds[0..w.n]) |p| if (p.revents & gone != 0) return w.peerGone();
+            for (pfds[0..w.n]) |p| if (p.revents & gone != 0) {
+                w.seen.store(true, .release);
+                return w.peerGone();
+            };
         }
     }
 
@@ -148,6 +172,7 @@ test "a peer that closes its link without a done frame is found within two secon
         _ = std.c.nanosleep(&ts, null);
     }
     try std.testing.expect(w.lost.load(.acquire));
+    try std.testing.expect(w.faulted()); // a stop after it (rank 0's teardown) keeps the fault
 }
 
 test "a released watch forgets its rings and still finds the peer gone" {
