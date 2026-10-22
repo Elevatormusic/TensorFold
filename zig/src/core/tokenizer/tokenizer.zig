@@ -445,13 +445,13 @@ test "byte-level BPE with merges, added tokens and decode" {
 
 test "a cut encode: the text's own added tokens are tokens, the restored text between them is plain text" {
     const json =
-        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
-        \\  {"id":8,"content":"<t>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],
+        \\{"added_tokens":[{"id":10,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        \\  {"id":11,"content":"<t>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],
         \\ "normalizer":{"type":"Sequence","normalizers":[]},
         \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
         \\ "decoder":{"type":"ByteLevel"},
         \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
-        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6,"<":9,"t":10,">":11},"merges":[["Ġ","a"],"a b","Ġa b"]}}
+        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6,"<":7,"t":8,">":9},"merges":[["Ġ","a"],"a b","Ġa b"]}}
     ;
     const a = std.testing.allocator;
     var t = try parse(a, json);
@@ -464,8 +464,8 @@ test "a cut encode: the text's own added tokens are tokens, the restored text be
     const restore: Tokenizer.Restore = .{ .ctx = &t, .spelled = Marks.spelled };
     const ids = try t.encodeCut(a, "ab<|end|>a@0@b<t>c", restore);
     defer a.free(ids);
-    // "<t>" from the marker is three plain tokens; the text's own "<t>" is token 8
-    try std.testing.expectEqualSlices(u32, &.{ 3, 7, 0, 9, 10, 11, 1, 8, 6 }, ids);
+    // added tokens take ids past the model's 10 (tokenizers' rule): "<|end|>" 10, "<t>" 11; the marker's "<t>" is plain
+    try std.testing.expectEqualSlices(u32, &.{ 3, 10, 0, 7, 8, 9, 1, 11, 6 }, ids);
     // no marker and no added token: the same ids as encode, through the memo too
     t.memo = try Memo.create(a, 1 << 20);
     const plain = try t.encode(a, "ab abc");
