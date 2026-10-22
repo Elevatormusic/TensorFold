@@ -42,6 +42,16 @@ pub const Text = struct {
         encode_plain: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8) Error![]u32 = null,
         /// A token's own bytes (a partial UTF-8 sequence kept whole) for logprob rows; null: the tokenizer can't say.
         token_bytes: ?*const fn (ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error!?[]u8 = null,
+        /// Every added token's text (plain_text.zig shields these in request text); null: none are known.
+        added_spellings: ?*const fn (ctx: *anyopaque, a: Allocator) Allocator.Error![]const []const u8 = null,
+        /// Ids of a shielded prompt: each added token spelled exactly is its token, the text between restored and plain.
+        encode_cut: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8, restore: Restore) Error![]u32 = null,
+    };
+
+    /// What encode_cut does to the text between two cuts: a shielded request's markers spelled again.
+    pub const Restore = struct {
+        ctx: *const anyopaque,
+        spelled: *const fn (ctx: *const anyopaque, a: Allocator, text: []const u8) Allocator.Error![]const u8,
     };
 
     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
@@ -51,6 +61,18 @@ pub const Text = struct {
     pub fn encodePlain(t: Text, a: Allocator, text: []const u8) Error![]u32 {
         const f = t.vtable.encode_plain orelse return t.encode(a, text, false);
         return f(t.ctx, a, text);
+    }
+
+    /// Every added token's text, or none when this text cannot list them.
+    pub fn addedSpellings(t: Text, a: Allocator) Allocator.Error![]const []const u8 {
+        const f = t.vtable.added_spellings orelse return &.{};
+        return f(t.ctx, a);
+    }
+
+    /// The ids of a shielded prompt (plain_text.zig); null when this text has no cut encode.
+    pub fn encodeCut(t: Text, a: Allocator, text: []const u8, restore: Restore) ?Error![]u32 {
+        const f = t.vtable.encode_cut orelse return null;
+        return f(t.ctx, a, text, restore);
     }
 
     pub fn decode(t: Text, a: Allocator, ids: []const u32) Allocator.Error![]u8 {

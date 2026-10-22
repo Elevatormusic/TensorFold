@@ -7,6 +7,7 @@ const fields = @import("fields.zig");
 const auth = @import("auth.zig");
 const metrics = @import("metrics.zig");
 const model_text = @import("model_text.zig");
+const plain_text = @import("plain_text.zig");
 const reply_text = @import("reply_text.zig");
 const http_conn = @import("http_conn.zig");
 const listener_mod = @import("listener.zig");
@@ -88,6 +89,8 @@ pub const Server = struct {
     config: Config,
     keys: ?*auth.Store,
     late_system: []const u8 = "system",
+    /// Info.plain_message_text's shield; null: request text encodes as the template renders it.
+    plain: ?plain_text.PlainText = null,
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
     chunks: chunk_plan.Plan = .{},
@@ -147,6 +150,7 @@ pub const Server = struct {
         srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
             std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
+        if (srv.info.plain_message_text) srv.plain = try plain_text.PlainText.init(a, text, srv.info.plain_assistant_keep);
         srv.needs_user_after_tool = needsUserAfterTool(source);
         if (text.tokenId("</think>")) |end| {
             const lead = try text.encode(a, "\n", false);

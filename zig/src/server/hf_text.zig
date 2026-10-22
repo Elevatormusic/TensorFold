@@ -212,6 +212,8 @@ pub const HfText = struct {
             .special = specialFn,
             .token_bytes = tokenBytesFn,
             .encode_plain = encodePlainFn,
+            .added_spellings = addedFn,
+            .encode_cut = encodeCutFn,
         } };
     }
 
@@ -234,6 +236,17 @@ pub const HfText = struct {
 
     fn encodePlainFn(ctx: *anyopaque, a: Allocator, s: []const u8) model_text.Error![]u32 {
         return self(ctx).tok.encodePlain(a, s) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
+    }
+
+    fn addedFn(ctx: *anyopaque, a: Allocator) Allocator.Error![]const []const u8 {
+        const added = self(ctx).tok.added;
+        const out = try a.alloc([]const u8, added.len);
+        for (added, out) |t, *o| o.* = t.content;
+        return out;
+    }
+
+    fn encodeCutFn(ctx: *anyopaque, a: Allocator, s: []const u8, restore: model_text.Text.Restore) model_text.Error![]u32 {
+        return self(ctx).tok.encodeCut(a, s, .{ .ctx = restore.ctx, .spelled = restore.spelled }) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
     }
 
     fn decodeFn(ctx: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {

@@ -121,6 +121,16 @@ pub const Normalizer = union(enum) {
         return error.UnsupportedNormalizer;
     }
 
+    /// Whether the normalizer changes no text: a sequence of no steps (DeepSeek's).
+    pub fn isIdentity(n: *const Normalizer) bool {
+        return switch (n.*) {
+            .sequence => |steps| for (steps) |*step| {
+                if (!step.isIdentity()) break false;
+            } else true,
+            else => false,
+        };
+    }
+
     pub fn hasForms(n: *const Normalizer) bool {
         return switch (n.*) {
             .sequence => |steps| for (steps) |*step| {
