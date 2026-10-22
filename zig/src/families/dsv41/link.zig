@@ -3,6 +3,13 @@
 const std = @import("std");
 const c = std.c;
 
+/// TCP_USER_TIMEOUT (Linux): the longest time sent data can stay not acknowledged before the kernel ends the link
+/// (ETIMEDOUT: POLLERR to peer_watch.zig, PeerDown to a read or send). Without it, retransmissions run for many minutes.
+const tcp_user_timeout: u32 = 18;
+/// The same bound as the keepalive (10 s + 3 x 3 s, rounded up). With a keepalive on, Linux also ends an idle link
+/// whose probes get no answer at this time.
+const user_timeout_ms: u32 = 20_000;
+
 pub const Link = struct {
     fd: c.fd_t,
 
@@ -15,15 +22,16 @@ pub const Link = struct {
 
     /// TCP_NODELAY, and SO_BUSY_POLL: a read polls the NIC's receive queue itself (up to 50 us) instead of waiting for
     /// its interrupt, whose core may be leaving a deep idle state (node to node, 64-byte frames: round trip 1.0 ms
-    /// blocking, 0.72 ms polling the socket, 11 us with SO_BUSY_POLL). A keepalive (10 s idle, then 3 probes 3 s
-    /// apart) shows a peer whose node vanished (no FIN) within about 20 s, to a read and to peer_watch.zig.
+    /// blocking, 0.72 ms polling the socket, 11 us with SO_BUSY_POLL). A peer whose node vanished (no FIN) shows
+    /// within about 20 s, to a read and to peer_watch.zig: on an idle link by the keepalive (10 s idle, then 3 probes
+    /// 3 s apart), and with sent data not acknowledged (the node lost power during a round) by TCP_USER_TIMEOUT.
     fn tune(fd: c.fd_t) void {
         const one: c_int = 1;
         const busy_us: c_int = 50;
         _ = c.setsockopt(fd, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
         _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.BUSY_POLL, std.mem.asBytes(&busy_us), @sizeOf(c_int));
         _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.KEEPALIVE, std.mem.asBytes(&one), @sizeOf(c_int));
-        for ([_][2]u32{ .{ std.posix.TCP.KEEPIDLE, 10 }, .{ std.posix.TCP.KEEPINTVL, 3 }, .{ std.posix.TCP.KEEPCNT, 3 } }) |o| {
+        for ([_][2]u32{ .{ std.posix.TCP.KEEPIDLE, 10 }, .{ std.posix.TCP.KEEPINTVL, 3 }, .{ std.posix.TCP.KEEPCNT, 3 }, .{ tcp_user_timeout, user_timeout_ms } }) |o| {
             const v: c_int = @intCast(o[1]);
             _ = c.setsockopt(fd, c.IPPROTO.TCP, o[0], std.mem.asBytes(&v), @sizeOf(c_int));
         }
@@ -160,6 +168,38 @@ pub fn parseIp(text: []const u8) ![4]u8 {
 test "addresses parse as four bytes" {
     try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, try parseIp("192.0.2.7"));
     try std.testing.expectError(error.BadAddress, parseIp("10.200.30"));
+}
+
+fn tcpOption(fd: c.fd_t, level: i32, name: u32) !c_int {
+    var v: c_int = 0;
+    var len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(fd, level, name, &v, &len) != 0) return error.GetSockOptFailed;
+    return v;
+}
+
+test "both ends of a link find a gone peer within 20 s: keepalive and TCP_USER_TIMEOUT" {
+    const io = std.testing.io;
+    const port: u16 = 28400 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 500)));
+    const Peer = struct {
+        fn run(p: u16, out: *[2]c_int) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            defer l.close();
+            out[0] = tcpOption(l.fd, c.IPPROTO.TCP, tcp_user_timeout) catch -1;
+            out[1] = tcpOption(l.fd, c.SOL.SOCKET, c.SO.KEEPALIVE) catch -1;
+            var buf: [8]u8 = undefined;
+            _ = l.recv(&buf) catch {}; // until rank 0 closes its end
+        }
+    };
+    var follower: [2]c_int = .{ 0, 0 };
+    const t = try std.Thread.spawn(.{}, Peer.run, .{ port, &follower });
+    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    // rank 0's end (the accepted socket) and rank 1's end (connect)
+    try std.testing.expectEqual(@as(c_int, user_timeout_ms), try tcpOption(l.fd, c.IPPROTO.TCP, tcp_user_timeout));
+    try std.testing.expectEqual(@as(c_int, 1), try tcpOption(l.fd, c.SOL.SOCKET, c.SO.KEEPALIVE));
+    try std.testing.expectEqual(@as(c_int, 10), try tcpOption(l.fd, c.IPPROTO.TCP, std.posix.TCP.KEEPIDLE));
+    l.close();
+    t.join();
+    try std.testing.expectEqual([2]c_int{ user_timeout_ms, 1 }, follower);
 }
 
 test "frames cross a loopback link in order" {
