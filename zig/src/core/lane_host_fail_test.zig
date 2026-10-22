@@ -62,3 +62,29 @@ test "a failed round ends the request it held; the queued request and a later on
     try std.testing.expectEqual(Reason.length, later.wait());
     try std.testing.expectEqual(@as(usize, 48), later.tokens);
 }
+
+test "a fault exit ends the queued requests with the error too" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    defer host.stop(); // the engine thread never starts: both requests wait in the queue
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    const request: api.Request = .{ .prompt = &prompt, .max_tokens = 48 };
+    const e = host.engine();
+    var first: Box = .{};
+    var second: Box = .{};
+    try e.submit(1, &request, .{ .ctx = &first, .event = Box.event });
+    try e.submit(2, &request, .{ .ctx = &second, .event = Box.event });
+    @import("lane_host_end.zig").failQueued(&host, "GpuFailed");
+    try std.testing.expectEqual(Reason.failed, first.wait());
+    try std.testing.expectEqualStrings("GpuFailed", first.message);
+    try std.testing.expectEqual(Reason.failed, second.wait());
+    try std.testing.expectEqualStrings("GpuFailed", second.message);
+    try std.testing.expectEqual(@as(usize, 0), host.queued.items.len);
+}

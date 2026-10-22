@@ -74,9 +74,11 @@ fn before(va: f32, ia: i64, vb: f32, ib: i64) bool {
 }
 
 /// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
-/// orders it.
+/// orders it. A count over max_candidates keeps them in a bounded heap, so a top_k near the vocabulary size costs
+/// O(row * log count), not O(row * count).
 pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
     const k = @min(count, row.len);
+    if (k > max_candidates) return topCandidatesHeap(row, k, values, ids);
     var n: usize = 0;
     for (row, 0..) |v, i| {
         const id: i64 = @intCast(i);
@@ -90,6 +92,57 @@ pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) 
         values[j] = v;
         ids[j] = id;
         if (n < k) n += 1;
+    }
+    return n;
+}
+
+fn pairSwap(values: []f32, ids: []i64, a: usize, b: usize) void {
+    std.mem.swap(f32, &values[a], &values[b]);
+    std.mem.swap(i64, &ids[a], &ids[b]);
+}
+
+/// The heap keeps the worst candidate (the last in the sort order) at the root.
+fn pairDown(values: []f32, ids: []i64, n: usize, start: usize) void {
+    var i = start;
+    while (true) {
+        var w = i;
+        const l = 2 * i + 1;
+        const r = l + 1;
+        if (l < n and before(values[w], ids[w], values[l], ids[l])) w = l;
+        if (r < n and before(values[w], ids[w], values[r], ids[r])) w = r;
+        if (w == i) return;
+        pairSwap(values, ids, w, i);
+        i = w;
+    }
+}
+
+fn topCandidatesHeap(row: []const f32, k: usize, values: []f32, ids: []i64) usize {
+    var n: usize = 0;
+    for (row, 0..) |v, i| {
+        const id: i64 = @intCast(i);
+        if (n < k) {
+            values[n] = v;
+            ids[n] = id;
+            n += 1;
+            var c = n - 1;
+            while (c > 0) {
+                const p = (c - 1) / 2;
+                if (!before(values[p], ids[p], values[c], ids[c])) break;
+                pairSwap(values, ids, p, c);
+                c = p;
+            }
+        } else if (before(v, id, values[0], ids[0])) {
+            values[0] = v;
+            ids[0] = id;
+            pairDown(values, ids, n, 0);
+        }
+    }
+    // heap sort: the worst goes to the end each time, so the best come first
+    var end = n;
+    while (end > 1) {
+        end -= 1;
+        pairSwap(values, ids, 0, end);
+        pairDown(values, ids, end, 0);
     }
     return n;
 }
@@ -113,7 +166,8 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
         var ids: [max_candidates]i64 = undefined;
         var scaled: [max_candidates]f64 = undefined;
         var score: [max_candidates]f64 = undefined;
-        return choose(row, position, s, values[0..count], ids[0..count], scaled[0..count], score[0..count]);
+        var probs: [max_candidates]f64 = undefined;
+        return choose(row, position, s, values[0..count], ids[0..count], scaled[0..count], score[0..count], probs[0..count]);
     }
     // a top_k past max_candidates - margin: the same rule on heap buffers (no per-stream error that fails a round)
     const gpa = std.heap.page_allocator;
@@ -125,12 +179,15 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     defer gpa.free(scaled);
     const score = try gpa.alloc(f64, count);
     defer gpa.free(score);
-    return choose(row, position, s, values, ids, scaled, score);
+    const probs = try gpa.alloc(f64, count);
+    defer gpa.free(probs);
+    return choose(row, position, s, values, ids, scaled, score, probs);
 }
 
-/// choose_rows for one row on buffers of the candidate count: the top candidates in lexsort's order, the keyed scores,
-/// the top_p and min_p cuts, the first best score.
-fn choose(row: []const f32, position: u64, s: Sampling, values: []f32, ids: []i64, scaled: []f64, score: []f64) i64 {
+/// choose_rows for one row on buffers of the candidate count (the caller allocates them, so a failed allocation is its
+/// error, never a different token): the top candidates in lexsort's order, the keyed scores, the top_p and min_p cuts,
+/// the first best score.
+fn choose(row: []const f32, position: u64, s: Sampling, values: []f32, ids: []i64, scaled: []f64, score: []f64, probs: []f64) i64 {
     const width = topCandidates(row, values.len, values, ids);
     const k = @max(1, @min(s.top_k, width));
     const t = @max(s.temperature, 1e-6);
@@ -142,12 +199,6 @@ fn choose(row: []const f32, position: u64, s: Sampling, values: []f32, ids: []i6
     if (0.0 < s.top_p and s.top_p < 1.0) {
         var mx = scaled[0];
         for (scaled[1..k]) |v| mx = @max(mx, v);
-        // probs over the candidates: the score buffer's twin (score is written after this only for the cut)
-        var small: [max_candidates]f64 = undefined;
-        const big = if (k > max_candidates) std.heap.page_allocator.alloc(f64, k) catch null else null;
-        defer if (big) |b| std.heap.page_allocator.free(b);
-        const probs: []f64 = if (big) |b| b else small[0..k];
-        if (k > max_candidates and big == null) return ids[0]; // out of memory: the top candidate
         for (0..k) |j| probs[j] = exp(scaled[j] - mx);
         const sum = pairwiseSum(probs[0..k]);
         for (0..k) |j| probs[j] /= sum;
@@ -455,5 +506,33 @@ test "nucleus: the heap-first rule draws as the full sort does, peaked and flat 
                 }
             }
         }
+    }
+}
+
+test "top candidates past max_candidates come from the heap in the same order" {
+    var prng = std.Random.DefaultPrng.init(77);
+    const rnd = prng.random();
+    const row = try std.testing.allocator.alloc(f32, 5000);
+    defer std.testing.allocator.free(row);
+    // few distinct values: many ties, so the lower-id rule decides
+    for (row) |*x| x.* = @floatFromInt(rnd.intRangeAtMost(i32, 0, 300));
+    for ([_]usize{ 65, 200, 1500, 5000 }) |count| {
+        const v = try std.testing.allocator.alloc(f32, count);
+        defer std.testing.allocator.free(v);
+        const ids = try std.testing.allocator.alloc(i64, count);
+        defer std.testing.allocator.free(ids);
+        try std.testing.expectEqual(count, topCandidates(row, count, v, ids));
+        // the order a full sort gives: value descending, then id ascending
+        const all = try std.testing.allocator.alloc(i64, row.len);
+        defer std.testing.allocator.free(all);
+        for (all, 0..) |*a, i| a.* = @intCast(i);
+        const Ctx = struct {
+            row: []const f32,
+            fn lt(c: @This(), a: i64, b: i64) bool {
+                return before(c.row[@intCast(a)], a, c.row[@intCast(b)], b);
+            }
+        };
+        std.mem.sort(i64, all, Ctx{ .row = row }, Ctx.lt);
+        try std.testing.expectEqualSlices(i64, all[0..count], ids);
     }
 }

@@ -52,6 +52,17 @@ pub fn failAll(h: *LaneHost, message: []const u8) void {
     h.gpa.free(jobs);
 }
 
+/// A fault exit ends the queued jobs too: they never reach a lane, and their clients get the error before the process
+/// goes (failAll holds the admitted ones only).
+pub fn failQueued(h: *LaneHost, message: []const u8) void {
+    h.lock();
+    const jobs = h.gpa.dupe(*Job, h.queued.items) catch &.{};
+    h.queued.clearRetainingCapacity();
+    h.unlock();
+    for (jobs) |job| h.finish(job, .failed, message);
+    h.gpa.free(jobs);
+}
+
 pub fn closeAll(h: *LaneHost) void {
     h.lock();
     for (h.queued.items) |job| h.cancels.append(h.gpa, job.id) catch {};
