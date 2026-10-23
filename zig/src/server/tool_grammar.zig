@@ -168,14 +168,27 @@ fn quoteFree(name: []const u8) bool {
     return std.mem.indexOfScalar(u8, name, '"') == null;
 }
 
-/// Whether the schema's argument names (its `properties` keys, also in allOf, anyOf, oneOf and $defs) can be DSML attributes.
-fn argNamesOk(schema: Value) bool {
+/// The schema a local `$ref` ("#/$defs/N" or "#/definitions/N") names in `root`, or null.
+fn localRef(root: Value, ref: []const u8) ?Value {
+    inline for (.{ "#/$defs/", "#/definitions/" }) |prefix| {
+        if (std.mem.startsWith(u8, ref, prefix)) {
+            const defs = root.get(prefix[2 .. prefix.len - 1]) orelse return null;
+            return defs.get(ref[prefix.len..]);
+        }
+    }
+    return null;
+}
+
+/// Whether the argument names the schema can write (its `properties` keys, also through allOf, anyOf, oneOf and the
+/// local $refs it uses; a definition nothing refers to is never written) can be DSML attributes. `depth` stops a $ref cycle.
+fn argNamesOk(root: Value, schema: Value, depth: usize) bool {
+    if (depth > 16) return true;
     if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!quoteFree(k)) return false;
     for ([_][]const u8{ "allOf", "anyOf", "oneOf" }) |kw| if (schema.get(kw)) |members| if (members == .array) for (members.array) |m| {
-        if (m == .object and !argNamesOk(m)) return false;
+        if (m == .object and !argNamesOk(root, m, depth + 1)) return false;
     };
-    for ([_][]const u8{ "$defs", "definitions" }) |kw| if (schema.get(kw)) |defs| if (defs == .object) for (defs.object.values()) |m| {
-        if (m == .object and !argNamesOk(m)) return false;
+    if (schema.get("$ref")) |ref| if (ref == .string) if (localRef(root, ref.string)) |target| {
+        if (target == .object and !argNamesOk(root, target, depth + 1)) return false;
     };
     return true;
 }
@@ -184,7 +197,8 @@ fn argNamesOk(schema: Value) bool {
 fn dsmlNamesOk(a: Allocator, tools: []const Value) Allocator.Error!bool {
     for (tools) |t| {
         if (!quoteFree(try tool_specs.toolName(a, t))) return false;
-        if (!argNamesOk(try parameters(a, t))) return false;
+        const params = try parameters(a, t);
+        if (!argNamesOk(params, params, 0)) return false;
     }
     return true;
 }
@@ -305,4 +319,9 @@ test "a DSML name with a double quote is refused, not written as a broken attrib
     try std.testing.expect(!try dsmlNamesOk(a, prop.array));
     const nested = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"allOf\": [{\"type\": \"object\", \"properties\": {\"a\\\"b\": {\"type\": \"string\"}}}]}}}]")).ok;
     try std.testing.expect(!try dsmlNamesOk(a, nested.array));
+    // a definition nothing refers to is never written: it does not refuse the call; one a $ref uses does
+    const unused = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"$defs\": {\"x\": {\"type\": \"object\", \"properties\": {\"a\\\"b\": {\"type\": \"string\"}}}}}}}]")).ok;
+    try std.testing.expect(try dsmlNamesOk(a, unused.array));
+    const used = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/x\", \"$defs\": {\"x\": {\"type\": \"object\", \"properties\": {\"a\\\"b\": {\"type\": \"string\"}}}}}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, used.array));
 }
