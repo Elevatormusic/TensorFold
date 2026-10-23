@@ -133,9 +133,16 @@ fn dsmlInvoke(a: Allocator, name: []const u8, schema: Value) Allocator.Error!Val
     return .{ .array = parts.items };
 }
 
+/// The object-schema keywords the hand-written parameters cover: the declared properties, which are required, and notes.
+/// Any other keyword (minProperties, maxProperties, dependentRequired, $ref, allOf, a schema for additionalProperties,
+/// $defs, ...) limits the object in a way only xgrammar's own parameter style keeps.
+const direct_keywords = [_][]const u8{ "type", "properties", "required", "additionalProperties", "description", "title", "default", "examples", "example", "$schema", "$comment", "deprecated" };
+
 /// Whether the call's arguments need more than the direct `properties` of the parameter schema.
 fn needsFullSchema(schema: Value, props: ?Value) bool {
-    for ([_][]const u8{ "$ref", "$defs", "definitions", "allOf", "anyOf", "oneOf", "patternProperties" }) |k| if (schema.get(k) != null) return true;
+    if (schema != .object) return false;
+    for (schema.object.keys()) |k| if (!contains(&direct_keywords, k)) return true;
+    // additionalProperties is false or true (extra names allowed, none required): a schema there is more than direct
     if (schema.get("additionalProperties")) |ap| if (ap == .object) return true;
     if (schema.get("required")) |r| if (r == .array) for (r.array) |x| {
         if (x != .string) continue;
@@ -179,11 +186,12 @@ fn localRef(root: Value, ref: []const u8) ?Value {
     return null;
 }
 
-/// Whether the argument names the schema can write (its `properties` keys, also through allOf, anyOf, oneOf and the
+/// Whether the argument names the schema can write (its `properties` keys and `required` names, also through allOf, anyOf, oneOf and the
 /// local $refs it uses; a definition nothing refers to is never written) can be DSML attributes. `depth` stops a $ref cycle.
 fn argNamesOk(root: Value, schema: Value, depth: usize) bool {
     if (depth > 16) return true;
     if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!quoteFree(k)) return false;
+    if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string and !quoteFree(x.string)) return false;
     for ([_][]const u8{ "allOf", "anyOf", "oneOf" }) |kw| if (schema.get(kw)) |members| if (members == .array) for (members.array) |m| {
         if (m == .object and !argNamesOk(root, m, depth + 1)) return false;
     };
@@ -324,4 +332,16 @@ test "a DSML name with a double quote is refused, not written as a broken attrib
     try std.testing.expect(try dsmlNamesOk(a, unused.array));
     const used = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/x\", \"$defs\": {\"x\": {\"type\": \"object\", \"properties\": {\"a\\\"b\": {\"type\": \"string\"}}}}}}}]")).ok;
     try std.testing.expect(!try dsmlNamesOk(a, used.array));
+    // a required name that only additionalProperties declares
+    const dynamic = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"required\": [\"a\\\"b\"], \"additionalProperties\": {\"type\": \"string\"}}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, dynamic.array));
+}
+
+test "a DSML schema with an object-level limit goes whole to the DeepSeek-V4.1 parameter style" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"m\", \"parameters\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"integer\"}}, \"minProperties\": 1}}}, {\"type\": \"function\", \"function\": {\"name\": \"n\", \"parameters\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"integer\"}}, \"dependentRequired\": {\"x\": [\"x\"]}}}}]")).ok;
+    const g = try build(a, .dsml41, tools.array, false);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, g, "\"style\":\"deepseek_v4_1_xml\""));
 }
