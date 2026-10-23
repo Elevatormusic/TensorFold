@@ -175,19 +175,37 @@ fn quoteFree(name: []const u8) bool {
     return std.mem.indexOfScalar(u8, name, '"') == null;
 }
 
-/// The schema a local `$ref` ("#/$defs/N" or "#/definitions/N") names in `root`, or null.
+/// A JSON Pointer token with ~1 read as / and ~0 as ~ (RFC 6901), in `buf`; null when it does not fit.
+fn pointerToken(buf: []u8, token: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < token.len) : (i += 1) {
+        if (n == buf.len) return null;
+        if (token[i] == '~' and i + 1 < token.len and (token[i + 1] == '0' or token[i + 1] == '1')) {
+            buf[n] = if (token[i + 1] == '0') '~' else '/';
+            i += 1;
+        } else buf[n] = token[i];
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// The schema a local `$ref` ("#", "#/$defs/N" or "#/definitions/N", the name in JSON Pointer escapes) names in `root`, or null.
 fn localRef(root: Value, ref: []const u8) ?Value {
+    if (std.mem.eql(u8, ref, "#")) return root;
     inline for (.{ "#/$defs/", "#/definitions/" }) |prefix| {
         if (std.mem.startsWith(u8, ref, prefix)) {
             const defs = root.get(prefix[2 .. prefix.len - 1]) orelse return null;
-            return defs.get(ref[prefix.len..]);
+            var buf: [256]u8 = undefined;
+            return defs.get(pointerToken(&buf, ref[prefix.len..]) orelse return null);
         }
     }
     return null;
 }
 
-/// Whether the argument names the schema can write (its `properties` keys and `required` names, also through allOf, anyOf, oneOf and the
-/// local $refs it uses; a definition nothing refers to is never written) can be DSML attributes. `depth` stops a $ref cycle.
+/// Whether the argument names the schema can write (its `properties` keys and `required` names, also through allOf,
+/// anyOf, oneOf and the local $refs it uses; a definition nothing refers to is never written) can be DSML attributes.
+/// A $ref that does not resolve locally fails closed (the names behind it are unknown). `depth` stops a $ref cycle.
 fn argNamesOk(root: Value, schema: Value, depth: usize) bool {
     if (depth > 16) return true;
     if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!quoteFree(k)) return false;
@@ -195,7 +213,8 @@ fn argNamesOk(root: Value, schema: Value, depth: usize) bool {
     for ([_][]const u8{ "allOf", "anyOf", "oneOf" }) |kw| if (schema.get(kw)) |members| if (members == .array) for (members.array) |m| {
         if (m == .object and !argNamesOk(root, m, depth + 1)) return false;
     };
-    if (schema.get("$ref")) |ref| if (ref == .string) if (localRef(root, ref.string)) |target| {
+    if (schema.get("$ref")) |ref| if (ref == .string) {
+        const target = localRef(root, ref.string) orelse return false;
         if (target == .object and !argNamesOk(root, target, depth + 1)) return false;
     };
     return true;
@@ -335,6 +354,11 @@ test "a DSML name with a double quote is refused, not written as a broken attrib
     // a required name that only additionalProperties declares
     const dynamic = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"required\": [\"a\\\"b\"], \"additionalProperties\": {\"type\": \"string\"}}}}]")).ok;
     try std.testing.expect(!try dsmlNamesOk(a, dynamic.array));
+    // a $ref in JSON Pointer escapes (~1 is /) finds its definition; one that resolves nowhere fails closed
+    const escaped = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/a~1b\", \"$defs\": {\"a/b\": {\"type\": \"object\", \"required\": [\"x\\\"y\"]}}}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, escaped.array));
+    const lost = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"https://example.com/args.json\"}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, lost.array));
 }
 
 test "a DSML schema with an object-level limit goes whole to the DeepSeek-V4.1 parameter style" {
