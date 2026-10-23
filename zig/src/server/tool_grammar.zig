@@ -190,17 +190,27 @@ fn pointerToken(buf: []u8, token: []const u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// The schema a local `$ref` ("#", "#/$defs/N" or "#/definitions/N", the name in JSON Pointer escapes) names in `root`, or null.
+/// The schema a local `$ref` names in `root`: "#" is the root, "#/a/b" walks the decoded JSON Pointer tokens a, b through
+/// objects (and arrays by index). Null when it does not resolve.
 fn localRef(root: Value, ref: []const u8) ?Value {
     if (std.mem.eql(u8, ref, "#")) return root;
-    inline for (.{ "#/$defs/", "#/definitions/" }) |prefix| {
-        if (std.mem.startsWith(u8, ref, prefix)) {
-            const defs = root.get(prefix[2 .. prefix.len - 1]) orelse return null;
-            var buf: [256]u8 = undefined;
-            return defs.get(pointerToken(&buf, ref[prefix.len..]) orelse return null);
-        }
+    if (!std.mem.startsWith(u8, ref, "#/")) return null;
+    var at = root;
+    var tokens = std.mem.splitScalar(u8, ref[2..], '/');
+    while (tokens.next()) |raw| {
+        var buf: [256]u8 = undefined;
+        const token = pointerToken(&buf, raw) orelse return null;
+        at = switch (at) {
+            .object => at.get(token) orelse return null,
+            .array => |items| blk: {
+                const i = std.fmt.parseInt(usize, token, 10) catch return null;
+                if (i >= items.len) return null;
+                break :blk items[i];
+            },
+            else => return null,
+        };
     }
-    return null;
+    return at;
 }
 
 /// Whether a propertyNames schema names only quote-free names: a const string, or an enum of strings, none with a quote.
@@ -389,6 +399,11 @@ test "a DSML name with a double quote is refused, not written as a broken attrib
     try std.testing.expect(!try dsmlNamesOk(a, escaped.array));
     const lost = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"https://example.com/args.json\"}}}]")).ok;
     try std.testing.expect(!try dsmlNamesOk(a, lost.array));
+    // a nested pointer: #/$defs/group/$defs/Args
+    const nested_ref = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/group/$defs/Args\", \"$defs\": {\"group\": {\"$defs\": {\"Args\": {\"type\": \"object\", \"required\": [\"x\\\"y\"]}}}}}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, nested_ref.array));
+    const nested_fine = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/group/$defs/Args\", \"$defs\": {\"group\": {\"$defs\": {\"Args\": {\"type\": \"object\", \"required\": [\"x\"]}}}}}}}]")).ok;
+    try std.testing.expect(try dsmlNamesOk(a, nested_fine.array));
     // names chosen at run time: propertyNames with a quote, a pattern or patternProperties are refused; a quote-free const or enum is fine
     const pn_quote = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"propertyNames\": {\"const\": \"a\\\"b\"}, \"additionalProperties\": {\"type\": \"string\"}, \"minProperties\": 1}}}]")).ok;
     try std.testing.expect(!try dsmlNamesOk(a, pn_quote.array));
