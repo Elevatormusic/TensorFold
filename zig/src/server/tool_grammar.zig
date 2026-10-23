@@ -105,7 +105,7 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
 /// schema's order), the close. A plain string argument is the template's string="true" form (text up to the parameter's
 /// close); any other is string="false" with its value as JSON in the property's schema, a string that has enum, const,
 /// pattern or length limits too (tool_parse.zig dsml41Calls reads both). A schema that is more than direct
-/// `properties` (a $ref, allOf, anyOf, oneOf, patternProperties, a schema for additionalProperties, or a required name
+/// `properties` (a $ref, $defs or definitions a property may refer to, allOf, anyOf, oneOf, patternProperties, a schema for additionalProperties, or a required name
 /// no property declares) goes whole to xgrammar's own DeepSeek-V4.1 parameter style.
 fn dsmlInvoke(a: Allocator, name: []const u8, schema: Value) Allocator.Error!Value {
     const ws = try node(a, "regex", &.{.{ "pattern", .{ .string = blanks } }});
@@ -135,7 +135,7 @@ fn dsmlInvoke(a: Allocator, name: []const u8, schema: Value) Allocator.Error!Val
 
 /// Whether the call's arguments need more than the direct `properties` of the parameter schema.
 fn needsFullSchema(schema: Value, props: ?Value) bool {
-    for ([_][]const u8{ "$ref", "allOf", "anyOf", "oneOf", "patternProperties" }) |k| if (schema.get(k) != null) return true;
+    for ([_][]const u8{ "$ref", "$defs", "definitions", "allOf", "anyOf", "oneOf", "patternProperties" }) |k| if (schema.get(k) != null) return true;
     if (schema.get("additionalProperties")) |ap| if (ap == .object) return true;
     if (schema.get("required")) |r| if (r == .array) for (r.array) |x| {
         if (x != .string) continue;
@@ -300,9 +300,9 @@ test "a DSML schema that is not direct properties goes whole to the DeepSeek-V4.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"r\", \"parameters\": {\"$ref\": \"#/$defs/args\", \"$defs\": {\"args\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"m\", \"parameters\": {\"type\": \"object\", \"additionalProperties\": {\"type\": \"integer\"}}}}, {\"type\": \"function\", \"function\": {\"name\": \"d\", \"parameters\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"integer\"}}, \"required\": [\"x\"]}}}]")).ok;
+    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"r\", \"parameters\": {\"$ref\": \"#/$defs/args\", \"$defs\": {\"args\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"m\", \"parameters\": {\"type\": \"object\", \"additionalProperties\": {\"type\": \"integer\"}}}}, {\"type\": \"function\", \"function\": {\"name\": \"p\", \"parameters\": {\"type\": \"object\", \"properties\": {\"home\": {\"$ref\": \"#/$defs/addr\"}}, \"required\": [\"home\"], \"$defs\": {\"addr\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}}}}}, {\"type\": \"function\", \"function\": {\"name\": \"d\", \"parameters\": {\"type\": \"object\", \"properties\": {\"x\": {\"type\": \"integer\"}}, \"required\": [\"x\"]}}}]")).ok;
     const g = try build(a, .dsml41, tools.array, false);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, g, "\"style\":\"deepseek_v4_1_xml\""));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, g, "\"style\":\"deepseek_v4_1_xml\""));
     // the direct-properties tool keeps the hand-written parameter
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, g, "parameter name=\\\"x\\\" string=\\\"false\\\">"));
 }
