@@ -214,22 +214,38 @@ fn quoteFreeNames(pn: Value) bool {
     return false;
 }
 
+/// The $refs a name walk has followed (each is walked once, so a cycle ends) and the most it follows.
+const Walk = struct {
+    root: Value,
+    seen: [32][]const u8 = undefined,
+    n: usize = 0,
+
+    /// True when `ref` was walked before; false (and now recorded) when it is new. Null: too many refs to track.
+    fn visited(w: *Walk, ref: []const u8) ?bool {
+        for (w.seen[0..w.n]) |r| if (std.mem.eql(u8, r, ref)) return true;
+        if (w.n == w.seen.len) return null;
+        w.seen[w.n] = ref;
+        w.n += 1;
+        return false;
+    }
+};
+
 /// Whether the argument names the schema can write (its `properties` keys and `required` names, also through allOf,
-/// anyOf, oneOf and the local $refs it uses; a definition nothing refers to is never written) can be DSML attributes.
-/// A $ref that does not resolve locally fails closed (the names behind it are unknown). `depth` stops a $ref cycle.
-fn argNamesOk(root: Value, schema: Value, depth: usize) bool {
-    if (depth > 16) return true;
+/// anyOf, oneOf and the local $refs it uses, each walked once; a definition nothing refers to is never written) can be
+/// DSML attributes. A $ref that does not resolve locally, or more distinct $refs than the walk tracks, fails closed.
+fn argNamesOk(w: *Walk, schema: Value) bool {
     if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!quoteFree(k)) return false;
     if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string and !quoteFree(x.string)) return false;
     // names chosen at run time: a pattern may match a quote, and propertyNames limits them only through const or enum
     if (schema.get("patternProperties") != null) return false;
     if (schema.get("propertyNames")) |pn| if (!quoteFreeNames(pn)) return false;
     for ([_][]const u8{ "allOf", "anyOf", "oneOf" }) |kw| if (schema.get(kw)) |members| if (members == .array) for (members.array) |m| {
-        if (m == .object and !argNamesOk(root, m, depth + 1)) return false;
+        if (m == .object and !argNamesOk(w, m)) return false;
     };
     if (schema.get("$ref")) |ref| if (ref == .string) {
-        const target = localRef(root, ref.string) orelse return false;
-        if (target == .object and !argNamesOk(root, target, depth + 1)) return false;
+        const target = localRef(w.root, ref.string) orelse return false;
+        if (w.visited(ref.string) orelse return false) return true;
+        if (target == .object and !argNamesOk(w, target)) return false;
     };
     return true;
 }
@@ -238,8 +254,8 @@ fn argNamesOk(root: Value, schema: Value, depth: usize) bool {
 fn dsmlNamesOk(a: Allocator, tools: []const Value) Allocator.Error!bool {
     for (tools) |t| {
         if (!quoteFree(try tool_specs.toolName(a, t))) return false;
-        const params = try parameters(a, t);
-        if (!argNamesOk(params, params, 0)) return false;
+        var walk: Walk = .{ .root = try parameters(a, t) };
+        if (!argNamesOk(&walk, walk.root)) return false;
     }
     return true;
 }
@@ -382,6 +398,15 @@ test "a DSML name with a double quote is refused, not written as a broken attrib
     try std.testing.expect(!try dsmlNamesOk(a, pp.array));
     const pn_ok = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"propertyNames\": {\"enum\": [\"ab\", \"cd\"]}, \"additionalProperties\": {\"type\": \"string\"}}}}]")).ok;
     try std.testing.expect(try dsmlNamesOk(a, pn_ok.array));
+    // twenty $refs in a chain still reach the quoted name at its end; a $ref cycle ends instead of failing
+    var chain: std.ArrayList(u8) = .empty;
+    try chain.appendSlice(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/d0\", \"$defs\": {");
+    for (0..20) |i| try chain.print(a, "\"d{d}\": {{\"$ref\": \"#/$defs/d{d}\"}}, ", .{ i, i + 1 });
+    try chain.appendSlice(a, "\"d20\": {\"type\": \"object\", \"required\": [\"x\\\"y\"]}}}}}]");
+    const deep = (try json.parse(a, chain.items)).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, deep.array));
+    const cycle = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/t\", \"$defs\": {\"t\": {\"allOf\": [{\"$ref\": \"#/$defs/t\"}], \"properties\": {\"c\": {\"type\": \"string\"}}}}}}}]")).ok;
+    try std.testing.expect(try dsmlNamesOk(a, cycle.array));
 }
 
 test "a DSML schema with an object-level limit goes whole to the DeepSeek-V4.1 parameter style" {
