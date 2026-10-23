@@ -79,6 +79,20 @@ pub const Shards = struct {
         const i = sh.names.get(name) orelse return null;
         return sh.files[i].get(name);
     }
+
+    /// The linears this checkpoint holds dense (plan.Dense): a `<prefix>.weight` and no `<prefix>.trellis`.
+    pub fn dense(sh: *const Shards) plan.Dense {
+        return .{ .ctx = sh, .has = hasDense };
+    }
+
+    fn hasDense(ctx: *const anyopaque, prefix: []const u8) bool {
+        const sh: *const Shards = @ptrCast(@alignCast(ctx));
+        var buf: [256]u8 = undefined;
+        const tr = std.fmt.bufPrint(&buf, "{s}.trellis", .{prefix}) catch return false;
+        if (sh.names.contains(tr)) return false;
+        const w = std.fmt.bufPrint(&buf, "{s}.weight", .{prefix}) catch return false;
+        return sh.names.contains(w);
+    }
 };
 
 /// A loader key split into its fields: "name|dtype" (plain) or "prefix|cols|rows|part" (an EXL3 part).

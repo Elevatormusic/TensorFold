@@ -73,6 +73,17 @@ pub const Blas = struct {
         try b.check(b.api.cublasGemmEx(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, bf16_type, @intCast(k), x, bf16_type, @intCast(k), &zero, out, bf16_type, @intCast(n), 68, 99));
     }
 
+    /// A dense linear of a mixed pack (weights.Linear.dense): x bf16 [rows, k] (row stride ldx) @ w bf16 [n, k]^T into
+    /// out [rows, n] (row stride ldo), bf16 or fp32. linearBf16's call (COMPUTE_32F, fp32 alpha 1 and beta 0,
+    /// CUBLAS_GEMM_DEFAULT_TENSOR_OP) with the strides and the output dtype as the caller's buffers have them.
+    pub fn linearDense(b: *const Blas, x: u64, ldx: usize, w: u64, out: u64, ldo: usize, out_f32: bool, rows: usize, k: usize, n: usize) Error!void {
+        const one: f32 = 1;
+        const zero: f32 = 0;
+        const bf16_type: c_int = 14; // CUDA_R_16BF
+        const out_type: c_int = if (out_f32) 0 else bf16_type; // CUDA_R_32F
+        try b.check(b.api.cublasGemmEx(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, bf16_type, @intCast(k), x, bf16_type, @intCast(ldx), &zero, out, out_type, @intCast(ldo), 68, 99));
+    }
+
     /// torch.matmul of x [rows, k] fp32 (row-major) and w [n, k] fp32 transposed: out [rows, n] fp32, as torch issues
     /// it (column-major C^T = W x^T: transa T, transb N, m = n, n = rows, lda = ldb = k, ldc = n, alpha 1, beta 0).
     pub fn xwT(b: *const Blas, x: u64, w: u64, out: u64, rows: usize, k: usize, n: usize) Error!void {

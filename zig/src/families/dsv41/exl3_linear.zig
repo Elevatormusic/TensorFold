@@ -224,6 +224,7 @@ pub fn glinear(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: u
 pub fn zFloats(layers: []const weights.Linear, m: usize) usize {
     var n: usize = 0;
     for (layers) |l| {
+        if (l.isDense()) continue; // runs through cuBLAS (prompt.denseRows)
         const p = plan(l.k, planN(l));
         if (p.sk > 1) n += p.sk * m * l.n;
     }

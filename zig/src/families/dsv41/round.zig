@@ -590,6 +590,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         const outs = [_]u64{ rd.q, rd.iq };
         for (qls) |ol| {
             const l = ol orelse continue;
+            if (l.isDense()) continue; // a mixed pack's dense linear: from q's normed rows below
             const xh = rd.xhq + n * R * c.q_lora * 2;
             rot[n] = .{ .suh = l.suh, .h = xh };
             calls[n] = .{ .layer = l, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = xh, .y = outs[n], .ldy = @intCast(l.n), .y_dtype = .bf16, .counters = 0 };
@@ -598,6 +599,10 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         }
         try tri_norm.qKvNorm(t, rd.qa, lay.wq_a.n, lay.q_norm, c.eps, rot[0..n], rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), true, rd_dim, rd.qr, rd.kout, R, lay.wq_a.n, hd);
         try prompt.groupedRotated(e, ch, R, calls[0..n]);
+        for (qls, outs) |ol, out| {
+            const l = ol orelse continue;
+            if (l.isDense()) try prompt.denseRows(e, R, l, rd.qr, lay.wq_a.n, out, l.n, .bf16);
+        }
     }
     // the prefetch: this layer's wo_a and wo_b behind q's linears
     {
@@ -798,6 +803,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
 
 /// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
 fn linearBytes(l: weights.Linear) [2]u64 {
+    if (l.isDense()) return .{ l.dense, @as(u64, l.k) * l.n * 2 };
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 

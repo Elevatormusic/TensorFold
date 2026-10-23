@@ -7,7 +7,8 @@
 //! and keeps pair p's whole 128-column blocks of each of its rank's split outputs; DSpark stays TP2 inside the pair.
 const std = @import("std");
 const Config = @import("config.zig").Config;
-const DType = @import("rank_cache.zig").DType;
+const rank_cache = @import("rank_cache.zig");
+const DType = rank_cache.DType;
 
 /// What a split means for one rank.
 pub const Split = struct {
@@ -138,9 +139,34 @@ pub fn partKey(buf: []u8, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize, 
     return std.fmt.bufPrint(buf, "{s}|{s}|{s}|{s}", .{ prefix, cs, rs, part });
 }
 
+/// A dense linear's key: its plain `<prefix>.weight` in the checkpoint's own dtype (bf16 [n, k]).
+pub fn denseKey(buf: []u8, prefix: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}.weight|None", .{prefix});
+}
+
+/// Which linears a mixed pack holds dense (a plain `<prefix>.weight` and no trellis): `has(ctx, prefix)`. A whole
+/// linear the predicate names is planned as its dense entry; a split one (2D / TP column or row parts) is refused.
+pub const Dense = struct {
+    ctx: *const anyopaque,
+    has: *const fn (ctx: *const anyopaque, prefix: []const u8) bool,
+
+    /// The linears a rank cache holds dense: a dense entry and no trellis part.
+    pub fn inCache(ix: *const rank_cache.Index) Dense {
+        return .{ .ctx = ix, .has = cacheHas };
+    }
+
+    fn cacheHas(ctx: *const anyopaque, prefix: []const u8) bool {
+        const ix: *const rank_cache.Index = @ptrCast(@alignCast(ctx));
+        var buf: [256]u8 = undefined;
+        if (ix.get(partKey(&buf, prefix, null, null, "tr") catch return false) != null) return false;
+        return ix.get(denseKey(&buf, prefix) catch return false) != null;
+    }
+};
+
 const Builder = struct {
     a: std.mem.Allocator,
     out: std.ArrayList(Want) = .empty,
+    dense: ?Dense = null,
 
     fn plain(b: *Builder, tensor: []const u8, dtype: ?DType) !void {
         var buf: [256]u8 = undefined;
@@ -148,6 +174,11 @@ const Builder = struct {
     }
 
     fn exl3(b: *Builder, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize, k: ?usize, n: ?usize) !void {
+        if (b.dense) |d| if (d.has(d.ctx, prefix)) {
+            if (cols != null or rows != null) return error.DenseLinearSplit;
+            var buf: [256]u8 = undefined;
+            return b.out.append(b.a, .{ .key = try b.a.dupe(u8, try denseKey(&buf, prefix)), .dtype = .bf16 });
+        };
         const k16: ?usize = if (rows) |r| (r[1] - r[0]) / 16 else if (k) |x| x / 16 else null;
         const n16: ?usize = if (cols) |c| (c[1] - c[0]) / 16 else if (n) |x| x / 16 else null;
         for ([_][]const u8{ "tr", "suh", "svh" }) |part| {
@@ -220,7 +251,12 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
 
 /// Every tensor rank `s` loads, in load order (`dspark`: the DSpark stages and heads too). Keys live in `a`.
 pub fn wants(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
-    var b: Builder = .{ .a = a };
+    return wantsDense(a, c, s, dspark, null);
+}
+
+/// wants, the linears `dense` names planned as their dense entries (a mixed pack).
+pub fn wantsDense(a: std.mem.Allocator, c: Config, s: Split, dspark: bool, dense: ?Dense) ![]Want {
+    var b: Builder = .{ .a = a, .dense = dense };
     try b.plain("embed.weight", null);
     try b.plain("norm.weight", null);
     try b.exl3("head", s.headCols(c), null, c.hidden, null);
@@ -264,6 +300,37 @@ test "a rank's tensors in load order: the split's ranges, keys as Python prints 
     try std.testing.expect(seen_wq_b and seen_down and seen_engram);
     try std.testing.expectEqual(@as(usize, 4), wo_a);
     try std.testing.expectEqualStrings("mtp.2.confidence_head.proj.weight|None", w[w.len - 1].key);
+}
+
+test "a mixed pack's dense linears: one bf16 .weight entry for a whole linear, a split one refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: @import("config.zig").Why = .{};
+    const c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    const names = struct {
+        fn has(_: *const anyopaque, prefix: []const u8) bool {
+            return std.mem.eql(u8, prefix, "layers.2.attn.wq_a") or std.mem.eql(u8, prefix, "layers.2.attn.indexer.wq_b");
+        }
+        fn split(_: *const anyopaque, prefix: []const u8) bool {
+            return std.mem.eql(u8, prefix, "layers.0.attn.wq_b");
+        }
+    };
+    const w = try wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &names, .has = names.has });
+    const plain = try wants(a, c, .{ .rank = 0, .world = 2 }, true);
+    // each dense linear: its three parts give way to one entry
+    try std.testing.expectEqual(plain.len - 2 * 2, w.len);
+    var seen: usize = 0;
+    for (w) |x| {
+        if (std.mem.startsWith(u8, x.key, "layers.2.attn.wq_a|") or std.mem.startsWith(u8, x.key, "layers.2.attn.indexer.wq_b|")) return error.PartsLeft;
+        if (std.mem.eql(u8, x.key, "layers.2.attn.wq_a.weight|None") or std.mem.eql(u8, x.key, "layers.2.attn.indexer.wq_b.weight|None")) {
+            try std.testing.expectEqual(@as(?DType, .bf16), x.dtype);
+            seen += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    // wq_b is a column slice of the rank's heads: no dense form of it
+    try std.testing.expectError(error.DenseLinearSplit, wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &names, .has = names.split }));
 }
 
 test "each split tensor's ranges: TP2's slices, a 2D node's pair parts of them" {
