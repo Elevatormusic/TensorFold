@@ -316,7 +316,8 @@ test "a mixed pack's dense linears: one bf16 .weight entry for a whole linear, a
             return std.mem.eql(u8, prefix, "layers.0.attn.wq_b");
         }
     };
-    const w = try wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &names, .has = names.has });
+    const ctx: u8 = 0;
+    const w = try wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &ctx, .has = names.has });
     const plain = try wants(a, c, .{ .rank = 0, .world = 2 }, true);
     // each dense linear: its three parts give way to one entry
     try std.testing.expectEqual(plain.len - 2 * 2, w.len);
@@ -330,7 +331,7 @@ test "a mixed pack's dense linears: one bf16 .weight entry for a whole linear, a
     }
     try std.testing.expectEqual(@as(usize, 2), seen);
     // wq_b is a column slice of the rank's heads: no dense form of it
-    try std.testing.expectError(error.DenseLinearSplit, wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &names, .has = names.split }));
+    try std.testing.expectError(error.DenseLinearSplit, wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &ctx, .has = names.split }));
 }
 
 test "each split tensor's ranges: TP2's slices, a 2D node's pair parts of them" {
