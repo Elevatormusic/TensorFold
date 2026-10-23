@@ -203,6 +203,17 @@ fn localRef(root: Value, ref: []const u8) ?Value {
     return null;
 }
 
+/// Whether a propertyNames schema names only quote-free names: a const string, or an enum of strings, none with a quote.
+fn quoteFreeNames(pn: Value) bool {
+    if (pn.get("const")) |c| return c == .string and quoteFree(c.string);
+    if (pn.get("enum")) |e| {
+        if (e != .array) return false;
+        for (e.array) |x| if (x != .string or !quoteFree(x.string)) return false;
+        return true;
+    }
+    return false;
+}
+
 /// Whether the argument names the schema can write (its `properties` keys and `required` names, also through allOf,
 /// anyOf, oneOf and the local $refs it uses; a definition nothing refers to is never written) can be DSML attributes.
 /// A $ref that does not resolve locally fails closed (the names behind it are unknown). `depth` stops a $ref cycle.
@@ -210,6 +221,9 @@ fn argNamesOk(root: Value, schema: Value, depth: usize) bool {
     if (depth > 16) return true;
     if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!quoteFree(k)) return false;
     if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string and !quoteFree(x.string)) return false;
+    // names chosen at run time: a pattern may match a quote, and propertyNames limits them only through const or enum
+    if (schema.get("patternProperties") != null) return false;
+    if (schema.get("propertyNames")) |pn| if (!quoteFreeNames(pn)) return false;
     for ([_][]const u8{ "allOf", "anyOf", "oneOf" }) |kw| if (schema.get(kw)) |members| if (members == .array) for (members.array) |m| {
         if (m == .object and !argNamesOk(root, m, depth + 1)) return false;
     };
@@ -359,6 +373,15 @@ test "a DSML name with a double quote is refused, not written as a broken attrib
     try std.testing.expect(!try dsmlNamesOk(a, escaped.array));
     const lost = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"https://example.com/args.json\"}}}]")).ok;
     try std.testing.expect(!try dsmlNamesOk(a, lost.array));
+    // names chosen at run time: propertyNames with a quote, a pattern or patternProperties are refused; a quote-free const or enum is fine
+    const pn_quote = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"propertyNames\": {\"const\": \"a\\\"b\"}, \"additionalProperties\": {\"type\": \"string\"}, \"minProperties\": 1}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, pn_quote.array));
+    const pn_pattern = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"propertyNames\": {\"pattern\": \"^a\"}, \"additionalProperties\": {\"type\": \"string\"}}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, pn_pattern.array));
+    const pp = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"patternProperties\": {\"^a\": {\"type\": \"integer\"}}}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, pp.array));
+    const pn_ok = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"propertyNames\": {\"enum\": [\"ab\", \"cd\"]}, \"additionalProperties\": {\"type\": \"string\"}}}}]")).ok;
+    try std.testing.expect(try dsmlNamesOk(a, pn_ok.array));
 }
 
 test "a DSML schema with an object-level limit goes whole to the DeepSeek-V4.1 parameter style" {
