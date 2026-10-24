@@ -49,7 +49,19 @@ pub const Shards = struct {
             sh.files[n] = try st.File.open(gpa, io, p);
             n += 1;
             var names = sh.files[n - 1].names.iterator();
-            while (names.next()) |kv| try sh.names.put(gpa, kv.key_ptr.*, @intCast(n - 1));
+            while (names.next()) |kv| {
+                const slot = try sh.names.getOrPut(gpa, kv.key_ptr.*);
+                if (slot.found_existing) {
+                    // same dtype and shape (1017 Engram tables): the later shard wins; else no single source
+                    const was = sh.files[slot.value_ptr.*].get(kv.key_ptr.*).?;
+                    const now = sh.files[n - 1].get(kv.key_ptr.*).?;
+                    if (was.dtype != now.dtype or was.rank != now.rank or !std.mem.eql(usize, was.shape[0..was.rank], now.shape[0..now.rank])) {
+                        std.log.warn("tensor {s} is in two shards with another dtype or shape: {s} and {s}", .{ kv.key_ptr.*, paths.items[slot.value_ptr.*], p });
+                        return error.DuplicateTensor;
+                    }
+                }
+                slot.value_ptr.* = @intCast(n - 1);
+            }
         }
         return sh;
     }
@@ -200,6 +212,8 @@ pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u
         // the 1017 quants hold the Engram q_weight / k_weight tables in bf16; the engine reads them as f32, and the
         // widening is exact (bf16 is an f32's top 16 bits), as the Python loader's .to(torch.float32) is.
         if (from == .bf16 and k.dtype.? == .f32) return widenBfloat(t.bytes, out);
+        // the 2.8 bpw pack's bf16 router weights read as f16, as Python's .to(torch.float16) (round to nearest even)
+        if (from == .bf16 and k.dtype.? == .f16) return narrowBfloat(t.bytes, out);
         return error.UnsupportedConversion;
     }
     const es = (try dtypeOf(t.dtype)).size();
@@ -369,6 +383,10 @@ test "a pack with the engine's own names reads them as before: the converter's n
     var f32_got: [8]u8 = undefined;
     try read(&sh, "layers.1.engram.q_weight|torch.float32", &f32_got);
     try std.testing.expectEqualSlices(u8, body[16..24], &f32_got);
+}
+
+test {
+    _ = @import("checkpoint_test.zig");
 }
 
 test "column, row and whole slices of a toy trellis and its scales" {
