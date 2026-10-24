@@ -498,6 +498,7 @@ fn layerLinears(e: *const Engine, ch: *Chunk, a: *Arena, lay: weights.Layer, max
 /// One linear alone at 128 rows in the chunk's grouped-linear sizes, and its split-K counters (int32 [8 N / 128], zeros,
 /// left zero by each launch).
 fn addLinear(e: *const Engine, ch: *Chunk, a: *Arena, l: weights.Linear, max_gk: *usize, max_gz: *usize) !void {
+    if (l.isDense()) return; // cuBLAS: no rotated rows, partials or counters
     max_gk.* = @max(max_gk.*, l.k);
     max_gz.* = @max(max_gz.*, exl3_linear.zFloats(&[_]weights.Linear{l}, 128));
     if (ch.n_counters == ch.counters.len) return error.TooManyLinears;
@@ -555,19 +556,38 @@ pub fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
 pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
     if (m == 0 or m > 128 or ls.len > 8) return error.NotADecodeWindow;
     var calls: [8]exl3_linear.Call = undefined;
+    var n: usize = 0;
     var off: usize = 0;
     for (ls, 0..) |l, i| {
-        calls[i] = .{ .layer = l, .x = xs[i], .ldx = @intCast(ldxs[i]), .x_dtype = .bf16, .xh = ch.gxh + off * 2, .y = outs[i], .ldy = @intCast(ldos[i]), .y_dtype = types[i], .counters = try counterOf(ch, l) };
+        // a mixed pack's dense linears through cuBLAS, the group's EXL3 ones as before
+        if (l.isDense()) {
+            try denseRows(e, m, l, xs[i], ldxs[i], outs[i], ldos[i], types[i]);
+            continue;
+        }
+        calls[n] = .{ .layer = l, .x = xs[i], .ldx = @intCast(ldxs[i]), .x_dtype = .bf16, .xh = ch.gxh + off * 2, .y = outs[i], .ldy = @intCast(ldos[i]), .y_dtype = types[i], .counters = try counterOf(ch, l) };
         off += m * l.k;
+        n += 1;
     }
-    try exl3_linear.rotMany(e.lin, e.s, calls[0..ls.len], m, true);
-    try exl3_linear.glinear(e.lin, e.s, calls[0..ls.len], m, ch.gz, true, true);
+    if (n == 0) return;
+    try exl3_linear.rotMany(e.lin, e.s, calls[0..n], m, true);
+    try exl3_linear.glinear(e.lin, e.s, calls[0..n], m, ch.gz, true, true);
 }
 
-/// Exl3Group.rotated on m rows already rotated into each call's xh (a kernel that folds the rotation in wrote them):
-/// the glinear launches alone, each call's counters and folds as given.
+/// A dense linear (weights.Linear.dense) on m rows: x bf16 (row stride ldx) into out (row stride ldo, bf16 or fp32).
+pub fn denseRows(e: *const Engine, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, ldo: usize, dt: exl3_linear.DType) !void {
+    if (!l.isDense()) return error.NotDense;
+    const f32_out = switch (dt) {
+        .bf16 => false,
+        .f32 => true,
+        .f16 => return error.UnsupportedDType,
+    };
+    try e.blas.linearDense(x, ldx, l.dense, out, ldo, f32_out, m, l.k, l.n);
+}
+
+/// Exl3Group.rotated on m rows already rotated into each call's xh: the glinear launches alone (dense: denseRows).
 pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl3_linear.Call) !void {
     if (m == 0 or m > 128 or calls.len > exl3_linear.gmax) return error.NotADecodeWindow;
+    for (calls) |c| if (c.layer.isDense()) return error.DenseNotRotated;
     for (calls) |*c| c.counters = try counterOf(ch, c.layer);
     try exl3_linear.glinear(e.lin, e.s, calls, m, ch.gz, true, true);
 }
@@ -711,11 +731,12 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
 
 /// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond 128 rows, the layer's own group (GROUPED) up to 128.
 fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
-    if (m > 128) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
     const dt: exl3_linear.DType = switch (out_type) {
         .bf16 => .bf16,
         .fp32 => .f32,
     };
+    if (l.isDense()) return denseRows(e, m, l, x, ldx, out, os, dt);
+    if (m > 128) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
     try grouped(e, ch, m, &.{l}, &.{x}, &.{ldx}, &.{out}, &.{os}, &.{dt});
 }
 

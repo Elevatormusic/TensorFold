@@ -49,9 +49,10 @@ pub fn main(init: std.process.Init) !u8 {
     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the file is still rank g of 4
     const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2, .parity = parity } else .{ .rank = rank, .world = world };
     const cfg = try dsv41.Config.read(a, io, args[1]);
-    const want = try dsv41.plan.wants(a, cfg, split, dspark);
     var sh = try dsv41.checkpoint.Shards.open(gpa, io, args[1]);
     defer sh.close(io);
+    // a mixed pack's dense linears (a plain <prefix>.weight, no trellis): one bf16 entry each
+    const want = try dsv41.plan.wantsDense(a, cfg, split, dspark, sh.dense());
 
     // every entry's layout first, and from the layouts the index: a missing tensor or a layout the split does not
     // expect stops before a byte is written

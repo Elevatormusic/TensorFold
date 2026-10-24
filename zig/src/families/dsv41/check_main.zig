@@ -37,7 +37,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ix.deinit();
     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the cache file is still rank g of 4
     const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2, .parity = parity } else .{ .rank = rank, .world = world };
-    const want = try dsv41.plan.wants(a, cfg, split, dspark);
+    // a mixed pack's dense linears: planned as the cache holds them
+    const want = try dsv41.plan.wantsDense(a, cfg, split, dspark, dsv41.plan.Dense.inCache(&ix));
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);
     const w = &out.interface;

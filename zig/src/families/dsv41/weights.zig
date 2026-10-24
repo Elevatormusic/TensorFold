@@ -14,10 +14,23 @@ const max_span = 4 << 30;
 /// The size of one direct read within such a stretch.
 const span_piece = 64 << 20;
 
-/// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
-/// plan_n: the N its decode plan is made for, when not n: a 2D node's column part of a TP2 slice keeps that slice's
-/// plan (linear.py pinned plans), so its columns sum in the slice's K order.
-pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0 };
+/// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N]; or dense.
+pub const Linear = struct {
+    words: u64,
+    suh: u64,
+    svh: u64,
+    k: u32,
+    n: u32,
+    k2: u32,
+    /// The N of its decode plan when not n: a 2D column part keeps its TP2 slice's plan (linear.py pinned plans).
+    plan_n: u32 = 0,
+    /// A mixed pack's plain bf16 `<prefix>.weight` [n, k] row-major (EAQ v1.1); words, suh, svh and k2 are then 0.
+    dense: u64 = 0,
+
+    pub fn isDense(l: Linear) bool {
+        return l.dense != 0;
+    }
+};
 
 /// A layer's routed experts and its shared expert (the last entry), as exl3_experts.prepare lays them out. On a 2D node
 /// (exl3/experts2d.py prepare) gate / up hold its intermediate blocks (width of the half's down_k) and down its
@@ -305,10 +318,14 @@ const Loader = struct {
         return L.upload(tensor, L.aux.items);
     }
 
-    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips.
+    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips, or a whole linear the pack holds dense.
     fn linear(L: *Loader, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize) !Linear {
         var kb: [256]u8 = undefined;
         var nb: [256]u8 = undefined;
+        if (cols == null and rows == null) if (try L.denseLinear(prefix)) |d| {
+            if (!plan.denseRunnable(prefix)) return error.DenseLinearUnsupported;
+            return d;
+        };
         const tr = try L.entry(try plan.partKey(&kb, prefix, cols, rows, "tr"));
         const t = try L.shape(try plan.partKey(&kb, prefix, cols, rows, "tr"));
         const kt = t[0];
@@ -321,6 +338,40 @@ const Loader = struct {
         const suh = try L.upload(try std.fmt.bufPrint(&nb, "{s}.suh", .{prefix}), try L.entry(try plan.partKey(&kb, prefix, cols, rows, "suh")));
         const svh = try L.upload(try std.fmt.bufPrint(&nb, "{s}.svh", .{prefix}), try L.entry(try plan.partKey(&kb, prefix, cols, rows, "svh")));
         return .{ .words = words, .suh = suh, .svh = svh, .k = @intCast(kt * 16), .n = @intCast(nt * 16), .k2 = @intCast(w16 / 8) };
+    }
+
+    /// A whole linear the source holds as a plain bf16 `<prefix>.weight` [n, k], uploaded as it is; null: a trellis.
+    fn denseLinear(L: *Loader, prefix: []const u8) !?Linear {
+        var kb: [256]u8 = undefined;
+        var nb: [256]u8 = undefined;
+        if (L.has(try plan.partKey(&kb, prefix, null, null, "tr"))) return null;
+        const key = try plan.denseKey(&kb, prefix);
+        if (!L.has(key)) return null;
+        const s = try L.dims(key);
+        if (s.dtype != .bf16 or s.rank != 2 or s.n % 8 != 0 or s.k % 8 != 0) return error.UnexpectedTensor;
+        const w = try L.upload(try std.fmt.bufPrint(&nb, "{s}.weight", .{prefix}), try L.entry(key));
+        return .{ .words = 0, .suh = 0, .svh = 0, .k = @intCast(s.k), .n = @intCast(s.n), .k2 = 0, .dense = w };
+    }
+
+    fn has(L: *Loader, key: []const u8) bool {
+        return switch (L.src) {
+            .cache => |c| c.index.get(key) != null,
+            .shards => |sh| if (checkpoint.describe(sh, key)) |_| true else |_| false,
+        };
+    }
+
+    /// An entry's dtype, rank and first two dimensions ([n, k] for a dense linear).
+    fn dims(L: *Loader, key: []const u8) !struct { dtype: rank_cache.DType, rank: u8, n: usize, k: usize } {
+        return switch (L.src) {
+            .cache => |c| blk: {
+                const e = c.index.get(key) orelse return error.MissingEntry;
+                break :blk .{ .dtype = e.dtype, .rank = e.rank, .n = e.shape[0], .k = e.shape[1] };
+            },
+            .shards => |sh| blk: {
+                const s = try checkpoint.describe(sh, key);
+                break :blk .{ .dtype = s.dtype, .rank = s.rank, .n = s.shape[0], .k = s.shape[1] };
+            },
+        };
     }
 
     /// A trellis entry's [kt, nt, w16].
