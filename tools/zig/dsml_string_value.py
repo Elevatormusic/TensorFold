@@ -1,9 +1,5 @@
-"""A DSML string argument's grammar (zig/src/server/tool_grammar.zig string_value) against xgrammar's Python package.
-
-The value may hold any text but no `<`, blanks, `/`, blanks, `｜`: an end-tag look-alike such as
-`</｜DSML｜  parameter>` cannot run on inside the value, and the exact end tag is the only way out.
-Run: python -I tools/zig/dsml_string_value.py (prints one line a case; exit 0 when every case is right).
-"""
+"""A DSML string value's grammar (tool_grammar.zig string_value) against xgrammar: end-tag look-alikes stay text."""
+# Run: python -I tools/zig/dsml_string_value.py (one line a case; exit 0 when every case is right).
 
 from __future__ import annotations
 

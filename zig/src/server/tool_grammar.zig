@@ -10,8 +10,7 @@ const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
 
-/// How the template writes a call: inside <tool_call>, Qwen3-Coder's XML (Nemotron, Qwen3.5) or a JSON object; or
-/// DeepSeek-V4.1's DSML block (<｜DSML｜ calls> with an invoke a call and a parameter an argument).
+/// How the template writes a call: Qwen3-Coder XML or JSON in <tool_call>, or DeepSeek-V4.1's DSML calls block.
 pub const Style = enum { xml, json, dsml41 };
 
 const dsml = "\u{ff5c}DSML\u{ff5c}";
@@ -24,9 +23,7 @@ const key = "tfprobe_k";
 /// Blanks around and between calls: the template's newlines, never an endless run.
 const blanks = "[ \\t\\r\\n]{0,8}";
 
-/// A DSML string argument's value: any text with no `<`, blanks, `/`, blanks, `｜` in it, so a look-alike of the end
-/// tag (`</｜DSML｜  parameter>`) cannot run on inside the value and the exact end tag is the only way out.
-/// The states of "no match yet": after text (s0), after `<` and blanks (s1), after `</` and blanks (s2).
+/// A DSML string value: no `<`, blanks, `/`, blanks, `｜` in it, so only the exact end tag ends it (states s0, s1, s2).
 const string_value = "([^<]|<([ \\t\\r\\n<]|/[ \\t\\r\\n]*<)*([^ \\t\\r\\n/<]|/[ \\t\\r\\n]*[^ \\t\\r\\n<\u{ff5c}]))*" ++
     "(<([ \\t\\r\\n<]|/[ \\t\\r\\n]*<)*(/[ \\t\\r\\n]*)?)?";
 
@@ -101,17 +98,13 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
     return node(a, "sequence", &.{.{ "elements", elements }});
 }
 
-/// One DSML invoke: the name, each required argument in the schema's order, then each optional one at most once (in the
-/// schema's order), the close. A plain string argument is the template's string="true" form (text up to the parameter's
-/// close); any other is string="false" with its value as JSON in the property's schema, a string that has enum, const,
-/// pattern or length limits too (tool_parse.zig dsml41Calls reads both). A schema that is more than direct
-/// `properties` (a $ref, $defs or definitions a property may refer to, allOf, anyOf, oneOf, patternProperties, a schema for additionalProperties, or a required name
-/// no property declares) goes whole to xgrammar's own DeepSeek-V4.1 parameter style.
+/// One DSML invoke: the name, required arguments in schema order, optional ones at most once, then the close.
 fn dsmlInvoke(a: Allocator, name: []const u8, schema: Value) Allocator.Error!Value {
     const ws = try node(a, "regex", &.{.{ "pattern", .{ .string = blanks } }});
     var parts: std.ArrayList(Value) = .empty;
     try parts.append(a, try constant(a, try std.fmt.allocPrint(a, "<" ++ dsml ++ " invoke name=\"{s}\">", .{name})));
     const props: ?Value = if (schema.get("properties")) |pv| (if (pv == .object) pv else null) else null;
+    // more than direct `properties` ($ref, $defs, allOf, anyOf, oneOf, ...): xgrammar's own DeepSeek-V4.1 style
     if (needsFullSchema(schema, props)) {
         try parts.appendSlice(a, &.{ ws, try arguments(a, schema, "deepseek_v4_1_xml") });
     } else if (props) |ps| {
@@ -133,9 +126,7 @@ fn dsmlInvoke(a: Allocator, name: []const u8, schema: Value) Allocator.Error!Val
     return .{ .array = parts.items };
 }
 
-/// The object-schema keywords the hand-written parameters cover: the declared properties, which are required, and notes.
-/// Any other keyword (minProperties, maxProperties, dependentRequired, $ref, allOf, a schema for additionalProperties,
-/// $defs, ...) limits the object in a way only xgrammar's own parameter style keeps.
+/// The object keywords the hand-written parameters cover; any other one needs xgrammar's own parameter style.
 const direct_keywords = [_][]const u8{ "type", "properties", "required", "additionalProperties", "description", "title", "default", "examples", "example", "$schema", "$comment", "deprecated" };
 
 /// Whether the call's arguments need more than the direct `properties` of the parameter schema.
@@ -154,8 +145,7 @@ fn needsFullSchema(schema: Value, props: ?Value) bool {
 /// The schema keywords that describe a string without limiting it.
 const plain_keywords = [_][]const u8{ "type", "description", "title", "default", "examples", "example", "$comment", "deprecated", "readOnly", "writeOnly" };
 
-/// A string schema with nothing but its type and notes: its value is raw text. enum, const, pattern, minLength,
-/// maxLength, format and the rest limit it, and only the JSON form carries those limits.
+/// A string schema with only its type and notes: raw text; enum, pattern, length and other limits need the JSON form.
 fn plainString(schema: Value) bool {
     const t = schema.get("type") orelse return false;
     if (t != .string or !std.mem.eql(u8, t.string, "string")) return false;
@@ -170,7 +160,7 @@ fn dsmlParameter(a: Allocator, key_name: []const u8, schema: Value) Allocator.Er
     return node(a, "tag", &.{ .{ "begin", .{ .string = begin } }, .{ "content", content }, .{ "end", .{ .string = "</" ++ dsml ++ " parameter>" } } });
 }
 
-/// DSML writes a name inside double quotes and dsml41Calls ends it at the first one: a name with a quote cannot be a call.
+/// DSML writes a name in double quotes and dsml41Calls ends it at the first one: a quoted name cannot be a call.
 fn quoteFree(name: []const u8) bool {
     return std.mem.indexOfScalar(u8, name, '"') == null;
 }
@@ -190,8 +180,7 @@ fn pointerToken(buf: []u8, token: []const u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// The schema a local `$ref` names in `root`: "#" is the root, "#/a/b" walks the decoded JSON Pointer tokens a, b through
-/// objects (and arrays by index). Null when it does not resolve.
+/// The schema a local `$ref` ("#" or a JSON Pointer "#/a/b", arrays by index) names in `root`; null if unresolved.
 fn localRef(root: Value, ref: []const u8) ?Value {
     if (std.mem.eql(u8, ref, "#")) return root;
     if (!std.mem.startsWith(u8, ref, "#/")) return null;
@@ -213,7 +202,7 @@ fn localRef(root: Value, ref: []const u8) ?Value {
     return at;
 }
 
-/// Whether a propertyNames schema names only quote-free names: a const string, or an enum of strings, none with a quote.
+/// Whether a propertyNames schema allows only quote-free names: a const string, or an enum of strings, none quoted.
 fn quoteFreeNames(pn: Value) bool {
     if (pn.get("const")) |c| return c == .string and quoteFree(c.string);
     if (pn.get("enum")) |e| {
@@ -240,9 +229,7 @@ const Walk = struct {
     }
 };
 
-/// Whether the argument names the schema can write (its `properties` keys and `required` names, also through allOf,
-/// anyOf, oneOf and the local $refs it uses, each walked once; a definition nothing refers to is never written) can be
-/// DSML attributes. A $ref that does not resolve locally, or more distinct $refs than the walk tracks, fails closed.
+/// Whether every argument name the schema can write (through allOf, anyOf, oneOf, local $refs) can be a DSML attribute.
 fn argNamesOk(w: *Walk, schema: Value) bool {
     if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!quoteFree(k)) return false;
     if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string and !quoteFree(x.string)) return false;
@@ -253,6 +240,7 @@ fn argNamesOk(w: *Walk, schema: Value) bool {
         if (m == .object and !argNamesOk(w, m)) return false;
     };
     if (schema.get("$ref")) |ref| if (ref == .string) {
+        // a $ref that does not resolve, or more $refs than the walk tracks, fails closed; each $ref is walked once
         const target = localRef(w.root, ref.string) orelse return false;
         if (w.visited(ref.string) orelse return false) return true;
         if (target == .object and !argNamesOk(w, target)) return false;
@@ -404,7 +392,7 @@ test "a DSML name with a double quote is refused, not written as a broken attrib
     try std.testing.expect(!try dsmlNamesOk(a, nested_ref.array));
     const nested_fine = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/group/$defs/Args\", \"$defs\": {\"group\": {\"$defs\": {\"Args\": {\"type\": \"object\", \"required\": [\"x\"]}}}}}}}]")).ok;
     try std.testing.expect(try dsmlNamesOk(a, nested_fine.array));
-    // names chosen at run time: propertyNames with a quote, a pattern or patternProperties are refused; a quote-free const or enum is fine
+    // run-time names: a quoted propertyNames, a pattern or patternProperties are refused; a quote-free const is fine
     const pn_quote = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"propertyNames\": {\"const\": \"a\\\"b\"}, \"additionalProperties\": {\"type\": \"string\"}, \"minProperties\": 1}}}]")).ok;
     try std.testing.expect(!try dsmlNamesOk(a, pn_quote.array));
     const pn_pattern = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"propertyNames\": {\"pattern\": \"^a\"}, \"additionalProperties\": {\"type\": \"string\"}}}}]")).ok;

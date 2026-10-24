@@ -183,8 +183,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null };
 }
 
-/// Where the first DSML calls block that never closes begins (either spelling), outside the blocks before it; null when
-/// every DSML block closes.
+/// Where the first DSML calls block that never closes begins (either spelling); null when every DSML block closes.
 pub fn openDsml(a: Allocator, text: []const u8) Allocator.Error!?usize {
     const envs = try envelopes(a, text);
     var first: ?usize = null;
@@ -207,8 +206,7 @@ pub fn openDsml(a: Allocator, text: []const u8) Allocator.Error!?usize {
 
 pub const Cut = struct { parsed: Parsed, open: bool };
 
-/// ``parse`` of a finished reply that may end inside a DSML calls block (max_tokens): that block is not a call and none
-/// of its markup is content, as the stream hides it (``reply_text.hideInto``); the complete blocks before it still parse.
+/// ``parse`` of a reply cut in a DSML calls block (max_tokens): that block is hidden, as ``reply_text.hideInto`` does.
 pub fn parseCut(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Cut {
     // a reply that is one bare JSON call (or a list of them) is a call, also when an argument holds a DSML opener
     if (tools.len > 0) {
