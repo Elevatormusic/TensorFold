@@ -319,8 +319,7 @@ pub const Lanes = struct {
         return ln;
     }
 
-    /// Ends the peer link watch (Watch.end, the one teardown: before the model frees its links and rings). `failed`:
-    /// with a follower gone and TF_DS_EXIT_ON_FAULT=1, it does not return (exit 75).
+    /// Ends the peer link watch (Watch.end) before the model frees its links and rings; may exit 75 on `failed`.
     pub fn endWatch(self: *Lanes, how: peer_watch.How) void {
         if (self.watch) |w| _ = w.end(self.gpa, how);
         self.watch = null;
@@ -333,9 +332,7 @@ pub const Lanes = struct {
             self.gpa.destroy(sn);
         }
         self.snaps.deinit(self.gpa);
-        // a requested stop (the server's SIGTERM) is orderly even when a follower went away during it (both ranks got
-        // the signal). Else a follower gone before the done frame is a fault, and so is a done frame that cannot go
-        // out; the followers' close after a done frame that went out is expected (within the watch's one-second wait)
+        // a SIGTERM stop is orderly; else a follower gone before the done frame, or a done frame that fails, is a fault
         const lost = if (self.watch) |w| w.faulted() else false;
         const sent = if (self.peer != null) (if (self.send(.done)) |_| true else |_| false) else true;
         self.endWatch(if (self.stop_requested or (!lost and sent)) .done else .failed);
@@ -893,8 +890,7 @@ fn refused(err: anyerror) void {
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
 pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
 
-/// A watch on `links`. If it cannot start: with TF_DS_EXIT_ON_FAULT=1 the error (the exit 75 contract needs the watch,
-/// so the start fails); else null, and the ranks run as before, without it.
+/// A watch on `links`; if it cannot start, the error with TF_DS_EXIT_ON_FAULT=1 (exit 75 needs it), else null.
 fn watchLinks(gpa: std.mem.Allocator, m: *Model, links: []const ?link.Link) !?*peer_watch.Watch {
     var fds: [3]std.posix.fd_t = undefined;
     var n: usize = 0;
@@ -933,9 +929,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         while (ki.next()) |b| b.free();
         kept.deinit(gpa);
     }
-    // a rank 0 that dies while this rank waits on the GPU for its writes ends this rank too (peer_watch.zig); the done
-    // frame ends the watch orderly, an error ends it failed (exit 75 when rank 0 is gone). The watch starts after the
-    // kept states, so on an error it ends (rings aborted, exit 75) before their device memory is freed
+    // a dead rank 0 ends this rank too (peer_watch.zig); started after the kept states, so it ends before they free
     const watch = try watchLinks(gpa, m, &.{peer});
     errdefer {
         if (watch) |w| _ = w.end(gpa, .failed);

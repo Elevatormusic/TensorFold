@@ -451,15 +451,13 @@ pub const Model = struct {
         try m.ringsOk();
     }
 
-    /// After a stream sync, before its results are used: a ring aborted while the work ran (a peer gone,
-    /// peer_watch.zig) made its collects leave their waits, maybe with stale peer slots, so the work fails.
+    /// After a stream sync: a ring the peer watch aborted during the work may leave stale peer slots, so it fails.
     fn ringsOk(m: *Model) !void {
         var buf: [6]*rdma.Ring = undefined;
         if (rdma.anyFailed(m.rdmaRings(&buf))) return error.RdmaTransportFailed;
     }
 
-    /// Every RDMA ring that a GPU wait of this rank reads: TP2's ring, world 4's three rings (ring2d.zig), and the
-    /// neighbor gather's two (neighbor.zig). The peer watch aborts these; synchronize checks them.
+    /// Every RDMA ring a GPU wait of this rank reads (TP2, ring2d.zig, neighbor.zig): the peer watch aborts these.
     pub fn rdmaRings(m: *Model, buf: *[6]*rdma.Ring) []*rdma.Ring {
         var k: usize = 0;
         if (m.ring) |r| {

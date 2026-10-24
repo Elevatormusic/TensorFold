@@ -3,11 +3,9 @@
 const std = @import("std");
 const c = std.c;
 
-/// TCP_USER_TIMEOUT (Linux): the longest time sent data can stay not acknowledged before the kernel ends the link
-/// (ETIMEDOUT: POLLERR to peer_watch.zig, PeerDown to a read or send). Without it, retransmissions run for many minutes.
+/// TCP_USER_TIMEOUT (Linux): the longest time sent data stays not acknowledged before the kernel ends the link.
 const tcp_user_timeout: u32 = 18;
-/// The same bound as the keepalive (10 s + 3 x 3 s, rounded up). With a keepalive on, Linux also ends an idle link
-/// whose probes get no answer at this time.
+/// The same bound as the keepalive (10 s + 3 x 3 s, rounded up); also the end of an idle link's unanswered probes.
 const user_timeout_ms: u32 = 20_000;
 
 pub const Link = struct {
@@ -22,14 +20,13 @@ pub const Link = struct {
 
     /// TCP_NODELAY, and SO_BUSY_POLL: a read polls the NIC's receive queue itself (up to 50 us) instead of waiting for
     /// its interrupt, whose core may be leaving a deep idle state (node to node, 64-byte frames: round trip 1.0 ms
-    /// blocking, 0.72 ms polling the socket, 11 us with SO_BUSY_POLL). A peer whose node vanished (no FIN) shows
-    /// within about 20 s, to a read and to peer_watch.zig: on an idle link by the keepalive (10 s idle, then 3 probes
-    /// 3 s apart), and with sent data not acknowledged (the node lost power during a round) by TCP_USER_TIMEOUT.
+    /// blocking, 0.72 ms polling the socket, 11 us with SO_BUSY_POLL).
     fn tune(fd: c.fd_t) void {
         const one: c_int = 1;
         const busy_us: c_int = 50;
         _ = c.setsockopt(fd, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
         _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.BUSY_POLL, std.mem.asBytes(&busy_us), @sizeOf(c_int));
+        // a vanished node (no FIN) shows in about 20 s to a read and to peer_watch.zig: keepalive, TCP_USER_TIMEOUT
         _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.KEEPALIVE, std.mem.asBytes(&one), @sizeOf(c_int));
         for ([_][2]u32{ .{ std.posix.TCP.KEEPIDLE, 10 }, .{ std.posix.TCP.KEEPINTVL, 3 }, .{ std.posix.TCP.KEEPCNT, 3 }, .{ tcp_user_timeout, user_timeout_ms } }) |o| {
             const v: c_int = @intCast(o[1]);
@@ -78,7 +75,7 @@ pub const Link = struct {
     fn writeAll(l: Link, bytes: []const u8) !void {
         var done: usize = 0;
         while (done < bytes.len) {
-            // NOSIGNAL: a send to a gone peer fails with PeerDown (no SIGPIPE, which would end the rank with no exit 75)
+            // NOSIGNAL: a send to a gone peer fails with PeerDown (a SIGPIPE would end the rank with no exit 75)
             const n = c.send(l.fd, bytes.ptr + done, bytes.len - done, c.MSG.NOSIGNAL);
             if (n <= 0) {
                 if (n < 0 and c.errno(n) == .INTR) continue;

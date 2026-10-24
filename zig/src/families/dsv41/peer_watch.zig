@@ -1,10 +1,4 @@
-//! A watch on the ranks' TCP links (release fault F3). A rank waits for its peer's frames and RDMA writes without a
-//! limit, so when the peer died while this rank was idle, or during a round whose waits got no error completion, the
-//! rank stayed up: /health said 200 and every request hung. The watch reads nothing: it polls each link for the
-//! peer's end (its process died: the kernel closed the socket) or a failed keepalive (its node is gone, link.zig).
-//! Then it aborts the RDMA rings (every wait gives up, so a live round fails and its requests get the error) and, with
-//! TF_DS_EXIT_ON_FAULT=1, ends the process with 75 after TF_DS_EXIT_GRACE, so a supervisor restarts both ranks.
-//! Watch.end is the one teardown of a watch: every way a rank ends calls it before the rings are freed.
+//! A watch on the ranks' TCP links: a gone peer aborts the RDMA rings, so no request hangs, then optionally exits 75.
 const std = @import("std");
 const rdma = @import("rdma.zig");
 const posix = std.posix;
@@ -12,8 +6,7 @@ const Allocator = std.mem.Allocator;
 
 /// POLLRDHUP (Linux): the peer closed its end.
 const rdhup: i16 = 0x2000;
-/// The peer closed its end, or the connection failed (a keepalive or a send got no answer), or the descriptor is no
-/// longer open (POLLNVAL: a poll on it would return at once, again and again).
+/// The peer closed its end, the link failed (keepalive or send), or the descriptor closed (POLLNVAL would repeat).
 const gone: i16 = rdhup | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
 const max_links = 3;
 /// TP2's ring, world 4's three rings (ring2d.zig), or the neighbor gather's two (neighbor.zig).
@@ -54,8 +47,7 @@ pub const Watch = struct {
     exit_grace: ?u64,
     thread: ?std.Thread = null,
 
-    /// A watch thread on `fds` (rank 0's links to its followers, or a follower's one link to rank 0) that aborts
-    /// `rings` (every RDMA ring this rank's GPU waits on) when a peer is gone. `exit_grace`: faultGrace() (tests: null).
+    /// A thread that polls `fds` (this rank's peer links) and aborts `rings` when a peer is gone; see faultGrace.
     pub fn start(gpa: Allocator, fds: []const posix.fd_t, rings: []const *rdma.Ring, rank: u32, exit_grace: ?u64) !*Watch {
         const w = try gpa.create(Watch);
         errdefer gpa.destroy(w);
@@ -67,22 +59,17 @@ pub const Watch = struct {
         return w;
     }
 
-    /// True when a peer's link has ended (the watch thread saw it, or a poll that does not wait finds it now, before
-    /// the thread sees it): rank 0 reads it before its done frame (a done frame after it is no orderly stop).
+    /// True when a peer's link has ended (seen by the thread or by a poll now); rank 0 reads it before its done frame.
     pub fn faulted(w: *Watch) bool {
         return w.seen.load(.acquire) or w.linkGone();
     }
 
-    /// The one teardown, for every way a rank ends (rank 0's Lanes.deinit, a follower's done frame or error, a start
-    /// that fails after the watch started), always before the caller frees the rings (Model.close):
-    /// 1. on an error, it aborts every RDMA ring, so no GPU wait of this rank waits on a gone peer;
-    /// 2. it stops the watch thread and joins it, so no thread reads the rings after end returns;
-    /// 3. it frees the watch (the caller frees the rings and links next);
-    /// 4. on an error with a peer's link gone and TF_DS_EXIT_ON_FAULT=1, it ends the process with 75 (a normal exit
-    ///    could wait on the gone rank in Model.close).
+    /// The one teardown, for every way a rank ends, always before the caller frees the rings (Model.close).
     pub fn end(w: *Watch, gpa: Allocator, how: How) Outcome {
+        // on an error, no GPU wait of this rank waits on a gone peer
         if (how == .failed) w.abortRings("this rank ends on an error");
         w.running.store(false, .release);
+        // no thread reads the rings after end returns
         if (w.thread) |t| t.join();
         const out: Outcome = switch (how) {
             .done => .orderly,
@@ -91,6 +78,7 @@ pub const Watch = struct {
         const rank = w.rank;
         const exit_on_fault = w.exit_grace != null;
         gpa.destroy(w);
+        // a normal exit could wait on the gone rank in Model.close
         if (out == .peer_fault and exit_on_fault) {
             note("[tensorfold] rank {d}: a peer rank is gone; exit 75 (TF_DS_EXIT_ON_FAULT): a supervisor restarts both ranks\n", .{rank});
             std.c._exit(75);
@@ -104,8 +92,7 @@ pub const Watch = struct {
         for (w.rings[0..w.n_rings]) |r| r.abort(why);
     }
 
-    /// A peer's link has ended now (a poll that does not wait): the error that the caller has may have come from it
-    /// before the watch thread saw it.
+    /// A peer's link has ended now (a poll that does not wait), maybe before the watch thread saw it.
     fn linkGone(w: *Watch) bool {
         var pfds: [max_links]posix.pollfd = undefined;
         for (pfds[0..w.n], w.fds[0..w.n]) |*p, fd| p.* = .{ .fd = fd, .events = rdhup, .revents = 0 };
@@ -193,8 +180,7 @@ fn note(comptime fmt: []const u8, args: anytype) void {
     _ = std.c.send(2, line.ptr, line.len, std.c.MSG.DONTWAIT | std.c.MSG.NOSIGNAL);
 }
 
-/// TF_DS_EXIT_ON_FAULT=1: the grace in ms (TF_DS_EXIT_GRACE seconds, default 5), as lane_host.faultExit reads it. The
-/// exit 75 of a watch (Watch.start's exit_grace); null when the variable is not 1.
+/// TF_DS_EXIT_ON_FAULT=1: the exit 75 grace in ms (TF_DS_EXIT_GRACE s, default 5, as lane_host.faultExit); else null.
 pub fn faultGrace() ?u64 {
     const on = std.c.getenv("TF_DS_EXIT_ON_FAULT") orelse return null;
     if (!std.mem.eql(u8, std.mem.span(on), "1")) return null;
@@ -220,8 +206,7 @@ fn sleepMs(ms: u64) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
-/// The test's peer rank: it connects, then reads frames until a "done" frame or its link ends (keep), or closes its
-/// end after `ms` (dies).
+/// The test's peer rank: it connects, then reads frames until "done" or its link ends, or closes after `die_ms`.
 const Peer = struct {
     port: u16,
     die_ms: ?u64,
