@@ -3,6 +3,11 @@
 const std = @import("std");
 const c = std.c;
 
+/// TCP_USER_TIMEOUT (Linux): the longest time sent data stays not acknowledged before the kernel ends the link.
+const tcp_user_timeout: u32 = 18;
+/// The same bound as the keepalive (10 s + 3 x 3 s, rounded up); also the end of an idle link's unanswered probes.
+const user_timeout_ms: u32 = 20_000;
+
 pub const Link = struct {
     fd: c.fd_t,
 
@@ -21,6 +26,12 @@ pub const Link = struct {
         const busy_us: c_int = 50;
         _ = c.setsockopt(fd, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
         _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.BUSY_POLL, std.mem.asBytes(&busy_us), @sizeOf(c_int));
+        // a vanished node (no FIN) shows in about 20 s to a read and to peer_watch.zig: keepalive, TCP_USER_TIMEOUT
+        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.KEEPALIVE, std.mem.asBytes(&one), @sizeOf(c_int));
+        for ([_][2]u32{ .{ std.posix.TCP.KEEPIDLE, 10 }, .{ std.posix.TCP.KEEPINTVL, 3 }, .{ std.posix.TCP.KEEPCNT, 3 }, .{ tcp_user_timeout, user_timeout_ms } }) |o| {
+            const v: c_int = @intCast(o[1]);
+            _ = c.setsockopt(fd, c.IPPROTO.TCP, o[0], std.mem.asBytes(&v), @sizeOf(c_int));
+        }
     }
 
     fn addr(ip: [4]u8, port: u16) c.sockaddr.in {
@@ -64,7 +75,8 @@ pub const Link = struct {
     fn writeAll(l: Link, bytes: []const u8) !void {
         var done: usize = 0;
         while (done < bytes.len) {
-            const n = c.send(l.fd, bytes.ptr + done, bytes.len - done, 0);
+            // NOSIGNAL: a send to a gone peer fails with PeerDown (a SIGPIPE would end the rank with no exit 75)
+            const n = c.send(l.fd, bytes.ptr + done, bytes.len - done, c.MSG.NOSIGNAL);
             if (n <= 0) {
                 if (n < 0 and c.errno(n) == .INTR) continue;
                 return error.PeerDown;
@@ -153,6 +165,38 @@ pub fn parseIp(text: []const u8) ![4]u8 {
 test "addresses parse as four bytes" {
     try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, try parseIp("192.0.2.7"));
     try std.testing.expectError(error.BadAddress, parseIp("10.200.30"));
+}
+
+fn tcpOption(fd: c.fd_t, level: i32, name: u32) !c_int {
+    var v: c_int = 0;
+    var len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(fd, level, name, &v, &len) != 0) return error.GetSockOptFailed;
+    return v;
+}
+
+test "both ends of a link find a gone peer within 20 s: keepalive and TCP_USER_TIMEOUT" {
+    const io = std.testing.io;
+    const port: u16 = 28400 + @as(u16, @intCast(@mod(std.Io.Timestamp.now(io, .awake).nanoseconds, 500)));
+    const Peer = struct {
+        fn run(p: u16, out: *[2]c_int) void {
+            var l = Link.connect(std.testing.io, .{ 127, 0, 0, 1 }, p, 10) catch return;
+            defer l.close();
+            out[0] = tcpOption(l.fd, c.IPPROTO.TCP, tcp_user_timeout) catch -1;
+            out[1] = tcpOption(l.fd, c.SOL.SOCKET, c.SO.KEEPALIVE) catch -1;
+            var buf: [8]u8 = undefined;
+            _ = l.recv(&buf) catch {}; // until rank 0 closes its end
+        }
+    };
+    var follower: [2]c_int = .{ 0, 0 };
+    const t = try std.Thread.spawn(.{}, Peer.run, .{ port, &follower });
+    var l = try Link.listen(.{ 127, 0, 0, 1 }, port);
+    // rank 0's end (the accepted socket) and rank 1's end (connect)
+    try std.testing.expectEqual(@as(c_int, user_timeout_ms), try tcpOption(l.fd, c.IPPROTO.TCP, tcp_user_timeout));
+    try std.testing.expectEqual(@as(c_int, 1), try tcpOption(l.fd, c.SOL.SOCKET, c.SO.KEEPALIVE));
+    try std.testing.expectEqual(@as(c_int, 10), try tcpOption(l.fd, c.IPPROTO.TCP, std.posix.TCP.KEEPIDLE));
+    l.close();
+    t.join();
+    try std.testing.expectEqual([2]c_int{ user_timeout_ms, 1 }, follower);
 }
 
 test "frames cross a loopback link in order" {

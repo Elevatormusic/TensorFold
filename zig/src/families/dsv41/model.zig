@@ -448,6 +448,31 @@ pub const Model = struct {
     fn synchronize(m: *Model) !void {
         try m.stream.synchronize();
         if (m.neighbor_gather) |*ng| try ng.check();
+        try m.ringsOk();
+    }
+
+    /// After a stream sync: a ring the peer watch aborted during the work may leave stale peer slots, so it fails.
+    fn ringsOk(m: *Model) !void {
+        var buf: [6]*rdma.Ring = undefined;
+        if (rdma.anyFailed(m.rdmaRings(&buf))) return error.RdmaTransportFailed;
+    }
+
+    /// Every RDMA ring a GPU wait of this rank reads (TP2, ring2d.zig, neighbor.zig): the peer watch aborts these.
+    pub fn rdmaRings(m: *Model, buf: *[6]*rdma.Ring) []*rdma.Ring {
+        var k: usize = 0;
+        if (m.ring) |r| {
+            buf[k] = r;
+            k += 1;
+        }
+        if (m.rdma_rings) |rr| for ([_]*rdma.Ring{ rr.all4, rr.col, rr.pair }) |r| {
+            buf[k] = r;
+            k += 1;
+        };
+        if (m.neighbor_gather) |ng| for ([_]*rdma.Ring{ ng.first, ng.second }) |r| {
+            buf[k] = r;
+            k += 1;
+        };
+        return buf[0..k];
     }
 
     /// TP2's RDMA ring for the decode gathers: created on both ranks, the queue-pair infos exchanged over NCCL,
@@ -831,5 +856,7 @@ pub const Model = struct {
         const pool = &m.dpool.?;
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+        // the drafter syncs its stream itself (draft.zig), so its drafts get the same ring check as synchronize
+        try m.ringsOk();
     }
 };

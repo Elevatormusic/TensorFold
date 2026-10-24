@@ -159,7 +159,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
     });
     errdefer st.m.close();
-    st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+    st.lanes = try lanes_mod.Lanes.init(gpa, st.m);
+    errdefer st.lanes.endWatch(.failed); // a failed start closes the model next: the watch ends first
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
@@ -175,6 +176,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 
 fn deinitFn(ptr: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ptr));
+    st.lanes.stop_requested = true; // the server stops (its SIGTERM, or its start failed after open): an orderly end
     st.lanes.deinit(); // rank 1 hears done
     if (st.vision) |v| v.close();
     st.m.close();

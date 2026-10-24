@@ -16,6 +16,7 @@ pub const weights = @import("weights.zig");
 pub const engram_io = @import("engram_io.zig");
 pub const engram_aio = @import("engram_aio.zig");
 pub const link = @import("link.zig");
+pub const peer_watch = @import("peer_watch.zig");
 pub const comm = @import("comm.zig");
 pub const tri = @import("tri.zig");
 pub const tri_basic = @import("tri_basic.zig");
@@ -64,6 +65,7 @@ test {
     refAll(engram_io);
     refAll(engram_aio);
     refAll(link);
+    refAll(peer_watch);
     refAll(comm);
     refAll(tri);
     refAll(tri_basic);

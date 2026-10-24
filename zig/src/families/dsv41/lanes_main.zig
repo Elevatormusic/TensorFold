@@ -185,7 +185,7 @@ pub fn main(init: std.process.Init) !u8 {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, requests_file orelse return error.NoRequests, a, .limited(1 << 30));
     const Requests = struct { requests: []Request };
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
-    var ln = dsv41.lanes.Lanes.init(gpa, m);
+    var ln = try dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
     ln.fix_k = fix_k;
     if (profile) {
