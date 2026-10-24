@@ -43,8 +43,7 @@ pub const Settings = struct {
     probing: bool = false,
 };
 
-/// TF_RDMA_GID_INDEX (the Python build's switch): the GID index of each RDMA device's port 1 that the rings use, for
-/// example the RoCE v2 entry of the link's IPv4 address. 5 when unset, as before.
+/// TF_RDMA_GID_INDEX (as in the Python build): the port 1 GID index the rings use, e.g. RoCE v2 IPv4. 5 when unset.
 pub fn gidIndex() !u8 {
     const raw = std.c.getenv("TF_RDMA_GID_INDEX") orelse return 5;
     const v = std.mem.span(raw);
