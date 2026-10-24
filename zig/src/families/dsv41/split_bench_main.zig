@@ -320,10 +320,23 @@ pub fn main(init: std.process.Init) !u8 {
             try scales.upload(0, hs);
         }
         const run: Run = .{
-            .t = t, .o = &o, .s = stream, .top = top, .n = n, .rb = rb,
+            .t = t,
+            .o = &o,
+            .s = stream,
+            .top = top,
+            .n = n,
+            .rb = rb,
             .kx = .{ .fp4 = .{ .codes = codes.ptr, .scales = scales.ptr } },
-            .q = q.ptr, .w = w.ptr, .vis = vis.ptr, .nvis = nvis.ptr, .keys = keys.ptr, .tmax = tmax.ptr, .bufs = bufs,
-            .parts = parts.ptr, .merged = merged.ptr, .vblk = vblk.ptr,
+            .q = q.ptr,
+            .w = w.ptr,
+            .vis = vis.ptr,
+            .nvis = nvis.ptr,
+            .keys = keys.ptr,
+            .tmax = tmax.ptr,
+            .bufs = bufs,
+            .parts = parts.ptr,
+            .merged = merged.ptr,
+            .vblk = vblk.ptr,
         };
 
         // every output byte, both splits, both patterns; the served keys past vis
