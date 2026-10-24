@@ -43,8 +43,7 @@ pub fn uniform(seed: u64, position: u64, id: u64) f64 {
     return @as(f64, @floatFromInt(x >> 11)) * 0x1p-53 + 0x1p-54;
 }
 
-/// numpy's pairwise sum of a contiguous float64 row (umath pairwise_sum: blocks of 128 summed 8 lanes wide, longer
-/// rows split in halves at a multiple of 8).
+/// numpy's pairwise_sum of a float64 row: blocks of 128 summed 8 lanes wide, longer rows halved at a multiple of 8.
 pub fn pairwiseSum(a: []const f64) f64 {
     const n = a.len;
     if (n < 8) {
@@ -72,9 +71,7 @@ fn before(va: f32, ia: i64, vb: f32, ib: i64) bool {
     return va > vb or (va == vb and ia < ib);
 }
 
-/// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
-/// orders it. A count over max_candidates keeps them in a bounded heap, so a top_k near the vocabulary size costs
-/// O(row * log count), not O(row * count).
+/// The row's first `count` (value, id): torch.topk's set in np.lexsort order; a large count uses a bounded heap.
 pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
     const k = @min(count, row.len);
     if (k > max_candidates) return topCandidatesHeap(row, k, values, ids);
@@ -183,9 +180,7 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     return choose(row, position, s, values, ids, scaled, score, probs);
 }
 
-/// choose_rows for one row on buffers of the candidate count (the caller allocates them, so a failed allocation is its
-/// error, never a different token): the top candidates in lexsort's order, the keyed scores, the top_p and min_p cuts,
-/// the first best score.
+/// choose_rows for one row on caller buffers (a failed allocation is the caller's error, never a different token).
 fn choose(row: []const f32, position: u64, s: Sampling, values: []f32, ids: []i64, scaled: []f64, score: []f64, probs: []f64) i64 {
     const width = topCandidates(row, values.len, values, ids);
     const k = @max(1, @min(s.top_k, width));

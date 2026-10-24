@@ -53,8 +53,7 @@ pub fn failAll(h: *LaneHost, message: []const u8) void {
     taken.deinit(h.gpa);
 }
 
-/// A fault exit ends the queued jobs too: they never reach a lane, and their clients get the error before the process
-/// goes (failAll holds the admitted ones only).
+/// A fault exit fails the queued jobs too, so their clients get the error first (failAll ends admitted ones only).
 pub fn failQueued(h: *LaneHost, message: []const u8) void {
     h.lock();
     // submissions stop first: a request that arrives during the grace sleep gets Closed, not a lost connection
