@@ -98,4 +98,5 @@ test {
     refAll(sampling);
     refAll(model);
     refAll(lanes);
+    refAll(@import("kept_order.zig"));
 }

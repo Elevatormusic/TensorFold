@@ -20,6 +20,7 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
+const kept_order = @import("kept_order.zig");
 const cuda = @import("cuda");
 
 const be = lanes.backend;
@@ -531,16 +532,31 @@ pub const Lanes = struct {
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
-            if (try self.begin(.snap_restore)) {
-                try self.wire.int(gpa, u64, sn.id);
-                try self.wire.int(gpa, u32, @intCast(slot));
-                try self.wire.int(gpa, u64, sn.base);
-                try self.wire.int(gpa, u64, base);
-                try self.wire.int(gpa, u64, sn.at);
-                try self.flush();
-            }
-            if (base != sn.base) try m.copyExtent(sn.base, base, sn.at);
-            try m.snapCopy(slot, sn.buf.ptr, false);
+            // this rank's copies, then the frame (kept_order.zig): a failed copy here sends rank 1 no restore
+            const Restore = struct {
+                self: *Lanes,
+                sn: *Snap,
+                slot: usize,
+                base: usize,
+
+                pub fn copy(x: @This()) !void {
+                    if (x.base != x.sn.base) try x.self.m.copyExtent(x.sn.base, x.base, x.sn.at);
+                    try x.self.m.snapCopy(x.slot, x.sn.buf.ptr, false);
+                }
+
+                pub fn send(x: @This()) !void {
+                    const g = x.self.gpa;
+                    if (try x.self.begin(.snap_restore)) {
+                        try x.self.wire.int(g, u64, x.sn.id);
+                        try x.self.wire.int(g, u32, @intCast(x.slot));
+                        try x.self.wire.int(g, u64, x.sn.base);
+                        try x.self.wire.int(g, u64, x.base);
+                        try x.self.wire.int(g, u64, x.sn.at);
+                        try x.self.flush();
+                    }
+                }
+            };
+            try kept_order.restore(Restore{ .self = self, .sn = sn, .slot = slot, .base = base });
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
@@ -879,14 +895,26 @@ pub const Lanes = struct {
         errdefer self.gpa.destroy(sn);
         sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
         errdefer sn.buf.free();
-        try self.snaps.append(self.gpa, sn);
-        self.next_snap += 1;
-        if (try self.begin(.snap_save)) {
-            try self.wire.int(self.gpa, u64, sn.id);
-            try self.wire.int(self.gpa, u32, @intCast(l.slot));
-            try self.flush();
-        }
-        try self.m.snapCopy(l.slot, sn.buf.ptr, true);
+        self.next_snap += 1; // an id is never used again, also after a failed save
+        // copy, frame, list (kept_order.zig): a failed step leaves no freed state in self.snaps nor a save on rank 1
+        const Save = struct {
+            self: *Lanes,
+            sn: *Snap,
+            slot: usize,
+
+            pub fn copy(x: @This()) !void {
+                try x.self.m.snapCopy(x.slot, x.sn.buf.ptr, true);
+            }
+
+            pub fn send(x: @This()) !void {
+                if (try x.self.begin(.snap_save)) {
+                    try x.self.wire.int(x.self.gpa, u64, x.sn.id);
+                    try x.self.wire.int(x.self.gpa, u32, @intCast(x.slot));
+                    try x.self.flush();
+                }
+            }
+        };
+        try kept_order.save(Snap, self.gpa, &self.snaps, sn, Save{ .self = self, .sn = sn, .slot = l.slot });
         return sn;
     }
 
@@ -1068,9 +1096,20 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const from: usize = @intCast(try r.int(u64));
                 const to: usize = @intCast(try r.int(u64));
                 const at: usize = @intCast(try r.int(u64));
-                const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
-                if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
-                m.snapCopy(s, b.ptr, false) catch |err| refused(err);
+                // a failed copy stops this rank (kept_order.zig): its state would differ from rank 0's
+                const Follow = struct {
+                    m: *Model,
+                    s: usize,
+                    from: usize,
+                    to: usize,
+                    at: usize,
+
+                    pub fn copy(x: @This(), b: cuda.DeviceBuffer) !void {
+                        if (x.from != x.to) try x.m.copyExtent(x.from, x.to, x.at);
+                        try x.m.snapCopy(x.s, b.ptr, false);
+                    }
+                };
+                try kept_order.follow(cuda.DeviceBuffer, &kept, id, Follow{ .m = m, .s = s, .from = from, .to = to, .at = at });
             },
             .snap_drop => {
                 const id = try r.int(u64);
