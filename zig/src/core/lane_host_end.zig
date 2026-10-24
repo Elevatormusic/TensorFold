@@ -41,15 +41,29 @@ pub fn takeCancels(h: *LaneHost) void {
 /// A failed round ends every stream it held, with the backend's error.
 pub fn failAll(h: *LaneHost, message: []const u8) void {
     h.lock();
-    const jobs = h.gpa.dupe(*Job, h.admitted.items) catch &.{};
-    h.admitted.clearRetainingCapacity();
+    // the list itself moves out: no allocation that could fail and drop a job
+    var taken = h.admitted;
+    h.admitted = .empty;
     h.filling.clearRetainingCapacity();
     h.unlock();
-    for (jobs) |job| {
+    for (taken.items) |job| {
         if (!job.stream.finished) h.core.discard(&job.stream);
         h.finish(job, .failed, message);
     }
-    h.gpa.free(jobs);
+    taken.deinit(h.gpa);
+}
+
+/// A fault exit fails the queued jobs too, so their clients get the error first (failAll ends admitted ones only).
+pub fn failQueued(h: *LaneHost, message: []const u8) void {
+    h.lock();
+    // submissions stop first: a request that arrives during the grace sleep gets Closed, not a lost connection
+    h.closing = true;
+    // the queue itself moves out: no allocation that could fail and drop a job
+    var taken = h.queued;
+    h.queued = .empty;
+    h.unlock();
+    for (taken.items) |job| h.finish(job, .failed, message);
+    taken.deinit(h.gpa);
 }
 
 pub fn closeAll(h: *LaneHost) void {

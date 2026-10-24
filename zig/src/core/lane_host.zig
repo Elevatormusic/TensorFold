@@ -21,6 +21,16 @@ const Info = api.Info;
 const Reason = api.Reason;
 const Stats = api.Stats;
 
+/// TF_DS_EXIT_ON_FAULT=1: a failed round exits 75 after TF_DS_EXIT_GRACE s (default 5); null: the host goes on.
+pub fn faultExit() ?u64 {
+    const on = std.c.getenv("TF_DS_EXIT_ON_FAULT") orelse return null;
+    if (!std.mem.eql(u8, std.mem.span(on), "1")) return null;
+    const g = std.c.getenv("TF_DS_EXIT_GRACE") orelse return 5000;
+    const s = std.fmt.parseFloat(f64, std.mem.span(g)) catch return 5000;
+    if (!(s >= 0) or s > 600) return 5000;
+    return @intFromFloat(s * 1000);
+}
+
 pub const LaneHost = struct {
     gpa: Allocator,
     io: std.Io,
@@ -614,6 +624,13 @@ pub const LaneHost = struct {
             h.unlock();
             h.core.step() catch |e| {
                 ends.failAll(h, @errorName(e));
+                if (faultExit()) |grace_ms| {
+                    ends.failQueued(h, @errorName(e));
+                    // device or rank link state is unknown: exit 75 so a supervisor restarts both ranks (as in Python)
+                    std.debug.print("[tensorfold] a round failed ({s}); every live request got the error; exit 75 in {d} ms (TF_DS_EXIT_ON_FAULT)\n", .{ @errorName(e), grace_ms });
+                    std.Io.sleep(h.io, .fromMilliseconds(@intCast(grace_ms)), .awake) catch {};
+                    std.process.exit(75);
+                }
                 continue;
             };
             var i: usize = 0;

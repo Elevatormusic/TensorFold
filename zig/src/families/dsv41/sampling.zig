@@ -43,7 +43,7 @@ pub fn uniform(seed: u64, position: u64, id: u64) f64 {
     return @as(f64, @floatFromInt(x >> 11)) * 0x1p-53 + 0x1p-54;
 }
 
-/// numpy's pairwise sum of a contiguous float64 row (umath pairwise_sum, under its 128-element block).
+/// numpy's pairwise_sum of a float64 row: blocks of 128 summed 8 lanes wide, longer rows halved at a multiple of 8.
 pub fn pairwiseSum(a: []const f64) f64 {
     const n = a.len;
     if (n < 8) {
@@ -51,7 +51,11 @@ pub fn pairwiseSum(a: []const f64) f64 {
         for (a) |v| res += v;
         return res;
     }
-    std.debug.assert(n <= 128);
+    if (n > 128) {
+        var n2 = n / 2;
+        n2 -= n2 % 8;
+        return pairwiseSum(a[0..n2]) + pairwiseSum(a[n2..]);
+    }
     var r: [8]f64 = a[0..8].*;
     var i: usize = 8;
     while (i < n - n % 8) : (i += 8) {
@@ -67,10 +71,10 @@ fn before(va: f32, ia: i64, vb: f32, ib: i64) bool {
     return va > vb or (va == vb and ia < ib);
 }
 
-/// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
-/// orders it.
+/// The row's first `count` (value, id): torch.topk's set in np.lexsort order; a large count uses a bounded heap.
 pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
     const k = @min(count, row.len);
+    if (k > max_candidates) return topCandidatesHeap(row, k, values, ids);
     var n: usize = 0;
     for (row, 0..) |v, i| {
         const id: i64 = @intCast(i);
@@ -84,6 +88,57 @@ pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) 
         values[j] = v;
         ids[j] = id;
         if (n < k) n += 1;
+    }
+    return n;
+}
+
+fn pairSwap(values: []f32, ids: []i64, a: usize, b: usize) void {
+    std.mem.swap(f32, &values[a], &values[b]);
+    std.mem.swap(i64, &ids[a], &ids[b]);
+}
+
+/// The heap keeps the worst candidate (the last in the sort order) at the root.
+fn pairDown(values: []f32, ids: []i64, n: usize, start: usize) void {
+    var i = start;
+    while (true) {
+        var w = i;
+        const l = 2 * i + 1;
+        const r = l + 1;
+        if (l < n and before(values[w], ids[w], values[l], ids[l])) w = l;
+        if (r < n and before(values[w], ids[w], values[r], ids[r])) w = r;
+        if (w == i) return;
+        pairSwap(values, ids, w, i);
+        i = w;
+    }
+}
+
+fn topCandidatesHeap(row: []const f32, k: usize, values: []f32, ids: []i64) usize {
+    var n: usize = 0;
+    for (row, 0..) |v, i| {
+        const id: i64 = @intCast(i);
+        if (n < k) {
+            values[n] = v;
+            ids[n] = id;
+            n += 1;
+            var c = n - 1;
+            while (c > 0) {
+                const p = (c - 1) / 2;
+                if (!before(values[p], ids[p], values[c], ids[c])) break;
+                pairSwap(values, ids, p, c);
+                c = p;
+            }
+        } else if (before(v, id, values[0], ids[0])) {
+            values[0] = v;
+            ids[0] = id;
+            pairDown(values, ids, n, 0);
+        }
+    }
+    // heap sort: the worst goes to the end each time, so the best come first
+    var end = n;
+    while (end > 1) {
+        end -= 1;
+        pairSwap(values, ids, 0, end);
+        pairDown(values, ids, end, 0);
     }
     return n;
 }
@@ -102,15 +157,34 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     if (s.temperature <= 0) return @intCast(argmax(row));
     if (s.top_k == 0) return nucleusRow(row, position, s);
     const count = @min(row.len, s.top_k + margin);
-    if (count > max_candidates) return error.TooManyCandidates;
-    var values: [max_candidates]f32 = undefined;
-    var ids: [max_candidates]i64 = undefined;
-    const width = topCandidates(row, count, &values, &ids);
-    // choose_rows on the candidates (already in lexsort's order)
+    if (count <= max_candidates) {
+        var values: [max_candidates]f32 = undefined;
+        var ids: [max_candidates]i64 = undefined;
+        var scaled: [max_candidates]f64 = undefined;
+        var score: [max_candidates]f64 = undefined;
+        var probs: [max_candidates]f64 = undefined;
+        return choose(row, position, s, values[0..count], ids[0..count], scaled[0..count], score[0..count], probs[0..count]);
+    }
+    // a top_k past max_candidates - margin: the same rule on heap buffers (no per-stream error that fails a round)
+    const gpa = std.heap.page_allocator;
+    const values = try gpa.alloc(f32, count);
+    defer gpa.free(values);
+    const ids = try gpa.alloc(i64, count);
+    defer gpa.free(ids);
+    const scaled = try gpa.alloc(f64, count);
+    defer gpa.free(scaled);
+    const score = try gpa.alloc(f64, count);
+    defer gpa.free(score);
+    const probs = try gpa.alloc(f64, count);
+    defer gpa.free(probs);
+    return choose(row, position, s, values, ids, scaled, score, probs);
+}
+
+/// choose_rows for one row on caller buffers (a failed allocation is the caller's error, never a different token).
+fn choose(row: []const f32, position: u64, s: Sampling, values: []f32, ids: []i64, scaled: []f64, score: []f64, probs: []f64) i64 {
+    const width = topCandidates(row, values.len, values, ids);
     const k = @max(1, @min(s.top_k, width));
     const t = @max(s.temperature, 1e-6);
-    var scaled: [max_candidates]f64 = undefined;
-    var score: [max_candidates]f64 = undefined;
     for (0..k) |j| {
         scaled[j] = @as(f64, values[j]) / t;
         const u = uniform(s.seed, position, @bitCast(ids[j]));
@@ -119,7 +193,6 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     if (0.0 < s.top_p and s.top_p < 1.0) {
         var mx = scaled[0];
         for (scaled[1..k]) |v| mx = @max(mx, v);
-        var probs: [max_candidates]f64 = undefined;
         for (0..k) |j| probs[j] = exp(scaled[j] - mx);
         const sum = pairwiseSum(probs[0..k]);
         for (0..k) |j| probs[j] /= sum;
@@ -359,6 +432,21 @@ test "numpy's pairwise sum" {
     try std.testing.expectEqual(want, pairwiseSum(&a));
 }
 
+test "a top_k past the stack buffers draws as the same rule, and numpy's long pairwise sum" {
+    var row: [300]f32 = undefined;
+    for (&row, 0..) |*x, j| x.* = @as(f32, @floatFromInt(j % 37)) * 0.25;
+    for (0..20) |p| {
+        const t = try sampleRow(&row, p, .{ .seed = 9, .top_k = 100, .top_p = 0.9 });
+        try std.testing.expect(t >= 0 and t < 300);
+        try std.testing.expect(row[@intCast(t)] >= 4.0); // inside the nucleus of the larger values
+    }
+    var a: [300]f64 = undefined;
+    for (&a, 0..) |*x, j| x.* = 1.0 / @as(f64, @floatFromInt(j + 1));
+    // n 300: halves at 144 (150 - 150 % 8), then 144 and 156 (> 128: 72 + 84)
+    const want = (pairwiseSum(a[0..72]) + pairwiseSum(a[72..144])) + (pairwiseSum(a[144..216]) + pairwiseSum(a[216..300]));
+    try std.testing.expectEqual(want, pairwiseSum(&a));
+}
+
 test "top candidates by value, then id" {
     const row = [_]f32{ 1, 5, 3, 5, 2, 5, 0 };
     var v: [4]f32 = undefined;
@@ -406,5 +494,33 @@ test "nucleus: the heap-first rule draws as the full sort does, peaked and flat 
                 }
             }
         }
+    }
+}
+
+test "top candidates past max_candidates come from the heap in the same order" {
+    var prng = std.Random.DefaultPrng.init(77);
+    const rnd = prng.random();
+    const row = try std.testing.allocator.alloc(f32, 5000);
+    defer std.testing.allocator.free(row);
+    // few distinct values: many ties, so the lower-id rule decides
+    for (row) |*x| x.* = @floatFromInt(rnd.intRangeAtMost(i32, 0, 300));
+    for ([_]usize{ 65, 200, 1500, 5000 }) |count| {
+        const v = try std.testing.allocator.alloc(f32, count);
+        defer std.testing.allocator.free(v);
+        const ids = try std.testing.allocator.alloc(i64, count);
+        defer std.testing.allocator.free(ids);
+        try std.testing.expectEqual(count, topCandidates(row, count, v, ids));
+        // the order a full sort gives: value descending, then id ascending
+        const all = try std.testing.allocator.alloc(i64, row.len);
+        defer std.testing.allocator.free(all);
+        for (all, 0..) |*a, i| a.* = @intCast(i);
+        const Ctx = struct {
+            row: []const f32,
+            fn lt(c: @This(), a: i64, b: i64) bool {
+                return before(c.row[@intCast(a)], a, c.row[@intCast(b)], b);
+            }
+        };
+        std.mem.sort(i64, all, Ctx{ .row = row }, Ctx.lt);
+        try std.testing.expectEqualSlices(i64, all[0..count], ids);
     }
 }
