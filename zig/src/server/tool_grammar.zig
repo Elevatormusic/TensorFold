@@ -48,7 +48,7 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
     var scratch: Cx = .{ .a = cx.a };
     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
     const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object) or DSML calls, and this one does not: send \"auto\"");
-    if (s == .dsml41 and !try dsmlNamesOk(cx.a, tools)) return cx.refuse("tool_choice \"required\" or a named function cannot write a tool or argument name with a double quote in a DSML call: send \"auto\"");
+    if (s == .dsml41 and !try dsmlNamesOk(cx.a, tools)) return cx.refuse("tool_choice \"required\" or a named function cannot write an empty tool or argument name, or one with a double quote or DSML markup, in a DSML call: send \"auto\"");
     const text = try build(cx.a, s, tools, parallel);
     return srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
 }
@@ -160,9 +160,9 @@ fn dsmlParameter(a: Allocator, key_name: []const u8, schema: Value) Allocator.Er
     return node(a, "tag", &.{ .{ "begin", .{ .string = begin } }, .{ "content", content }, .{ "end", .{ .string = "</" ++ dsml ++ " parameter>" } } });
 }
 
-/// DSML writes a name in double quotes and dsml41Calls ends it at the first one: a quoted name cannot be a call.
-fn quoteFree(name: []const u8) bool {
-    return std.mem.indexOfScalar(u8, name, '"') == null;
+/// A name dsml41Calls reads back: not empty, no double quote (it ends the attribute), no DSML markup (it ends a block).
+fn attrSafe(name: []const u8) bool {
+    return name.len > 0 and std.mem.indexOfScalar(u8, name, '"') == null and std.mem.indexOf(u8, name, dsml) == null;
 }
 
 /// A JSON Pointer token with ~1 read as / and ~0 as ~ (RFC 6901), in `buf`; null when it does not fit.
@@ -202,12 +202,12 @@ fn localRef(root: Value, ref: []const u8) ?Value {
     return at;
 }
 
-/// Whether a propertyNames schema allows only quote-free names: a const string, or an enum of strings, none quoted.
-fn quoteFreeNames(pn: Value) bool {
-    if (pn.get("const")) |c| return c == .string and quoteFree(c.string);
+/// Whether a propertyNames schema allows only attrSafe names: a const string, or an enum of strings.
+fn attrSafeNames(pn: Value) bool {
+    if (pn.get("const")) |c| return c == .string and attrSafe(c.string);
     if (pn.get("enum")) |e| {
         if (e != .array) return false;
-        for (e.array) |x| if (x != .string or !quoteFree(x.string)) return false;
+        for (e.array) |x| if (x != .string or !attrSafe(x.string)) return false;
         return true;
     }
     return false;
@@ -231,11 +231,11 @@ const Walk = struct {
 
 /// Whether every argument name the schema can write (through allOf, anyOf, oneOf, local $refs) can be a DSML attribute.
 fn argNamesOk(w: *Walk, schema: Value) bool {
-    if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!quoteFree(k)) return false;
-    if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string and !quoteFree(x.string)) return false;
+    if (schema.get("properties")) |ps| if (ps == .object) for (ps.object.keys()) |k| if (!attrSafe(k)) return false;
+    if (schema.get("required")) |r| if (r == .array) for (r.array) |x| if (x == .string and !attrSafe(x.string)) return false;
     // names chosen at run time: a pattern may match a quote, and propertyNames limits them only through const or enum
     if (schema.get("patternProperties") != null) return false;
-    if (schema.get("propertyNames")) |pn| if (!quoteFreeNames(pn)) return false;
+    if (schema.get("propertyNames")) |pn| if (!attrSafeNames(pn)) return false;
     for ([_][]const u8{ "allOf", "anyOf", "oneOf" }) |kw| if (schema.get(kw)) |members| if (members == .array) for (members.array) |m| {
         if (m == .object and !argNamesOk(w, m)) return false;
     };
@@ -251,7 +251,7 @@ fn argNamesOk(w: *Walk, schema: Value) bool {
 /// Whether every offered tool name and argument name can be written in DSML attributes.
 fn dsmlNamesOk(a: Allocator, tools: []const Value) Allocator.Error!bool {
     for (tools) |t| {
-        if (!quoteFree(try tool_specs.toolName(a, t))) return false;
+        if (!attrSafe(try tool_specs.toolName(a, t))) return false;
         var walk: Walk = .{ .root = try parameters(a, t) };
         if (!argNamesOk(&walk, walk.root)) return false;
     }
@@ -390,6 +390,11 @@ test "a DSML name with a double quote is refused, not written as a broken attrib
     // a nested pointer: #/$defs/group/$defs/Args
     const nested_ref = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/group/$defs/Args\", \"$defs\": {\"group\": {\"$defs\": {\"Args\": {\"type\": \"object\", \"required\": [\"x\\\"y\"]}}}}}}}]")).ok;
     try std.testing.expect(!try dsmlNamesOk(a, nested_ref.array));
+    // an empty name, or one with DSML markup, does not read back from the calls block
+    const empty = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"properties\": {\"\": {\"type\": \"integer\"}}, \"required\": [\"\"]}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, empty.array));
+    const markup = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"type\": \"object\", \"properties\": {\"</\u{ff5c}DSML\u{ff5c} calls>\": {\"type\": \"string\"}}}}}]")).ok;
+    try std.testing.expect(!try dsmlNamesOk(a, markup.array));
     const nested_fine = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"w\", \"parameters\": {\"$ref\": \"#/$defs/group/$defs/Args\", \"$defs\": {\"group\": {\"$defs\": {\"Args\": {\"type\": \"object\", \"required\": [\"x\"]}}}}}}}]")).ok;
     try std.testing.expect(try dsmlNamesOk(a, nested_fine.array));
     // run-time names: a quoted propertyNames, a pattern or patternProperties are refused; a quote-free const is fine
