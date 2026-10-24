@@ -584,9 +584,7 @@ pub fn denseRows(e: *const Engine, m: usize, l: weights.Linear, x: u64, ldx: usi
     try e.blas.linearDense(x, ldx, l.dense, out, ldo, f32_out, m, l.k, l.n);
 }
 
-/// Exl3Group.rotated on m rows already rotated into each call's xh (a kernel that folds the rotation in wrote them):
-/// the glinear launches alone, each call's counters and folds as given. A dense linear has no rotated rows: its
-/// caller runs it from the normed rows (denseRows).
+/// Exl3Group.rotated on m rows already rotated into each call's xh: the glinear launches alone (dense: denseRows).
 pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl3_linear.Call) !void {
     if (m == 0 or m > 128 or calls.len > exl3_linear.gmax) return error.NotADecodeWindow;
     for (calls) |c| if (c.layer.isDense()) return error.DenseNotRotated;

@@ -144,8 +144,7 @@ pub fn denseKey(buf: []u8, prefix: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}.weight|None", .{prefix});
 }
 
-/// Which linears a mixed pack holds dense (a plain `<prefix>.weight` and no trellis): `has(ctx, prefix)`. A whole
-/// linear the predicate names is planned as its dense entry; a split one (2D / TP column or row parts) is refused.
+/// Which whole linears a mixed pack holds dense (`has(ctx, prefix)`); a split (2D / TP part) dense linear is refused.
 pub const Dense = struct {
     ctx: *const anyopaque,
     has: *const fn (ctx: *const anyopaque, prefix: []const u8) bool,
