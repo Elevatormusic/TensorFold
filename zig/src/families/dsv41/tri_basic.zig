@@ -19,9 +19,9 @@ fn ci(name: []const u8, v: usize) aot.Const {
 pub fn hcPre(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, rows: usize, d: usize) !void {
     try t.run("_hc_partial", .{ u(rows), hc_blocks, 1 }, &.{ p("X", "*bf16", h), p("FN", "*fp32", fn_w), p("PART", "*fp32", part) }, &.{ ci("WIDE", 4 * d), ci("NB", hc_blocks), ci("SUB", 128) });
     try t.run("_hc_finish", .{ u(rows), 1, 1 }, &.{
-        p("X", "*bf16", h),          p("PART", "*fp32", part),       p("BASE", "*fp32", base), p("SCALE", "*fp32", scale),
-        p("PRE_IN", "*fp32", pre_in), p("NW", "*bf16", norm_w),      p("OUT", "*bf16", out),   p("PRE_OUT", "*fp32", pre_out),
-        p("POST", "*fp32", post),    p("COMB", "*fp32", comb),       aot.float("eps", eps),    aot.float("hc_eps", hc_eps),
+        p("X", "*bf16", h),           p("PART", "*fp32", part), p("BASE", "*fp32", base), p("SCALE", "*fp32", scale),
+        p("PRE_IN", "*fp32", pre_in), p("NW", "*bf16", norm_w), p("OUT", "*bf16", out),   p("PRE_OUT", "*fp32", pre_out),
+        p("POST", "*fp32", post),     p("COMB", "*fp32", comb), aot.float("eps", eps),    aot.float("hc_eps", hc_eps),
     }, &.{ ci("D", d), ci("NB", hc_blocks), ci("ITERS", iters), ci("BLOCK", 1024) });
 }
 
