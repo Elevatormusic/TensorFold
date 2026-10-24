@@ -1,10 +1,7 @@
-//! The order of the kept prompt state primitives on the ranks (lanes.zig). Rank 0 issues its own copies first and
-//! sends the frame only after them, so a follower never keeps or restores a state that rank 0 does not keep. A
-//! follower that cannot do a restore that rank 0 did stops: if it continued, its state would differ from rank 0's.
+//! Kept prompt state order on the ranks (lanes.zig): rank 0 copies before the frame; a failed follower restore stops.
 const std = @import("std");
 
-/// Saves kept state `sn` on every rank: room in `list` first, then this rank's copy (`x.copy`), then the frame to the
-/// followers (`x.send`), then `sn` into `list`. If a step fails, `sn` is not in `list`; a failed copy sends no frame.
+/// Saves kept state `sn`: room in `list`, this rank's copy, the frame, then `sn` into `list` (no entry on a failure).
 pub fn save(comptime T: type, gpa: std.mem.Allocator, list: *std.ArrayList(*T), sn: *T, x: anytype) !void {
     try list.ensureUnusedCapacity(gpa, 1);
     try x.copy();
@@ -12,7 +9,7 @@ pub fn save(comptime T: type, gpa: std.mem.Allocator, list: *std.ArrayList(*T), 
     list.appendAssumeCapacity(sn);
 }
 
-/// Restores a kept state on rank 0: its copies (`x.copy`) first, then the frame (`x.send`). A failed copy sends no frame.
+/// Restores a kept state on rank 0: its copies (`x.copy`) first, then the frame; a failed copy sends no frame.
 pub fn restore(x: anytype) !void {
     try x.copy();
     try x.send();

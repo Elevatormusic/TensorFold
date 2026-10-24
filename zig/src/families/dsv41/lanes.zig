@@ -840,8 +840,7 @@ pub const Lanes = struct {
         sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
         errdefer sn.buf.free();
         self.next_snap += 1; // an id is never used again, also after a failed save
-        // this rank's copy, then the frame, then the list (kept_order.zig): a failed step leaves no freed state in
-        // self.snaps, and a failed copy sends rank 1 no save
+        // copy, frame, list (kept_order.zig): a failed step leaves no freed state in self.snaps nor a save on rank 1
         const Save = struct {
             self: *Lanes,
             sn: *Snap,
@@ -1040,8 +1039,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const from: usize = @intCast(try r.int(u64));
                 const to: usize = @intCast(try r.int(u64));
                 const at: usize = @intCast(try r.int(u64));
-                // rank 0 restores only states both ranks keep, and sends the frame after its own copies: a copy that
-                // fails here stops this rank (kept_order.zig), as its state would differ from rank 0's
+                // a failed copy stops this rank (kept_order.zig): its state would differ from rank 0's
                 const Follow = struct {
                     m: *Model,
                     s: usize,
