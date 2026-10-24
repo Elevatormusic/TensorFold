@@ -84,6 +84,14 @@ pub const Blas = struct {
         try b.check(b.api.cublasGemmEx(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, bf16_type, @intCast(k), x, bf16_type, @intCast(ldx), &zero, out, out_type, @intCast(ldo), 68, 99));
     }
 
+    /// linearDense with beta 1 and a bf16 out: out += x @ w^T (the TFE head's residual adds, eagle.zig), the sum in
+    /// fp32 and rounded once.
+    pub fn linearDenseAdd(b: *const Blas, x: u64, ldx: usize, w: u64, out: u64, ldo: usize, rows: usize, k: usize, n: usize) Error!void {
+        const one: f32 = 1;
+        const bf16_type: c_int = 14; // CUDA_R_16BF
+        try b.check(b.api.cublasGemmEx(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, bf16_type, @intCast(k), x, bf16_type, @intCast(ldx), &one, out, bf16_type, @intCast(ldo), 68, 99));
+    }
+
     /// torch.matmul of x [rows, k] fp32 (row-major) and w [n, k] fp32 transposed: out [rows, n] fp32, as torch issues
     /// it (column-major C^T = W x^T: transa T, transb N, m = n, n = rows, lda = ldb = k, ldc = n, alpha 1, beta 0).
     pub fn xwT(b: *const Blas, x: u64, w: u64, out: u64, rows: usize, k: usize, n: usize) Error!void {
