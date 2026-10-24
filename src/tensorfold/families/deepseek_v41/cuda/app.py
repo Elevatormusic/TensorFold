@@ -91,7 +91,8 @@ class DsApp(App):
         from .vision import PLACEHOLDER
 
         # split refused every placeholder that the client wrote, so each one left in content is the server's own
-        prepared = super()._prepare({**body, "messages": text_messages}, chat, plain_keep=(PLACEHOLDER,))
+        prepared = super()._prepare({**body, "messages": text_messages}, chat, plain_keep=(PLACEHOLDER,),
+                                    allow_images=True)
         try:
             vp = vision.expand(prepared.prompt, pictures)
         except ValueError as exc:

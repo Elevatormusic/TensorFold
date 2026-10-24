@@ -296,8 +296,10 @@ class DsVision:
                    for m in messages or [])
 
     def split(self, messages: list) -> tuple[list, list[Picture]]:
-        """Messages with every image part replaced by the placeholder (content as one string, DeepSeek's join) and
-        the decoded pictures in prompt order. ValueError for anything DeepSeek's encoding refuses."""
+        """Messages with every image part replaced by an image block, which the checkpoint's template turns into the
+        placeholder, and the decoded pictures in prompt order. The blocks stay because the template's joined_text
+        macro is written for them and refuses a string that carries the placeholder. ValueError for anything
+        DeepSeek's encoding refuses."""
 
         out, pictures = [], []
         for m in messages:
@@ -332,7 +334,18 @@ class DsVision:
                     texts.append(text)
                 else:
                     raise ValueError("content parts must be text or image_url")
-            out.append({**m, "content": "\n\n".join(texts)})
+            # Keep the block list the template is written for: its own joined_text macro turns an image/image_url
+            # block into PLACEHOLDER, so the checkpoint's stock template renders the prompt instead of refusing it
+            # ("Message content contains image special token"). Flattening to one string here made every image
+            # request 400 with the stock chat_template.jinja.
+            blocks = []
+            for part in content:
+                kind = part.get("type") if isinstance(part, dict) else None
+                if kind in ("image_url", "image"):
+                    blocks.append({"type": "image"})
+                elif kind == "text":
+                    blocks.append({"type": "text", "text": part["text"]})
+            out.append({**m, "content": blocks})
         return out, pictures
 
     def expand(self, ids: list[int], pictures: list[Picture]) -> VisionPrompt:

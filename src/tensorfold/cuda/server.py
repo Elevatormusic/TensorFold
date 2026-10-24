@@ -250,8 +250,11 @@ class App:
                     raise RequestError(f"{name} must be an integer token count") from exc
         return max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens))
 
-    def _prepare(self, body: dict[str, Any], chat: bool, plain_keep: tuple[str, ...] = ()) -> PreparedRequest:
-        """``plain_keep``: spellings that the server itself wrote into this request's message content."""
+    def _prepare(self, body: dict[str, Any], chat: bool, plain_keep: tuple[str, ...] = (),
+                 allow_images: bool = False) -> PreparedRequest:
+        """``plain_keep``: spellings that the server itself wrote into this request's message content.
+        ``allow_images``: the caller already replaced every image part with the placeholder block, so the messages
+        keep their block list and the template's own image path renders the placeholder."""
 
         from jinja2.exceptions import TemplateError
 
@@ -311,7 +314,7 @@ class App:
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             plain = self._plain_text()
             # the shield sees the messages as the template gets them: a JSON escape or a split text part hides nothing
-            shield = plain.shield(self.template.prepared(body["messages"]), tools, kwargs,
+            shield = plain.shield(self.template.prepared(body["messages"], allow_images=allow_images), tools, kwargs,
                                   content_keep=plain_keep) if plain else None
             if shield is not None and (shield.table or plain.normalizes):    # a spelling in the request's text: plain text, not a token
                 try:
@@ -321,7 +324,7 @@ class App:
                     raise RequestError(f"the chat template rejected the request: {shield.spelled(str(exc))}") from exc
                 prompt = plain.encode(text, shield)
             else:
-                text = render(body["messages"])
+                text = render(body["messages"], allow_images=allow_images) if allow_images else render(body["messages"])
                 prompt = self._encode(text, False)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])

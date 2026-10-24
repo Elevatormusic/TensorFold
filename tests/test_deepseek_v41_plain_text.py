@@ -33,7 +33,7 @@ def test_the_family_asks_for_plain_message_text():
 def test_the_image_placeholder_is_kept_only_on_the_image_path(monkeypatch):
     seen = []
 
-    def prepare(self, body, chat, plain_keep=()):
+    def prepare(self, body, chat, plain_keep=(), **kwargs):
         seen.append((body["messages"], plain_keep))
         return PreparedRequest([1], 8, [], False, None)
 
