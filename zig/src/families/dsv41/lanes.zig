@@ -18,6 +18,7 @@ const lanes = @import("lanes");
 const model = @import("model.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
+const eagle = @import("eagle.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const peer_watch = @import("peer_watch.zig");
@@ -249,6 +250,32 @@ pub const Profile = struct {
     prefills: u64 = 0,
 };
 
+/// TF_DS_ACCEPT_LOG=N: kept held drafts by position (a draft kept: it and all before equal the draws), on stderr.
+pub const AcceptLog = struct {
+    every: u64,
+    rounds: u64 = 0,
+    windows: u64 = 0,
+    asked: [window_rows]u64 = @splat(0),
+    kept: [window_rows]u64 = @splat(0),
+
+    fn note(x: *AcceptLog, drafts: []const u32, sampled: []const u32) void {
+        if (drafts.len == 0) return;
+        x.windows += 1;
+        var ok = true;
+        for (drafts, 0..) |d, j| {
+            x.asked[j] += 1;
+            ok = ok and j < sampled.len and sampled[j] == d;
+            if (ok) x.kept[j] += 1;
+        }
+    }
+
+    fn endRound(x: *AcceptLog) void {
+        x.rounds += 1;
+        if (x.rounds % x.every != 0) return;
+        std.debug.print("{{\"accept_by_pos\": {{\"rounds\": {d}, \"windows\": {d}, \"asked\": {any}, \"kept\": {any}}}}}\n", .{ x.rounds, x.windows, x.asked, x.kept });
+    }
+};
+
 /// A round-cost table "30.0,35.2,..." (TF_DS_ROUND_MS's form): ms by rows from 1.
 pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
     var out: std.ArrayList(f64) = .empty;
@@ -318,9 +345,21 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
+    eagle_drafts: usize = eagle.max_steps, // TF_DS_EAGLE_DRAFTS: a stream's TFE drafts a round at most (1 to 5)
+    accept_log: ?AcceptLog = null, // TF_DS_ACCEPT_LOG
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) !Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+        if (std.c.getenv("TF_DS_ACCEPT_LOG")) |v| {
+            const every = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return error.BadAcceptLog;
+            if (every == 0) return error.BadAcceptLog;
+            ln.accept_log = .{ .every = every };
+        }
+        if (std.c.getenv("TF_DS_EAGLE_DRAFTS")) |v| {
+            const k = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadEagleDrafts;
+            if (k == 0 or k > eagle.max_steps) return error.BadEagleDrafts;
+            ln.eagle_drafts = k;
+        }
         if (m.world > 1) ln.watch = try watchLinks(gpa, m, m.followers());
         // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
         const t = m.round_ms;
@@ -380,7 +419,7 @@ pub const Lanes = struct {
             .mtp = drafting,
             .speculate = drafting,
             .speculate_early = false,
-            .drafts = if (self.m.dr) |dr| @intCast(dr.n) else 1,
+            .drafts = @intCast(self.blockDrafts()),
             .window_costs = self.wc[0..],
             .mtp_step_ms = draft.draft_ms,
             .streams_exact = true,
@@ -391,6 +430,13 @@ pub const Lanes = struct {
             .draft_probabilities = drafting,
             .draft_streams = drafting,
         };
+    }
+
+    /// A stream's drafts a round at most: DSpark's block, the TFE head's setting, else 1.
+    fn blockDrafts(self: *const Lanes) usize {
+        if (self.m.dr) |dr| return dr.n;
+        if (self.m.eg != null) return self.eagle_drafts;
+        return 1;
     }
 
     fn of(ptr: *anyopaque) *Lanes {
@@ -726,7 +772,9 @@ pub const Lanes = struct {
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
             l.nheld = 0;
+            if (self.accept_log) |*x| x.note(o.drafts[0..w.held], o.sampled[0..w.rows()]);
         }
+        if (self.accept_log) |*x| x.endRound();
     }
 
     /// The caches are positional: the next window starts at the stream's new length and writes over the rows past it.
@@ -743,8 +791,8 @@ pub const Lanes = struct {
         const self = of(ptr);
         const m = self.m;
         const gpa = self.gpa;
-        if (m.dr == null) return error.NoDraftHead;
-        const block = m.dr.?.n;
+        if (!m.drafting()) return error.NoDraftHead;
+        const block = self.blockDrafts();
         var tokens: [max_streams]i64 = undefined;
         var q0: [max_streams]i64 = undefined;
         var slots: [max_streams]i64 = undefined;
@@ -769,6 +817,29 @@ pub const Lanes = struct {
             n += 1;
         }
         if (n == 0) return;
+        if (m.eg) |eg| {
+            // the TFE head runs on rank 0 alone (rank 1 gets the drafts in the verify frame): no frame
+            var reqs: [max_streams]eagle.Req = undefined;
+            for (0..n) |i| {
+                const sl: usize = @intCast(slots[i]);
+                reqs[i] = .{ .slot = sl, .q0 = @intCast(q0[i]), .pending = tokens[i], .seq = self.seqs[sl].items };
+            }
+            const t0 = m.now();
+            try m.eaglePass(reqs[0..n], steps);
+            if (self.prof) |*p| {
+                p.pass += m.now() - t0;
+                p.passes += 1;
+                p.pass_streams += n;
+            }
+            for (asked[0..n], depths[0..n], 0..) |l, k, i| {
+                for (0..k) |j| {
+                    l.held[j] = @intCast(eg.drafts[i][j]);
+                    l.confs[j] = eg.confs[i][j];
+                }
+                l.nheld = k;
+            }
+            return;
+        }
         if (try self.begin(.pass)) {
             try self.wire.int(gpa, u32, @intCast(n));
             try self.wire.int(gpa, u32, @intCast(steps));
@@ -810,7 +881,7 @@ pub const Lanes = struct {
         survivals(l.confs[0..out.len], out);
         const live = @max(1, self.streams.count());
         if (self.served_k == .all or (self.served_k == .solo and live == 1)) {
-            const drafts: usize = if (self.m.dr) |dr| dr.n else 1;
+            const drafts = self.blockDrafts();
             const kmax = @min(out.len, draft.depth(live, drafts, self.m.eng.round_rows));
             const k = draft.chooseK(l.confs[0..out.len], kmax, live, drafts, self.m.eng.round_rows);
             for (out[k..]) |*o| o.* = 0.0;
