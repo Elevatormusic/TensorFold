@@ -322,7 +322,10 @@ const Loader = struct {
     fn linear(L: *Loader, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize) !Linear {
         var kb: [256]u8 = undefined;
         var nb: [256]u8 = undefined;
-        if (cols == null and rows == null) if (try L.denseLinear(prefix)) |d| return d;
+        if (cols == null and rows == null) if (try L.denseLinear(prefix)) |d| {
+            if (!plan.denseRunnable(prefix)) return error.DenseLinearUnsupported;
+            return d;
+        };
         const tr = try L.entry(try plan.partKey(&kb, prefix, cols, rows, "tr"));
         const t = try L.shape(try plan.partKey(&kb, prefix, cols, rows, "tr"));
         const kt = t[0];
