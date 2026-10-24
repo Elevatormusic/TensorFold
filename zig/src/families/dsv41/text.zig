@@ -6,6 +6,9 @@
 //! without one hears the template's default ("high": 75), the number the lane sends; "none" turns thinking off.
 //! Reasoning split ("</think>" closes the block the generation prompt opens) and DSML tool calls are the server's own.
 
+/// Grounding tokens (app.py GROUNDING) stay tokens in an assistant's content and reasoning; other spellings are text.
+pub const grounding: []const []const u8 = &.{ "<｜ref｜>", "<｜/ref｜>", "<｜box｜>", "<｜/box｜>", "<｜point｜>", "<｜/point｜>", "<｜polygon｜>", "<｜/polygon｜>" };
+
 /// A name and its number, as engine_api.Effort takes them.
 pub const Effort = struct { name: []const u8, value: i64 };
 

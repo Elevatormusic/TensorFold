@@ -43,6 +43,15 @@ pub const Settings = struct {
     probing: bool = false,
 };
 
+/// TF_RDMA_GID_INDEX (as in the Python build): the port 1 GID index the rings use, e.g. RoCE v2 IPv4. 5 when unset.
+pub fn gidIndex() !u8 {
+    const raw = std.c.getenv("TF_RDMA_GID_INDEX") orelse return 5;
+    const v = std.mem.span(raw);
+    if (v.len == 0) return error.BadRdmaGid;
+    for (v) |c| if (c < '0' or c > '9') return error.BadRdmaGid;
+    return std.fmt.parseInt(u8, v, 10) catch error.BadRdmaGid;
+}
+
 /// What the other side's queue pairs toward this rank need (a device each), and where this rank's receive ring is.
 pub const Info = extern struct {
     devices: u32,

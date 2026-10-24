@@ -161,6 +161,62 @@ pub const Tokenizer = struct {
         return a.dupe(u32, ids.items);
     }
 
+    /// What encodeCut does to the text between two cuts before it encodes it (a shielded request's markers spelled).
+    pub const Restore = struct {
+        ctx: *const anyopaque,
+        spelled: *const fn (ctx: *const anyopaque, a: Allocator, text: []const u8) Allocator.Error![]const u8,
+    };
+
+    /// Python's PlainText.encode: exact added-token spellings are cuts; the restored text between has no added token.
+    pub fn encodeCut(t: *const Tokenizer, a: Allocator, text: []const u8, restore: Restore) Error![]u32 {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+        var valid = text;
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            var fixed: std.ArrayList(u8) = .empty;
+            try unicode.appendLossy(&fixed, ctx.a, text);
+            valid = fixed.items;
+        }
+        var ids: std.ArrayList(u32) = .empty;
+        var at: usize = 0;
+        // the raw trie's tokens, then the normalized trie's in the text between them, both on the text as written
+        for (try t.splitAdded(&ctx, &t.raw, valid)) |seg| {
+            if (seg.id) |id| {
+                if (!t.spells(valid[seg.start..seg.end], id)) continue;
+                try t.encodeRegion(&ctx, valid[at..seg.start], restore, &ids);
+                try ids.append(ctx.a, id);
+                at = seg.end;
+                continue;
+            }
+            for (try t.splitAdded(&ctx, &t.normalized, valid[seg.start..seg.end])) |sub| {
+                const id = sub.id orelse continue;
+                if (!t.spells(valid[seg.start + sub.start .. seg.start + sub.end], id)) continue; // found through a strip: plain text
+                try t.encodeRegion(&ctx, valid[at .. seg.start + sub.start], restore, &ids);
+                try ids.append(ctx.a, id);
+                at = seg.start + sub.end;
+            }
+        }
+        try t.encodeRegion(&ctx, valid[at..], restore, &ids);
+        return a.dupe(u32, ids.items);
+    }
+
+    /// Whether `span` is the added token `id`'s own text.
+    fn spells(t: *const Tokenizer, span: []const u8, id: u32) bool {
+        return std.mem.eql(u8, span, t.id_to_token.get(id) orelse return false);
+    }
+
+    /// One region of encodeCut: restored, then encoded as its own text (Python's plain tokenizer on each region).
+    fn encodeRegion(t: *const Tokenizer, ctx: *steps.Context, region: []const u8, restore: Restore, ids: *std.ArrayList(u32)) Error!void {
+        if (region.len == 0) return;
+        const text = try restore.spelled(restore.ctx, ctx.a, region);
+        if (text.len == 0) return;
+        // text that spells no added token encodes the same with or without them: the memo's ids are good
+        const plain = t.raw.next(text, 0) == null and t.normalized.next(text, 0) == null and (t.normalizer == null or t.normalizer.?.isIdentity());
+        if (plain and t.memo != null and text.len >= @import("memo.zig").min_bytes) return t.encodeSegment(ctx, text, true, ids);
+        return t.encodeTextWith(ctx, text, true, ids, false);
+    }
+
     fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
         return t.encodeTextWith(ctx, text, first, ids, true);
     }
@@ -386,86 +442,6 @@ test "byte-level BPE with merges, added tokens and decode" {
     try std.testing.expectEqualStrings("", unknown);
 }
 
-test "with the memo, long segments encode as without it, and the second encode takes their kept ids" {
-    const json =
-        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
-        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
-        \\ "decoder":{"type":"ByteLevel"},
-        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
-        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6},"merges":[["Ġ","a"],"a b","Ġa b"]}}
-    ;
-    const a = std.testing.allocator;
-    var t = try parse(a, json);
-    defer t.deinit();
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(a);
-    for (0..300) |_| try text.appendSlice(a, "ab abc ");
-    try text.appendSlice(a, "<|end|>");
-    for (0..300) |_| try text.appendSlice(a, " ab cab");
-    const plain = try t.encode(a, text.items);
-    defer a.free(plain);
-    t.memo = try Memo.create(a, 1 << 20);
-    for (0..2) |_| {
-        const kept = try t.encode(a, text.items);
-        defer a.free(kept);
-        try std.testing.expectEqualSlices(u32, plain, kept);
-    }
-    try std.testing.expectEqual(@as(u64, 2), t.memo.?.hits); // both segments, the second time
-}
-
-test "a kept segment's ids equal a fresh encode's wherever the segment sits" {
-    const added =
-        \\{"added_tokens":[{"id":20,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
-        \\ {"id":21,"content":"<|l|>","single_word":false,"lstrip":true,"rstrip":false,"normalized":false,"special":true},
-        \\ {"id":22,"content":"<|r|>","single_word":false,"lstrip":false,"rstrip":true,"normalized":false,"special":true}],
-    ;
-    const kinds = [_][]const u8{
-        added ++
-            \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
-            \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
-            \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6,"x":7,"ï":8,"¿":9,"½":10},"merges":[["Ġ","a"],"a b","Ġa b"]}}
-        ,
-        added ++
-            \\ "pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"first","split":true},
-            \\ "model":{"type":"BPE","unk_token":"<unk>","fuse_unk":true,"byte_fallback":true,
-            \\  "vocab":{"<unk>":0,"a":1,"b":2,"▁":3,"ab":4,"▁a":5,"▁ab":6,"c":7,"x":8,"<0xEF>":9,"<0xBF>":10,"<0xBD>":11},"merges":["a b","▁ a","▁a b"]}}
-        ,
-    };
-    const a = std.testing.allocator;
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(a);
-    for (0..200) |i| try body.appendSlice(a, if (i % 3 == 0) "ab abc " else "cab ab ");
-    const b = body.items;
-    // first or not, after lstrip and rstrip tokens, with a leading space, around a lossy byte, repeated in one prompt
-    const texts = [_][]const []const u8{
-        &.{b},               &.{ "<|end|>", b }, &.{ b, "<|end|>", b }, &.{ "x  <|l|>", b },
-        &.{ "<|r|>   ", b }, &.{ " ", b },       &.{ b, "\xff", b },    &.{ "<|end|> ", b, "<|r|>", b },
-    };
-    for (kinds, 0..) |json, kind| {
-        var t = try parse(a, json);
-        defer t.deinit();
-        var fresh: [texts.len][]u32 = undefined;
-        for (texts, &fresh) |parts, *ids| {
-            const s = try std.mem.concat(a, u8, parts);
-            defer a.free(s);
-            ids.* = try t.encode(a, s);
-        }
-        defer for (fresh) |ids| a.free(ids);
-        // the Metaspace tokenizer prepends to the first segment alone, so a memo blind to `first` fails below
-        if (kind == 1) try std.testing.expect(!std.mem.eql(u32, fresh[0], fresh[1][1..]));
-        t.memo = try Memo.create(a, 1 << 20);
-        for (0..2) |round| for (0..texts.len) |k| {
-            const i = if (round == 0) k else texts.len - 1 - k;
-            const s = try std.mem.concat(a, u8, texts[i]);
-            defer a.free(s);
-            const kept = try t.encode(a, s);
-            defer a.free(kept);
-            try std.testing.expectEqualSlices(u32, fresh[i], kept);
-        };
-        try std.testing.expect(t.memo.?.hits >= 10); // every long segment of the second round, at least
-    }
-}
-
 test "sentencepiece-style BPE with byte fallback" {
     const json =
         \\{"added_tokens":[],"normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
@@ -591,4 +567,8 @@ test {
 
 test {
     _ = @import("identity.zig");
+}
+
+test {
+    _ = @import("tokenizer_test.zig");
 }

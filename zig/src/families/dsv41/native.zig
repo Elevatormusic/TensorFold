@@ -52,6 +52,8 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = 2048;
 /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
 pub const efforts = @import("text.zig").efforts;
+/// An added-token spelling in request text is plain text; these grounding tokens stay tokens in an assistant's text.
+pub const plain_assistant_keep = @import("text.zig").grounding;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false }; // slide: no learner here
 
