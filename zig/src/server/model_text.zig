@@ -44,7 +44,7 @@ pub const Text = struct {
         token_bytes: ?*const fn (ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error!?[]u8 = null,
         /// Every added token's text (plain_text.zig shields these in request text); null: none are known.
         added_spellings: ?*const fn (ctx: *anyopaque, a: Allocator) Allocator.Error![]const []const u8 = null,
-        /// Ids of a shielded prompt: each added token spelled exactly is its token, the text between restored and plain.
+        /// Ids of a shielded prompt: exact added-token spellings are tokens; the restored text between is plain.
         encode_cut: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8, restore: Restore) Error![]u32 = null,
     };
 

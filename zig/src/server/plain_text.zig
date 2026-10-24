@@ -1,9 +1,4 @@
-//! Request text stays plain text (Python's server/plain_text.py): an added-token spelling that a client writes in a
-//! message, a tool result or a tool definition is ordinary text, not that token. The chat template makes one string and
-//! the tokenizer would turn each spelling in it into its token, so a client that writes `</think>` or `<｜User｜>` could
-//! forge a thinking end or a turn. `shield` puts a marker in place of each spelling in the request's strings before
-//! the template runs; `encode` then makes the spellings that remain (the template's own) tokens, and encodes the text
-//! between them, with the markers spelled again, with no added token matched.
+//! Request text stays plain text (server/plain_text.py): a client's `</think>` or `<｜User｜>` cannot forge a token.
 const std = @import("std");
 const json = @import("json");
 const model_text = @import("model_text.zig");
@@ -105,8 +100,7 @@ pub const PlainText = struct {
         return .{ .spellings = try Spellings.init(a, words), .assistant_keep = assistant_keep };
     }
 
-    /// `messages` and `tools` with each added-token spelling as a marker; the same values when none is there.
-    /// `content_keep`: spellings that the server itself wrote into this request's message content.
+    /// `messages` and `tools` with each spelling as a marker; `content_keep`: spellings the server wrote in content.
     pub fn shield(p: *const PlainText, a: Allocator, messages: Value, tools: []const Value, content_keep: []const []const u8) Allocator.Error!Shielded {
         var attempt: u64 = 0;
         while (true) : (attempt += 1) {
@@ -122,9 +116,9 @@ pub const PlainText = struct {
     }
 
     /// The ids of rendered `text`: the template's spellings as tokens, the rest (markers spelled again) without them.
-    /// DeepSeek's normalizer changes no text, so a prompt without a marker is the tokenizer's own encode.
     pub fn encode(p: *const PlainText, text: model_text.Text, a: Allocator, rendered: []const u8, s: *const Shielded) model_text.Error![]u32 {
         _ = p;
+        // DeepSeek's normalizer changes no text, so a prompt without a marker is the tokenizer's own encode
         if (s.table.len == 0 or std.mem.indexOf(u8, rendered, s.prefix) == null) return text.encode(a, rendered, false);
         return text.encodeCut(a, rendered, .{ .ctx = s, .spelled = Shielded.spelledFn }) orelse text.encode(a, rendered, false);
     }
@@ -184,8 +178,7 @@ const Walk = struct {
         };
     }
 
-    /// Python's _messages: each message's text parts joined first (a spelling can span two parts), an assistant's
-    /// content and reasoning keeping the assistant spellings, the server's content spellings kept in any content.
+    /// Python's _messages: text parts joined first (a spelling can span two); assistant and server spellings kept.
     fn messages(w: *Walk, v: Value, content_keep: []const []const u8) Allocator.Error!Value {
         if (v != .array) return w.value(v, &.{});
         const out = try w.a.alloc(Value, v.array.len);

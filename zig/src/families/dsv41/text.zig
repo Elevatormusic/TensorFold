@@ -6,8 +6,7 @@
 //! without one hears the template's default ("high": 75), the number the lane sends; "none" turns thinking off.
 //! Reasoning split ("</think>" closes the block the generation prompt opens) and DSML tool calls are the server's own.
 
-/// The grounding tokens. DeepSeek's encoding keeps them as tokens in an assistant's content and reasoning (the model
-/// wrote them there); every other added-token spelling in request text is plain text (app.py GROUNDING).
+/// Grounding tokens (app.py GROUNDING) stay tokens in an assistant's content and reasoning; other spellings are text.
 pub const grounding: []const []const u8 = &.{ "<｜ref｜>", "<｜/ref｜>", "<｜box｜>", "<｜/box｜>", "<｜point｜>", "<｜/point｜>", "<｜polygon｜>", "<｜/polygon｜>" };
 
 /// A name and its number, as engine_api.Effort takes them.

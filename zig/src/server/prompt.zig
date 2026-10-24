@@ -62,8 +62,7 @@ fn renderKept(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thin
     return ids;
 }
 
-/// The template's ids for `messages`; with image input, a marker the text spells is ordinary text (images.zig), and
-/// with Info.plain_message_text every added-token spelling the request writes is (plain_text.zig).
+/// The template's ids for `messages`; image markers (images.zig) and plain_message_text spellings are plain text.
 fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, kept: []const []const u8, problem: *[]const u8) model_text.Error![]u32 {
     if (srv.plain) |*p| {
         const tools: []const Value = if (options.tools) |t| t.array else &.{};
