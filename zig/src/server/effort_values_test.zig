@@ -10,7 +10,7 @@ const Conn = @import("http_conn.zig").Conn;
 
 /// DeepSeek-V4.1's numbers (families/dsv41/text.zig; the served lane's EFFORT_VALUES).
 const numbers = [_]api.Effort{
-    .{ .name = "minimal", .value = 25 }, .{ .name = "low", .value = 50 },  .{ .name = "medium", .value = 62 },
+    .{ .name = "minimal", .value = 25 }, .{ .name = "low", .value = 50 },   .{ .name = "medium", .value = 62 },
     .{ .name = "high", .value = 75 },    .{ .name = "xhigh", .value = 88 }, .{ .name = "max", .value = 100 },
 };
 
