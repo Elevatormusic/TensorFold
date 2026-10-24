@@ -31,6 +31,11 @@ pub const isTitle = messages_mod.isTitleRequest;
 
 /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
 pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
+    return renderKept(srv, cx, messages, tools, thinking, effort, generation, &.{});
+}
+
+/// renderIds; `kept`: spellings that the server itself wrote into the messages' content (a lane image's placeholder).
+fn renderKept(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, kept: []const []const u8) errors.Refused![]const u32 {
     const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, .of(srv.info.vision)));
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
@@ -40,7 +45,7 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
         .reasoning_effort = if (thinking) effort else null,
         .reasoning_effort_value = if (thinking) srv.effortValue(effort) else null,
     };
-    var ids = render(srv, cx.a, normalized, options, &problem) catch |e| switch (e) {
+    var ids = render(srv, cx.a, normalized, options, kept, &problem) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Template => return cx.fail(.server, "{s}", .{problem}),
     };
@@ -57,8 +62,19 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
     return ids;
 }
 
-/// The template's ids for `messages`; with image input, a marker the text spells is ordinary text (images.zig).
-fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error![]u32 {
+/// The template's ids for `messages`; image markers (images.zig) and plain_message_text spellings are plain text.
+fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, kept: []const []const u8, problem: *[]const u8) model_text.Error![]u32 {
+    if (srv.plain) |*p| {
+        const tools: []const Value = if (options.tools) |t| t.array else &.{};
+        const s = try p.shield(a, messages, tools, kept);
+        var shielded = options;
+        if (options.tools != null) shielded.tools = .{ .array = @constCast(s.tools) };
+        const text = srv.text.render(a, s.messages, shielded, problem) catch |e| {
+            if (e == error.Template) problem.* = try s.spelled(a, problem.*);
+            return e;
+        };
+        return p.encode(srv.text, a, text, &s);
+    }
     const v = srv.info.vision orelse return srv.text.renderIds(a, messages, options, problem);
     const markers = try images.markerText(srv.text, a, v);
     const text = try srv.text.render(a, try images.shield(a, messages, markers), options, problem);
@@ -109,7 +125,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
-    const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+    // a lane image's placeholder in content is the server's own: normalizeImages refused each one the client wrote
+    const placeholder = [1][]const u8{if (srv.info.lane_vision) |v| v.placeholder else ""};
+    const kept: []const []const u8 = if (input.lane_images.len > 0 and srv.info.lane_vision != null) &placeholder else &.{};
+    const prompt = try renderKept(srv, cx, input.messages, input.tools, thinking, effort, true, kept);
     if (input.lane_images.len > 0) return laneSpans(srv, cx, prompt, input.lane_images); // (no kept history: the cache keys tokens)
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
