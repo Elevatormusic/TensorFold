@@ -268,8 +268,8 @@ def vectors(a) -> None:
 
 
 def fp8cmp(a) -> None:
-    """The FP8 form against the bf16 one on the self-test cases: step-1 logits (the same inputs), each step's top-1
-    with teacher forcing (both chains fed the bf16 chain's drafts) and the free-running drafts' agreement."""
+    """The FP8 form against the bf16 one on the self-test cases: the step-1 low-rank logits (the same inputs), the
+    step-1 drafts and the free-running drafts' agreement (each chain on its own drafts)."""
 
     head, tensors = read(a.head)
     D, V, L = head["dim"], head["vocab"], len(head["taps"])
@@ -281,9 +281,10 @@ def fp8cmp(a) -> None:
     worst, same1, n1, agree, steps = 0.0, 0, 0, 0, 0
     out = []
     for q0 in q0s:
-        db, _, _, lb = chain(rb, taps.float(), ids, q0, S)
-        d8, _, _, l8 = chain(r8, taps.float(), ids, q0, S)
-        err = float((l8[0] - lb[0]).abs().max() / lb[0].abs().max())
+        db, ob, _, _ = chain(rb, taps.float(), ids, q0, S)
+        d8, o8, _, _ = chain(r8, taps.float(), ids, q0, S)
+        lb, l8 = rb.logits(ob[:1])[0], r8.logits(o8[:1])[0]   # the low-rank logits (a two_stage head's first stage)
+        err = float((l8 - lb).abs().max() / lb.abs().max())
         worst = max(worst, err)
         same1 += int(db[0] == d8[0])
         n1 += 1
