@@ -169,10 +169,9 @@ def render(app: Any) -> str:
                 [f'{PREFIX}requests_total{{key="{key}",status="{status}"}} {count}'
                  for (key, status), count in sorted(requests.items())])
     suppressed = suppressed_counts()
-    if suppressed:       # only once a reply has had one: the Mac server does not count them, so no fake zero
+    if suppressed:       # only once a block has been counted: the Mac server does not count them, so no fake zero
         _family(lines, "tool_calls_suppressed_total", "counter",
-                "Replies where a block that does not count (an open block, a lone tag or a block that is not well "
-                "formed) kept a later tool call as text, by reason.",
+                "Tool-call blocks that were removed from a reply or kept in it as text and did not run, by reason.",
                 [f'{PREFIX}tool_calls_suppressed_total{{reason="{reason}"}} {count}'
                  for reason, count in sorted(suppressed.items())])
     _family(lines, "requests_running", "gauge", "Requests in prefill or decode.",
