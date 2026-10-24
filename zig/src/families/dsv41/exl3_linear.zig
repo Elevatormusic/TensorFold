@@ -164,7 +164,7 @@ pub fn rotMany(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: u
     var a: RArgs = .{ .n = @intCast(calls.len), .M = @intCast(m) };
     var warps: usize = 0;
     for (calls, 0..) |c, i| {
-        a.l[i] = .{ .x = c.x, .suh = c.layer.suh, .xh = c.xh, .ldx = c.ldx, .x_dtype = @intFromEnum(c.x_dtype), .K = @intCast(c.layer.k), .first = @intCast(warps) };
+        a.l[i] = .{ .x = c.x, .suh = c.layer.suh, .xh = c.xh, .ldx = c.ldx, .x_dtype = @backingInt(c.x_dtype), .K = @intCast(c.layer.k), .first = @intCast(warps) };
         warps += m * (c.layer.k / 128);
     }
     var args: cuda.Args = .{};
@@ -189,7 +189,7 @@ pub fn glinear(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: u
             done[j] = true;
             const s = strides(c.layer);
             const n: usize = @intCast(a.n);
-            a.l[n] = .{ .xh = c.xh, .ldx = @intCast(c.layer.k), .T = c.layer.words, .stride_k = s[0], .stride_nb = s[1], .svh = c.layer.svh, .y = c.y, .y_dtype = @intFromEnum(c.y_dtype), .ldy = c.ldy, .K = @intCast(c.layer.k), .N = @intCast(c.layer.n), .SK = @intCast(pj.sk), .counters = c.counters, .first = @intCast(blocks) };
+            a.l[n] = .{ .xh = c.xh, .ldx = @intCast(c.layer.k), .T = c.layer.words, .stride_k = s[0], .stride_nb = s[1], .svh = c.layer.svh, .y = c.y, .y_dtype = @backingInt(c.y_dtype), .ldy = c.ldy, .K = @intCast(c.layer.k), .N = @intCast(c.layer.n), .SK = @intCast(pj.sk), .counters = c.counters, .first = @intCast(blocks) };
             if (c.rot) |r| {
                 a.l[n].rsuh = r.suh;
                 a.l[n].rxh = r.xh;
@@ -243,12 +243,12 @@ test "plans as linear.py makes them" {
 test "plans and strides equal every recorded glinear layer of the served build" {
     // (K, N, SK, WK, K2, stride_k, stride_nb) of each distinct layer the recording's glinear calls passed
     const seen = [_][7]u32{
-        .{ 512, 128, 1, 4, 16, 512, 16384 },       .{ 1280, 4096, 2, 4, 10, 320, 25600 },     .{ 1280, 16384, 1, 8, 8, 256, 20480 },
-        .{ 1280, 16384, 1, 8, 10, 320, 25600 },    .{ 3072, 25600, 1, 8, 8, 256, 49152 },     .{ 3072, 25600, 1, 8, 10, 320, 61440 },
-        .{ 4096, 1024, 8, 4, 8, 256, 65536 },      .{ 4096, 1024, 8, 4, 10, 320, 81920 },     .{ 4096, 5120, 8, 4, 8, 256, 65536 },
-        .{ 4096, 5120, 8, 4, 10, 320, 81920 },     .{ 5120, 512, 8, 4, 8, 256, 81920 },       .{ 5120, 512, 8, 4, 10, 320, 102400 },
-        .{ 5120, 512, 8, 4, 12, 384, 122880 },     .{ 5120, 1280, 8, 4, 8, 256, 81920 },      .{ 5120, 1280, 8, 4, 10, 320, 102400 },
-        .{ 5120, 1280, 8, 4, 12, 384, 122880 },    .{ 5120, 64640, 1, 8, 12, 384, 122880 },   .{ 15360, 5120, 8, 4, 8, 256, 245760 },
+        .{ 512, 128, 1, 4, 16, 512, 16384 },    .{ 1280, 4096, 2, 4, 10, 320, 25600 },   .{ 1280, 16384, 1, 8, 8, 256, 20480 },
+        .{ 1280, 16384, 1, 8, 10, 320, 25600 }, .{ 3072, 25600, 1, 8, 8, 256, 49152 },   .{ 3072, 25600, 1, 8, 10, 320, 61440 },
+        .{ 4096, 1024, 8, 4, 8, 256, 65536 },   .{ 4096, 1024, 8, 4, 10, 320, 81920 },   .{ 4096, 5120, 8, 4, 8, 256, 65536 },
+        .{ 4096, 5120, 8, 4, 10, 320, 81920 },  .{ 5120, 512, 8, 4, 8, 256, 81920 },     .{ 5120, 512, 8, 4, 10, 320, 102400 },
+        .{ 5120, 512, 8, 4, 12, 384, 122880 },  .{ 5120, 1280, 8, 4, 8, 256, 81920 },    .{ 5120, 1280, 8, 4, 10, 320, 102400 },
+        .{ 5120, 1280, 8, 4, 12, 384, 122880 }, .{ 5120, 64640, 1, 8, 12, 384, 122880 }, .{ 15360, 5120, 8, 4, 8, 256, 245760 },
     };
     for (seen) |r| {
         const p = plan(r[0], r[1]);
