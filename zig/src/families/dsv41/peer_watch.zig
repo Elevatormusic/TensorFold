@@ -62,6 +62,7 @@ pub const Watch = struct {
         w.* = .{ .rank = rank, .n = @min(fds.len, max_links), .n_rings = @min(rings.len, max_rings), .exit_grace = exit_grace };
         @memcpy(w.fds[0..w.n], fds[0..w.n]);
         @memcpy(w.rings[0..w.n_rings], rings[0..w.n_rings]);
+        openLog();
         w.thread = try std.Thread.spawn(.{}, loop, .{w});
         return w;
     }
@@ -162,15 +163,34 @@ pub const Watch = struct {
     }
 };
 
-/// A log line to stderr that never blocks: it is written only when stderr can take it now (a write up to PIPE_BUF to
-/// a pipe that poll reports writable goes out whole), else it is dropped. The abort and the exit never wait on a log.
+/// note's descriptor: stderr's file opened again with O_NONBLOCK (openLog); -1: none; -2: not opened yet.
+var log_fd: std.atomic.Value(c_int) = .init(-2);
+
+/// A new open file description of `fd` with O_NONBLOCK, so fd itself (shared with other threads) stays blocking.
+fn nonblockingCopy(fd: c_int) c_int {
+    var buf: [32]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "/proc/self/fd/{d}", .{fd}, 0) catch return -1;
+    return std.c.open(path, .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .APPEND = true, .CLOEXEC = true });
+}
+
+/// Opens note's descriptor once per process (Watch.start), before any fault path can need it.
+fn openLog() void {
+    if (log_fd.load(.acquire) != -2) return;
+    const fd = nonblockingCopy(2);
+    if (log_fd.cmpxchgStrong(-2, if (fd >= 0) fd else -1, .acq_rel, .acquire) != null and fd >= 0) _ = std.c.close(fd);
+}
+
+/// A log line to stderr that never blocks: a full pipe or terminal drops it; the abort and exit never wait on it.
 fn note(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    var p = [1]posix.pollfd{.{ .fd = 2, .events = posix.POLL.OUT, .revents = 0 }};
-    const k = posix.poll(&p, 0) catch return;
-    if (k == 0 or p[0].revents & posix.POLL.OUT == 0) return;
-    _ = std.c.write(2, line.ptr, line.len);
+    const fd = log_fd.load(.acquire);
+    if (fd >= 0) {
+        _ = std.c.write(fd, line.ptr, line.len);
+        return;
+    }
+    // a socket stderr cannot open through /proc: MSG_DONTWAIT; on any other descriptor send fails and the line drops
+    _ = std.c.send(2, line.ptr, line.len, std.c.MSG.DONTWAIT | std.c.MSG.NOSIGNAL);
 }
 
 /// TF_DS_EXIT_ON_FAULT=1: the grace in ms (TF_DS_EXIT_GRACE seconds, default 5), as lane_host.faultExit reads it. The
@@ -316,4 +336,24 @@ test "the exit 75 comes from Watch.start's grace alone: TF_DS_EXIT_ON_FAULT in t
     sleepMs(100);
     // a peer fault with no grace: end returns (the test runner goes on) instead of exit 75
     try std.testing.expectEqual(Outcome.peer_fault, w.end(std.testing.allocator, .failed));
+}
+
+test "note's descriptor never blocks on a full pipe, and the pipe's own descriptor stays blocking" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    const w = nonblockingCopy(fds[1]);
+    try std.testing.expect(w >= 0);
+    defer _ = std.c.close(w);
+    const chunk: [4096]u8 = @splat('x');
+    var full = false;
+    // 4 MiB at most, more than a pipe holds: a write that would wait fails at once (EAGAIN)
+    for (0..1024) |_| if (std.c.write(w, &chunk, chunk.len) < 0) {
+        full = true;
+        break;
+    };
+    try std.testing.expect(full);
+    const flags: std.c.O = @bitCast(@as(u32, @intCast(std.c.fcntl(fds[1], std.c.F.GETFL))));
+    try std.testing.expect(!flags.NONBLOCK);
 }
