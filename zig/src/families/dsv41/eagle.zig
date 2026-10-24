@@ -7,11 +7,13 @@
 //! (heads x 128 queries, one key / value head, with qk_norm an RMSNorm on each query and key head, RoPE on 64 of 128
 //! dims, attention over the stream's newest window + 1 positions, then a SwiGLU MLP); logits = up(down(RMSNorm(o))).
 //! A two_stage head takes the top K of those logits (K = cand_k, or TF_DS_EAGLE_TOPK up to 512) and drafts the argmax
-//! of their exact logits from the target's own head (a dense bf16 copy in the head file, on rank 0). A stream's chain from its pending token at q0: the real rows below
-//! q0 (their keys and values in the stream's ring), draft 1 from the row q0 - 1, and draft j > 1 from a row at position
-//! q0 + j - 2 with g = the step before's o and the token draft j - 1 (its key and value go into the ring too; the next
-//! pass's real rows write over them). tools/dsv41-zig/eagle/eagle_ref.py is this order of work in torch (the
-//! self-test's reference), checked against the training code's chain.
+//! of their exact logits from the target's own head (a dense bf16 copy in the head file, on rank 0).
+//!
+//! A stream's chain from its pending token at q0: the real rows below q0 (their keys and values in the stream's ring),
+//! draft 1 from the row q0 - 1, and draft j > 1 from a row at position q0 + j - 2 with g = the step before's o and the
+//! token draft j - 1 (its key and value go into the ring too; the next pass's real rows write over them).
+//! tools/dsv41-zig/eagle/eagle_ref.py is this order of work in torch (the self-test's reference), checked against the
+//! training code's chain.
 //!
 //! The g rows come with each round (absorbRound: the drafting streams' window rows, eager as the DSpark absorb) and each
 //! prompt chunk that reaches the head (the last ring rows). A pass first runs the rows from the stream's last extended
@@ -224,6 +226,11 @@ pub const Eagle = struct {
     confs: [max_streams][max_steps]f32 = undefined,
     // where the passes spend their time (ns, the host's clock around each pass)
     passes: u64 = 0,
+    // TF_DS_EAGLE_GRAPH=1: the steps of a pass as one CUDA graph a (streams, steps)
+    graphs: ?std.AutoHashMapUnmanaged(GraphKey, cuda.graph.Exec) = null,
+    gpa: std.mem.Allocator = undefined,
+
+    const GraphKey = struct { streams: u32, steps: u32 };
 
     /// The head of `path` (its header read as `hdr`) on the device, the module, rings for `slots` streams and the
     /// scratch from the arena.
@@ -243,6 +250,11 @@ pub const Eagle = struct {
         eg.streams = 0;
         eg.steps = 0;
         eg.passes = 0;
+        eg.gpa = gpa;
+        eg.graphs = null;
+        if (std.c.getenv("TF_DS_EAGLE_GRAPH")) |v| {
+            if (std.mem.eql(u8, std.mem.span(v), "1")) eg.graphs = .empty;
+        }
         eg.tap_norms = 0;
         eg.fb_norm = 0;
         eg.q_norm = 0;
@@ -380,6 +392,11 @@ pub const Eagle = struct {
     }
 
     pub fn close(eg: *Eagle, gpa: std.mem.Allocator) void {
+        if (eg.graphs) |*g| {
+            var it = g.valueIterator();
+            while (it.next()) |x| x.deinit();
+            g.deinit(gpa);
+        }
         eg.mod.unload();
         eg.buf.free();
         gpa.destroy(eg);
@@ -505,7 +522,6 @@ pub const Eagle = struct {
     pub fn pass(eg: *Eagle, e: *const Engine, reqs: []const Req, steps: usize) !void {
         const N = reqs.len;
         if (N == 0 or N > max_streams or steps == 0 or steps > max_steps) return error.BadDraftPass;
-        const D = eg.s.dim;
         const W = eg.s.window;
         var ok: [max_streams]bool = @splat(false);
         var from: [max_streams]usize = undefined;
@@ -563,6 +579,48 @@ pub const Eagle = struct {
         try prompt.upload(e, eg.srow, &hr, steps * N * 8);
         try prompt.upload(e, eg.sbase, &hb, N * 8);
         try prompt.upload(e, eg.slo, &hl, N * 8);
+        try eg.chain(e, N, steps, cur);
+        try e.s.synchronize();
+        var ho: [(max_steps + 1) * max_streams]i64 = undefined;
+        var hc: [max_steps * max_streams]f32 = undefined;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&ho, eg.out, (steps + 1) * N * 8), "cuMemcpyDtoH");
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hc, eg.conf, steps * N * 4), "cuMemcpyDtoH");
+        for (reqs, 0..) |rq, i| {
+            for (0..steps) |j| {
+                eg.drafts[i][j] = if (ok[i]) ho[(j + 1) * N + i] else 0;
+                eg.confs[i][j] = if (ok[i]) hc[j * N + i] else -30.0;
+            }
+            if (ok[i]) eg.st[rq.slot].ext = rq.q0;
+        }
+        eg.streams = N;
+        eg.steps = steps;
+        eg.passes += 1;
+    }
+
+    /// The steps of a pass for N streams (their tables uploaded): eager, or a graph a (N, steps) with TF_DS_EAGLE_GRAPH
+    /// (every buffer and table is at a fixed place, so a replay runs the same work on the new tables).
+    fn chain(eg: *Eagle, e: *const Engine, N: usize, steps: usize, cur: usize) !void {
+        const g = if (eg.graphs) |*m| m else return eg.chainBody(e, N, steps, cur);
+        const key: GraphKey = .{ .streams = @intCast(N), .steps = @intCast(steps) };
+        if (g.getPtr(key)) |x| return x.launchOn(e.s);
+        try cuda.graph.beginCapture(e.s, .thread_local);
+        eg.chainBody(e, N, steps, cur) catch |err| {
+            if (cuda.graph.endCapture(e.s)) |got| {
+                var x = got;
+                x.deinit();
+            } else |_| {}
+            return err;
+        };
+        var graph = try cuda.graph.endCapture(e.s);
+        defer graph.deinit();
+        var exec = try graph.instantiate();
+        errdefer exec.deinit();
+        try g.put(eg.gpa, key, exec);
+        try exec.launchOn(e.s);
+    }
+
+    fn chainBody(eg: *Eagle, e: *const Engine, N: usize, steps: usize, cur: usize) !void {
+        const D = eg.s.dim;
         var x = eg.xs[cur];
         var prev = eg.xs[1 - cur];
         for (1..steps + 1) |j| {
@@ -596,21 +654,6 @@ pub const Eagle = struct {
             a.add(eg.conf_b);
             try cuda.launch.launch(eg.f.top1, .{ .grid = .{ .x = @intCast(N) }, .block = .{ .x = 1024 } }, e.s, &a);
         }
-        try e.s.synchronize();
-        var ho: [(max_steps + 1) * max_streams]i64 = undefined;
-        var hc: [max_steps * max_streams]f32 = undefined;
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&ho, eg.out, (steps + 1) * N * 8), "cuMemcpyDtoH");
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hc, eg.conf, steps * N * 4), "cuMemcpyDtoH");
-        for (reqs, 0..) |rq, i| {
-            for (0..steps) |j| {
-                eg.drafts[i][j] = if (ok[i]) ho[(j + 1) * N + i] else 0;
-                eg.confs[i][j] = if (ok[i]) hc[j * N + i] else -30.0;
-            }
-            if (ok[i]) eg.st[rq.slot].ext = rq.q0;
-        }
-        eg.streams = N;
-        eg.steps = steps;
-        eg.passes += 1;
     }
 
     /// two_stage: each row's top `topk` low-rank logits (lg) as candidates, then their exact logits (ex) from the target
