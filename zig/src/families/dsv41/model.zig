@@ -917,6 +917,7 @@ pub const Model = struct {
                 try tri_basic.collapseNorm(e.t, ch.h + at * c.hc * D * 2, ch.pre + at * c.hc * 4, e.w.norm, eg.fin, c.eps, k, D);
                 try e.ops.copyRows(e.s, eg.fin, D * 2, eg.tin + (L - 1) * D * 2, L * D * 2, D * 2, k);
             }
+            try eg.tapDump(e, "prompt", m.fill_slot, ch.start + at, k, cut, eg.tin, L * D);
             try eg.absorb(e, eg.tin, L * D, &.{.{ .slot = m.fill_slot, .start = ch.start + at, .n = k }});
             at += k;
         }

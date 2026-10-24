@@ -23,6 +23,8 @@
 //! linears: "wo" (the default: wo and w2, where cuBLAS's few-row kernel is slow), "all", or "cublas". With
 //! TF_DS_EAGLE_FP8=1 the head's linears are e4m3 with an fp32 scale a row (the file's "NAME.fp8" and "NAME.scale",
 //! eagle_convert.py's rule) through the own GEMV only; the norms, the target head's copy and the logits stay as they are.
+//! FP8 is the default when the head file has the FP8 forms; TF_DS_EAGLE_FP8=0 runs the bf16 forms.
+//! TF_DS_EAGLE_TAPDUMP=FILE writes every absorb's tap rows (tapDump; the prompt-path tap check, tfe_tapcheck.py).
 const std = @import("std");
 const cuda = @import("cuda");
 const prompt = @import("prompt.zig");
@@ -299,6 +301,10 @@ pub const Eagle = struct {
     // TF_DS_EAGLE_GRAPH=1: the steps of a pass as one CUDA graph a (streams, steps)
     graphs: ?std.AutoHashMapUnmanaged(GraphKey, cuda.graph.Exec) = null,
     gpa: std.mem.Allocator = undefined,
+    io: std.Io = undefined,
+    // TF_DS_EAGLE_TAPDUMP: the file and its end
+    dump: ?std.Io.File = null,
+    dump_at: u64 = 0,
 
     const GraphKey = struct { streams: u32, steps: u32 };
 
@@ -321,6 +327,9 @@ pub const Eagle = struct {
         eg.steps = 0;
         eg.passes = 0;
         eg.gpa = gpa;
+        eg.io = io;
+        eg.dump = null;
+        eg.dump_at = 0;
         eg.graphs = null;
         if (std.c.getenv("TF_DS_EAGLE_GRAPH")) |v| {
             if (std.mem.eql(u8, std.mem.span(v), "1")) eg.graphs = .empty;
@@ -341,7 +350,12 @@ pub const Eagle = struct {
             eg.conf_a = try std.fmt.parseFloat(f32, it.next() orelse return error.BadEagleConf);
             eg.conf_b = try std.fmt.parseFloat(f32, it.next() orelse "0");
         }
-        const fp8 = if (std.c.getenv("TF_DS_EAGLE_FP8")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        // FP8: on when the file has the forms (TF_DS_EAGLE_FP8 unset), "1" requires them, "0" runs bf16
+        const fp8_env = if (std.c.getenv("TF_DS_EAGLE_FP8")) |v| std.mem.span(v) else "";
+        if (fp8_env.len > 0 and !std.mem.eql(u8, fp8_env, "0") and !std.mem.eql(u8, fp8_env, "1")) return error.BadEagleFp8;
+        const has_fp8 = hdr.json.tensors.map.get("fc.fp8") != null;
+        const fp8 = if (std.mem.eql(u8, fp8_env, "1")) true else if (std.mem.eql(u8, fp8_env, "0")) false else has_fp8;
+        if (fp8_env.len == 0 and !has_fp8) std.log.info("eagle head: no FP8 forms in {s}: the bf16 linears", .{path});
         var own_all = false;
         var own_wo = true;
         if (std.c.getenv("TF_DS_EAGLE_GEMV")) |v| {
@@ -402,6 +416,8 @@ pub const Eagle = struct {
                 it.dest.* = eg.buf.ptr + it.at;
             }
         }
+        if (std.c.getenv("TF_DS_EAGLE_TAPDUMP")) |v| eg.dump = try std.Io.Dir.cwd().createFile(io, std.mem.span(v), .{ .truncate = true });
+        errdefer if (eg.dump) |f| f.close(io);
         eg.mod = try cuda.Module.load(e.d, cuda.kernels.dsv41_eagle);
         errdefer eg.mod.unload();
         eg.f = .{
@@ -471,6 +487,7 @@ pub const Eagle = struct {
             while (it.next()) |x| x.deinit();
             g.deinit(gpa);
         }
+        if (eg.dump) |f| f.close(eg.io);
         eg.mod.unload();
         eg.buf.free();
         gpa.destroy(eg);
@@ -609,17 +626,48 @@ pub const Eagle = struct {
         for (spans) |sp| if (sp.keep) note(&eg.st[sp.slot], sp.start, sp.n, eg.ring);
     }
 
+    /// TF_DS_EAGLE_TAPDUMP: one record of `n` absorbed rows of positions start .. in `slot`: u32 header length, the JSON
+    /// header {kind, slot, start, n, cut, taps, dim}, then the rows' taps bf16 [n, taps * dim] (the engine's tap order,
+    /// before tap_norm; at `src`, rows ld elements apart). cut: the rows a prompt chunk dropped at its replay floor.
+    pub fn tapDump(eg: *Eagle, e: *const Engine, kind: []const u8, slot: usize, start: usize, n: usize, cut: usize, src: u64, ld: usize) !void {
+        const f = eg.dump orelse return;
+        if (n == 0) return;
+        const row = eg.s.n_taps * eg.s.dim * 2;
+        try e.s.synchronize();
+        const host = try eg.gpa.alloc(u8, n * row);
+        defer eg.gpa.free(host);
+        for (0..n) |r| try e.d.check(e.d.api.cuMemcpyDtoH_v2(host[r * row ..].ptr, src + r * ld * 2, row), "cuMemcpyDtoH");
+        var hb: [256]u8 = undefined;
+        const h = try std.fmt.bufPrint(&hb, "{{\"kind\": \"{s}\", \"slot\": {d}, \"start\": {d}, \"n\": {d}, \"cut\": {d}, \"taps\": {d}, \"dim\": {d}}}", .{ kind, slot, start, n, cut, eg.s.n_taps, eg.s.dim });
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(h.len), .little);
+        try f.writePositionalAll(eg.io, &len, eg.dump_at);
+        try f.writePositionalAll(eg.io, h, eg.dump_at + 4);
+        try f.writePositionalAll(eg.io, host, eg.dump_at + 4 + h.len);
+        eg.dump_at += 4 + h.len + host.len;
+    }
+
     /// A round's windows (lanes.zig verify): every row's layer taps at `taps` (row stride layer taps * dim) and, for a
     /// head with the final tap, the final states at `xc` (row stride dim), `rows` rows in all.
     pub fn absorbRound(eg: *Eagle, e: *const Engine, taps: u64, xc: u64, rows: usize, spans: []const Span) !void {
         const D = eg.s.dim;
         const L = eg.s.n_taps;
-        if (!eg.s.final()) return eg.absorb(e, taps, L * D, spans);
-        if (rows > chunk_rows) return error.EagleAbsorbTooLarge;
-        const lt = L - 1;
-        if (lt > 0) try e.ops.copyRows(e.s, taps, lt * D * 2, eg.tin, L * D * 2, lt * D * 2, rows);
-        try e.ops.copyRows(e.s, xc, D * 2, eg.tin + lt * D * 2, L * D * 2, D * 2, rows);
-        return eg.absorb(e, eg.tin, L * D, spans);
+        var src = taps;
+        if (eg.s.final()) {
+            if (rows > chunk_rows) return error.EagleAbsorbTooLarge;
+            const lt = L - 1;
+            if (lt > 0) try e.ops.copyRows(e.s, taps, lt * D * 2, eg.tin, L * D * 2, lt * D * 2, rows);
+            try e.ops.copyRows(e.s, xc, D * 2, eg.tin + lt * D * 2, L * D * 2, D * 2, rows);
+            src = eg.tin;
+        }
+        if (eg.dump != null) {
+            var r: usize = 0;
+            for (spans) |sp| {
+                if (sp.keep) try eg.tapDump(e, "round", sp.slot, sp.start, sp.n, 0, src + r * L * D * 2, L * D);
+                r += sp.n;
+            }
+        }
+        return eg.absorb(e, src, L * D, spans);
     }
 
     // -- the pass -------------------------------------------------------------------------------------------------
