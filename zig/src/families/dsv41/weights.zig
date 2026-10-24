@@ -291,10 +291,7 @@ const Loader = struct {
         return L.upload(tensor, try L.entry(try plan.plainKey(&kb, tensor, dtype)));
     }
 
-    /// A plain tensor the kernels read as fp16 (the MTP markov head, the DSpark confidence head): a pack that holds it
-    /// in bf16 (the 1017 checkpoint's own dtype; the converter casts it to f16, the 2.8 bpw pack does not) is converted
-    /// exactly at load, and an f16 tensor is uploaded as it is. The cache key stays the checkpoint's own dtype, so no
-    /// rank cache is invalidated.
+    /// An fp16 kernel input (markov or confidence head): bf16 converts at load; the cache key keeps the pack dtype.
     fn halfAtLoad(L: *Loader, tensor: []const u8) !u64 {
         var kb: [256]u8 = undefined;
         const key = try plan.plainKey(&kb, tensor, null);
