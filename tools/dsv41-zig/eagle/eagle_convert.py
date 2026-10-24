@@ -1,7 +1,8 @@
 """A TFE draft head checkpoint (eagle_train.py's HEAD.pt: {"cfg", "state"}) as the file the Zig engine loads
-(TF_DS_DRAFTER=eagle TF_DS_EAGLE_HEAD=FILE): every tensor in bf16, row-major, after one JSON header.
+(TF_DS_DRAFTER=eagle TF_DS_EAGLE_HEAD=FILE): every tensor in bf16, row-major, after one JSON header, and each linear
+also in e4m3 with an fp32 scale a row (the engine's TF_DS_EAGLE_FP8=1 form).
 
-  python3 eagle_convert.py HEAD.pt OUT.tfe [--target-head PREFIX]
+  python3 eagle_convert.py HEAD.pt OUT.tfe [--target-head PREFIX] [--no-fp8]
 
 --target-head: a two_stage head's rescoring table, the target's own vocabulary head from eagle_collect.py --head-dump
 (PREFIX-r0.pt, PREFIX-r1.pt: {"rank", "wt" [dim, vocab / 2], "norm"}), as tensor "target_head" bf16 [vocab, dim]
@@ -14,6 +15,10 @@ head_type ("lowrank": up(down(o)) picks the draft; "two_stage": its top cand_k i
 cand_k, `taps` (the
 tap layers in the engine's order: layers ascending, the final hidden state 1000 last) and `tensors` {name: {offset,
 shape, dtype}}.
+
+The FP8 form of a linear NAME.weight [n, k] (bf16 W): s = amax(|W| a row) / 448 in fp32 (1 where the row is zero),
+q = e4m3 (round to nearest even) of fp32(W) / s, tensors NAME.fp8 (dtype f8e4m3, [n, k]) and NAME.scale (f32 [n]); the
+weight it stands for is fp32(q) * s. The header's "fp8" records the rule, the linears and the sha256 of each q and s.
 
 The engine writes its taps in that order. The training order (cfg["tap_layers"], the order of --layers) can differ, so
 fc's input column blocks (and tap_norms' rows) are put in the engine's order here; fc's output is the same.
@@ -31,6 +36,8 @@ import torch
 
 FINAL = 1000
 MAGIC = b"TFEHEAD1"
+LINEARS = ("fc", "w_in", "wq", "wkv", "wo", "w13", "w2", "down", "up")
+DTYPES = {"bf16": (torch.bfloat16, torch.int16), "f8e4m3": (torch.float8_e4m3fn, torch.uint8), "f32": (torch.float32, torch.int32)}
 NAMES = ("fc_norm", "e_norm", "g_norm", "attn_norm", "mlp_norm", "out_norm", "fc.weight", "w_in.weight", "wq.weight",
          "wkv.weight", "wo.weight", "w13.weight", "w2.weight", "down.weight", "up.weight")
 
@@ -70,8 +77,29 @@ def target_head(prefix: str, vocab: int, dim: int) -> tuple[torch.Tensor, dict]:
     return lm, rec
 
 
-def convert(ck: dict, target: str | None = None) -> tuple[dict, dict]:
-    """-> (header, {name: bf16 tensor}) of a checkpoint; `target`: the head dump prefix (a two_stage head)."""
+def fp8_rows(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The FP8 form of a bf16 linear [n, k]: (q e4m3 [n, k], s fp32 [n]) with fp32(q) * s standing for w."""
+
+    wf = w.to(torch.bfloat16).float()
+    s = wf.abs().amax(1) / 448.0
+    s = torch.where(s == 0, torch.ones_like(s), s)
+    return (wf / s[:, None]).to(torch.float8_e4m3fn), s
+
+
+def raw(t: torch.Tensor) -> bytes:
+    for name, (dt, iv) in DTYPES.items():
+        if t.dtype == dt:
+            return t.contiguous().view(iv).numpy().tobytes()
+    raise ValueError(f"dtype {t.dtype}")
+
+
+def dtype_name(t: torch.Tensor) -> str:
+    return next(n for n, (dt, _) in DTYPES.items() if t.dtype == dt)
+
+
+def convert(ck: dict, target: str | None = None, fp8: bool = True) -> tuple[dict, dict]:
+    """-> (header, {name: tensor}) of a checkpoint; `target`: the head dump prefix (a two_stage head); fp8: add each
+    linear's FP8 form."""
 
     cfg = ck["cfg"]
     if cfg.get("kind", "base") != "base":
@@ -115,15 +143,24 @@ def convert(ck: dict, target: str | None = None) -> tuple[dict, dict]:
             "train_taps": taps}
     if rec is not None:
         head["target_head"] = rec
-    return head, {k: v.to(torch.bfloat16).contiguous() for k, v in out.items()}
+    tensors = {k: v.to(torch.bfloat16).contiguous() for k, v in out.items()}
+    if fp8:
+        shas = {}
+        for n in LINEARS:
+            q, sc = fp8_rows(tensors[n + ".weight"])
+            tensors[n + ".fp8"], tensors[n + ".scale"] = q, sc
+            shas[n] = {"fp8": hashlib.sha256(raw(q)).hexdigest(), "scale": hashlib.sha256(raw(sc)).hexdigest()}
+        head["fp8"] = {"rule": "s = amax(|bf16 W| a row) / 448 (1 if 0); q = e4m3 RNE of fp32(W) / s; W ~ fp32(q) * s",
+                       "linears": list(LINEARS), "sha256": shas}
+    return head, tensors
 
 
 def write(path: str, head: dict, tensors: dict) -> None:
     table, off = {}, 0
     for k, t in tensors.items():
         off = (off + 255) // 256 * 256
-        table[k] = {"offset": off, "shape": list(t.shape), "dtype": "bf16"}
-        off += t.numel() * 2
+        table[k] = {"offset": off, "shape": list(t.shape), "dtype": dtype_name(t)}
+        off += t.numel() * t.element_size()
     head = {**head, "tensors": table, "data_bytes": off}
     text = json.dumps(head, separators=(",", ":")).encode()
     start = (len(MAGIC) + 8 + len(text) + 4095) // 4096 * 4096
@@ -134,12 +171,12 @@ def write(path: str, head: dict, tensors: dict) -> None:
         for k, t in tensors.items():
             o = table[k]["offset"]
             f.write(b"\0" * (o - pos))
-            f.write(t.view(torch.int16).numpy().tobytes())
-            pos = o + t.numel() * 2
+            f.write(raw(t))
+            pos = o + t.numel() * t.element_size()
 
 
 def read(path: str) -> tuple[dict, dict]:
-    """The header and the tensors (bf16) of a converted file."""
+    """The header and the tensors of a converted file."""
 
     with open(path, "rb") as f:
         b = f.read()
@@ -153,8 +190,10 @@ def read(path: str) -> tuple[dict, dict]:
         cnt = 1
         for s in e["shape"]:
             cnt *= s
-        raw = torch.frombuffer(bytearray(b[start + e["offset"]:start + e["offset"] + 2 * cnt]), dtype=torch.int16)
-        out[k] = raw.view(torch.bfloat16).view(*e["shape"])
+        dt, iv = DTYPES[e["dtype"]]
+        es = torch.empty(0, dtype=iv).element_size()
+        r = torch.frombuffer(bytearray(b[start + e["offset"]:start + e["offset"] + es * cnt]), dtype=iv)
+        out[k] = r.view(dt).view(*e["shape"])
     return head, out
 
 
@@ -163,14 +202,16 @@ def main() -> None:
     p.add_argument("head")
     p.add_argument("out")
     p.add_argument("--target-head", default=None, help="a two_stage head: the head dump prefix (PREFIX-r*.pt)")
+    p.add_argument("--no-fp8", action="store_true", help="leave out the linears' FP8 forms")
     a = p.parse_args()
     ck = torch.load(a.head, map_location="cpu", weights_only=True)
-    head, tensors = convert(ck, a.target_head)
+    head, tensors = convert(ck, a.target_head, not a.no_fp8)
     write(a.out, head, tensors)
     print(json.dumps({"out": a.out, "taps": head["taps"], "train_taps": head["train_taps"],
                       "head_type": head["head_type"], "cand_k": head["cand_k"],
                       "target_head": head.get("target_head"),
-                      "params": sum(t.numel() for k, t in tensors.items() if k != "target_head")}))
+                      "fp8": head.get("fp8", {}).get("sha256"),
+                      "params": sum(t.numel() for k, t in tensors.items() if k.endswith(".weight") or k.endswith("_norm") or k == "tap_norms")}))
 
 
 if __name__ == "__main__":

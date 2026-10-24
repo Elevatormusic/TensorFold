@@ -11,7 +11,10 @@ The engine's order of work for one stream (pending token at position q0, real ro
 Activations are bf16 between the operations (fp32 inside each), as the engine's kernels and cuBLAS calls give them.
 
   python3 eagle_ref.py cross HEAD.pt --train-py PATH/eagle_train.py        the chain equals chain_forward's
-  python3 eagle_ref.py vectors HEAD.tfe OUT.tfev --embed EMBED.bf16 [--T 160] [--steps 5]   self-test vectors
+  python3 eagle_ref.py vectors HEAD.tfe OUT.tfev --embed EMBED.bf16 [--T 160] [--steps 5] [--fp8]   self-test vectors
+  python3 eagle_ref.py fp8cmp HEAD.tfe --embed EMBED.bf16      the FP8 form's chain against the bf16 one's
+
+--fp8: the linears are the file's FP8 forms (fp32(q) * s, eagle_convert.py), as the engine's TF_DS_EAGLE_FP8=1 runs.
 """
 
 import argparse
@@ -23,13 +26,17 @@ import struct
 import torch
 import torch.nn.functional as F
 
-from eagle_convert import read
+from eagle_convert import LINEARS, read
 
 class Ref:
     """The converted head's tensors (bf16) and its math; `rnd`: round to bf16 between the operations."""
 
-    def __init__(self, head: dict, t: dict, embed: torch.Tensor, rnd: bool = True):
-        self.h, self.t, self.embed, self.rnd = head, {k: v.float() for k, v in t.items()}, embed.float(), rnd
+    def __init__(self, head: dict, t: dict, embed: torch.Tensor, rnd: bool = True, fp8: bool = False):
+        self.h, self.embed, self.rnd = head, embed.float(), rnd
+        self.t = {k: v.float() for k, v in t.items() if not k.endswith((".fp8", ".scale"))}
+        if fp8:
+            for n in LINEARS:
+                self.t[n + ".weight"] = t[n + ".fp8"].float() * t[n + ".scale"].float()[:, None]
         self.eps = head["eps"]
 
     def r(self, x):
@@ -238,14 +245,14 @@ def vectors(a) -> None:
     T, S, q0s = cases_of(a, head["window"])
     taps, ids = fake_inputs(L, D, V, T + S, 11)
     embed = torch.frombuffer(bytearray(open(a.embed, "rb").read()), dtype=torch.int16).view(torch.bfloat16).view(V, D)
-    ref = Ref(head, tensors, embed, rnd=True)
+    ref = Ref(head, tensors, embed, rnd=True, fp8=a.fp8)
     cases = []
     for q0 in q0s:
         d, o, p, lg = chain(ref, taps.float(), ids, q0, S)
         top2 = lg.topk(2, -1).values
         cases.append({"q0": q0, "drafts": d, "p_top1": p, "gap": (top2[:, 0] - top2[:, 1]).tolist(), "o": o})
         print(json.dumps({"q0": q0, "drafts": d, "p_top1": [round(x, 5) for x in p]}))
-    meta = {"T": T, "steps": S, "dim": D, "layers": L, "taps": head["taps"], "vocab": V,
+    meta = {"T": T, "steps": S, "dim": D, "layers": L, "taps": head["taps"], "vocab": V, "fp8": a.fp8,
             "q0": [c["q0"] for c in cases], "drafts": [c["drafts"] for c in cases],
             "p_top1": [c["p_top1"] for c in cases], "gap": [c["gap"] for c in cases]}
     blobs = [taps.view(torch.int16).numpy().tobytes(), ids.to(torch.int32).numpy().tobytes(),
@@ -260,9 +267,39 @@ def vectors(a) -> None:
     print(json.dumps({"out": a.out, "cases": len(cases), "bytes": 16 + len(text) + sum(meta["sizes"])}))
 
 
+def fp8cmp(a) -> None:
+    """The FP8 form against the bf16 one on the self-test cases: step-1 logits (the same inputs), each step's top-1
+    with teacher forcing (both chains fed the bf16 chain's drafts) and the free-running drafts' agreement."""
+
+    head, tensors = read(a.head)
+    D, V, L = head["dim"], head["vocab"], len(head["taps"])
+    T, S, q0s = cases_of(a, head["window"])
+    taps, ids = fake_inputs(L, D, V, T + S, 11)
+    embed = torch.frombuffer(bytearray(open(a.embed, "rb").read()), dtype=torch.int16).view(torch.bfloat16).view(V, D)
+    rb = Ref(head, tensors, embed, rnd=True)
+    r8 = Ref(head, tensors, embed, rnd=True, fp8=True)
+    worst, same1, n1, agree, steps = 0.0, 0, 0, 0, 0
+    out = []
+    for q0 in q0s:
+        db, _, _, lb = chain(rb, taps.float(), ids, q0, S)
+        d8, _, _, l8 = chain(r8, taps.float(), ids, q0, S)
+        err = float((l8[0] - lb[0]).abs().max() / lb[0].abs().max())
+        worst = max(worst, err)
+        same1 += int(db[0] == d8[0])
+        n1 += 1
+        k = 0
+        while k < S and db[k] == d8[k]:
+            k += 1
+        agree += k
+        steps += S
+        out.append({"q0": q0, "step1_logit_rel_err": round(err, 5), "drafts_bf16": db, "drafts_fp8": d8})
+    print(json.dumps({"fp8cmp": a.head, "cases": out, "worst_step1_logit_rel_err": worst,
+                      "step1_top1_equal": f"{same1}/{n1}", "free_run_steps_equal": f"{agree}/{steps}"}))
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("mode", choices=["cross", "vectors"])
+    p.add_argument("mode", choices=["cross", "vectors", "fp8cmp"])
     p.add_argument("head")
     p.add_argument("out", nargs="?")
     p.add_argument("--train-py", default=None)
@@ -271,8 +308,9 @@ def main() -> None:
     p.add_argument("--T", type=int, default=None, help="rows of taps (default: the window + 32)")
     p.add_argument("--steps", type=int, default=5)
     p.add_argument("--q0", type=int, nargs="+", default=None, help="default: 1 2 64 window+1 window+2 T")
+    p.add_argument("--fp8", action="store_true", help="vectors: the FP8 forms of the linears")
     a = p.parse_args()
-    cross(a) if a.mode == "cross" else vectors(a)
+    {"cross": cross, "vectors": vectors, "fp8cmp": fp8cmp}[a.mode](a)
 
 
 if __name__ == "__main__":

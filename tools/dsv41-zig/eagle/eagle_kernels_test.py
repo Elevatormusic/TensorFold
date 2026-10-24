@@ -113,6 +113,24 @@ for i, (sl, p, l) in enumerate(rows):
     want = sc.softmax(-1) @ V[idx].float()
     err = max(err, float((got[i].view(H, hd) - r(want)).abs().max()))
 res["attn"] = err
+ring2, W2 = 527, 511
+K2 = torch.randn(2 * ring2 + 1, hd, generator=gen).to(torch.bfloat16)
+V2 = torch.randn(2 * ring2 + 1, hd, generator=gen).to(torch.bfloat16)
+rows2 = [(0, 600, 0), (1, 700, 400), (0, 511, 0), (1, 5, 0)]
+N2 = len(rows2)
+qb = torch.randn(N2, H * hd, generator=gen).to(torch.bfloat16)
+out2 = torch.zeros(N2, H * hd, dtype=torch.bfloat16)
+args2 = [dev_t(t) for t in (qb, K2, V2, torch.tensor([sl * ring2 for sl, _, _ in rows2]), torch.tensor([p for _, p, _ in rows2]),
+                            torch.tensor([l for _, _, l in rows2]), out2)]
+launch(fn("tf_eagle_attn_kernel"), (N2, H), 128, [("p", args2[0].value), ("ll", H * hd), ("p", args2[1].value), ("p", args2[2].value), ("i", 1), ("p", args2[3].value), ("p", args2[4].value), ("p", args2[5].value), ("i", ring2), ("i", W2), ("i", H), ("f", hd ** -0.5), ("p", args2[6].value), ("ll", H * hd)])
+got = back(args2[6], out2).float()
+err = 0.0
+for i, (sl, p, l) in enumerate(rows2):
+    idx = torch.tensor([sl * ring2 + t % ring2 for t in range(max(l, p - W2), p + 1)])
+    sc = (qb[i].float().view(H, hd) @ K2[idx].float().T) * hd ** -0.5
+    want = sc.softmax(-1) @ V2[idx].float()
+    err = max(err, float((got[i].view(H, hd) - r(want)).abs().max()))
+res["attn511"] = err
 
 # silu * up
 I = 4096
@@ -138,6 +156,15 @@ p1 = lg.softmax(-1).max(-1)
 pr = p1.values.clamp(1e-7, 1 - 1e-7)
 res["top1_ids_equal"] = bool((gi == p1.indices).all())
 res["top1_conf"] = float((gc - torch.log(pr / (1 - pr))).abs().max())
+parts = 64
+pm, pz, pq = torch.zeros(N, parts), torch.zeros(N, parts), torch.zeros(N, parts, dtype=torch.int32)
+ppm, ppz, ppq = dev_t(pm), dev_t(pz), dev_t(pq)
+ids3, conf3 = torch.zeros(N, dtype=torch.long), torch.zeros(N)
+pi3, pc3 = dev_t(ids3), dev_t(conf3)
+launch(fn("tf_eagle_top1_part_kernel"), (N, parts), 256, [("p", pl.value), ("ll", Vv), ("i", Vv), ("p", ppm.value), ("p", ppz.value), ("p", ppq.value)])
+launch(fn("tf_eagle_top1_join_kernel"), (N,), 32, [("p", ppm.value), ("p", ppz.value), ("p", ppq.value), ("i", parts), ("p", pi3.value), ("p", pc3.value), ("f", 1.0), ("f", 0.0)])
+res["top1_split_ids_equal"] = bool((back(pi3, ids3) == p1.indices).all())
+res["top1_split_conf"] = float((back(pc3, conf3) - torch.log(pr / (1 - pr))).abs().max())
 
 # two_stage: top-k candidates (ties at the k-th value by the lower id), their exact logits, top-1 through the map
 for k in (128, 512):
@@ -169,7 +196,55 @@ pi2, pc2 = dev_t(ids2), dev_t(conf2)
 launch(fn("tf_eagle_top1_kernel"), (N,), 1024, [("p", pex.value), ("ll", k), ("i", k), ("p", pcd.value), ("ll", k), ("p", pi2.value), ("p", pc2.value), ("f", 1.0), ("f", 0.0)])
 res["top1_map_ids_equal"] = bool((back(pi2, ids2) == cand.gather(1, gx.argmax(-1, keepdim=True))[:, 0]).all())
 
+
+
+def fp8_rows(Wb: torch.Tensor):
+    """The converter's rule: s = amax(|W|) / 448 a row (1 where 0), q = e4m3 RNE of W / s."""
+
+    wf = Wb.float()
+    sc = wf.abs().amax(1) / 448.0
+    sc = torch.where(sc == 0, torch.ones_like(sc), sc)
+    return (wf / sc[:, None]).to(torch.float8_e4m3fn), sc
+
+
+gw = 0.0
+for (n_, k_) in ((5120, 4096), (4096, 5120), (512, 15360), (129280, 256), (256, 5120), (136, 10240)):
+    Wb = (torch.randn(n_, k_, generator=gen) * 0.02).to(torch.bfloat16)
+    Wb[3] = 0
+    q8, s8 = fp8_rows(Wb)
+    for rows_ in (1, 4, 16):
+        xg = torch.randn(rows_, k_ + 8, generator=gen).to(torch.bfloat16)        # rows k + 8 apart
+        for f8 in (False, True):
+            wd = q8.float() * s8[:, None] if f8 else Wb.float()
+            want = xg[:, :k_].float() @ wd.T
+            base_ = torch.randn(rows_, n_ + 8, generator=gen).to(torch.bfloat16)
+            for mode in (0, 1, 2):
+                o_ = torch.zeros(rows_, n_ + 8, dtype=torch.float32) if mode == 1 else base_.clone()
+                pw_ = dev_t(q8.view(torch.uint8) if f8 else Wb)
+                ps_ = dev_t(s8)
+                px_, po_ = dev_t(xg), dev_t(o_)
+                eb = 1 if f8 else 2
+                G = min(32, k_ * eb // 16)
+                per = 32 // G
+                grid = (n_ + 8 * per - 1) // (8 * per)
+                if f8:
+                    launch(fn("tf_eagle_gemv_fp8_kernel"), (grid,), 256, [("p", pw_.value), ("p", ps_.value), ("i", n_), ("i", k_), ("p", px_.value), ("ll", k_ + 8), ("i", rows_), ("p", po_.value), ("ll", n_ + 8), ("i", mode), ("i", G)])
+                else:
+                    launch(fn("tf_eagle_gemv_bf16_kernel"), (grid,), 256, [("p", pw_.value), ("i", n_), ("i", k_), ("p", px_.value), ("ll", k_ + 8), ("i", rows_), ("p", po_.value), ("ll", n_ + 8), ("i", mode), ("i", G)])
+                got = back(po_, o_).float()
+                w_ = want if mode != 2 else base_[:, :n_].float() + want
+                if mode == 1:
+                    e_ = float((got[:, :n_] - w_).abs().max() / w_.abs().max())
+                else:
+                    e_ = float((got[:, :n_] - r(w_)).abs().max() / w_.abs().max())
+                e_ = max(e_, float((got[:, n_:] - o_[:, n_:].float()).abs().max()))       # the gap columns stay
+                gw = max(gw, e_)
+                for t_ in (pw_, ps_, px_, po_):
+                    cu.cuMemFree_v2(t_)
+res["gemv"] = gw
+
 print(res)
 bad = res["rmsnorm"] > 1e-2 or res["rope"] > 0.05 or res["attn"] > 0.02 or res["silu_mul"] > 0.05 or \
-    not res["top1_ids_equal"] or res["top1_conf"] > 1e-3 or not res["topk128_sets_equal"] or     not res["topk512_sets_equal"] or res["rescore"] > 1e-4 or not res["top1_map_ids_equal"]
+    not res["top1_ids_equal"] or res["top1_conf"] > 1e-3 or not res["topk128_sets_equal"] or     not res["topk512_sets_equal"] or res["rescore"] > 1e-4 or not res["top1_map_ids_equal"] or \
+    res["attn511"] > 0.02 or not res["top1_split_ids_equal"] or res["top1_split_conf"] > 1e-3 or res["gemv"] > 1e-2
 print("FAIL" if bad else "PASS")

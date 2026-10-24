@@ -18,7 +18,11 @@
 //! The g rows come with each round (absorbRound: the drafting streams' window rows, eager as the DSpark absorb) and each
 //! prompt chunk that reaches the head (the last ring rows). A pass first runs the rows from the stream's last extended
 //! position to q0 - 1 through the layer's input part (their keys and values), then `steps` single-row steps for all
-//! streams at once. Every GEMM is a bf16 cuBLAS call (fp32 sums); the row kernels are zig/kernels/cuda/dsv41/eagle.cu.
+//! streams at once. The linears are bf16 cuBLAS calls or, for up to 16 rows, the own GEMV of
+//! zig/kernels/cuda/dsv41/eagle.cu (fp32 sums both), as are the row kernels. TF_DS_EAGLE_GEMV picks the own GEMV's
+//! linears: "wo" (the default: wo and w2, where cuBLAS's few-row kernel is slow), "all", or "cublas". With
+//! TF_DS_EAGLE_FP8=1 the head's linears are e4m3 with an fp32 scale a row (the file's "NAME.fp8" and "NAME.scale",
+//! eagle_convert.py's rule) through the own GEMV only; the norms, the target head's copy and the logits stay as they are.
 const std = @import("std");
 const cuda = @import("cuda");
 const prompt = @import("prompt.zig");
@@ -39,6 +43,10 @@ pub const final_tap: u16 = 1000;
 pub const max_keys = 512;
 /// A two_stage head's candidates a row at most.
 pub const max_cand = 512;
+/// The rows of one own GEMV launch (eagle.cu gemv_rows); more rows run in launches of this many.
+pub const gemv_rows = 16;
+/// The parts of a low-rank row's top-1 (eagle.cu tf_eagle_top1_part_kernel).
+const top1_parts = 64;
 const ring_extra = 16;
 const magic = "TFEHEAD1";
 
@@ -143,6 +151,61 @@ pub const Req = struct { slot: usize, q0: usize, pending: i64, seq: []const i32 
 /// What a slot's rings hold: g rows of positions [g_lo, g_hi), keys and values of the real rows below `ext` from `lo`.
 const Slot = struct { live: bool = false, lo: usize = 0, ext: usize = 0, g_lo: usize = 0, g_hi: usize = 0 };
 
+/// A linear of the head: weights [n, k] row-major, bf16 or e4m3 (fp8) with an fp32 scale a row; own: the own GEMV for
+/// up to gemv_rows rows (always for fp8).
+const Lin = struct { w: u64 = 0, scale: u64 = 0, n: usize = 0, k: usize = 0, fp8: bool = false, own: bool = false };
+
+/// A linear's output: bf16, fp32, or added to the bf16 out (one rounding).
+const Out = enum(c_int) { bf16 = 0, f32 = 1, add = 2 };
+
+/// The tensors a head needs from its file: each one's place in the file and on the device (a multiple of 256 bytes).
+const Plan = struct {
+    items: [40]Item = undefined,
+    n: usize = 0,
+
+    const Item = struct { name: []const u8, dtype: []const u8, shape: [2]u64, dims: usize, dest: *u64, src: u64 = 0, bytes: u64 = 0, at: u64 = 0 };
+
+    fn add(p: *Plan, name: []const u8, dtype: []const u8, shape: []const u64, dest: *u64) void {
+        var sh: [2]u64 = .{ 0, 0 };
+        for (shape, 0..) |x, i| sh[i] = x;
+        p.items[p.n] = .{ .name = name, .dtype = dtype, .shape = sh, .dims = shape.len, .dest = dest };
+        p.n += 1;
+    }
+
+    /// A linear `base` [n, k]: "BASE.weight" bf16, or "BASE.fp8" e4m3 and "BASE.scale" fp32 [n].
+    fn lin(p: *Plan, l: *Lin, comptime base: []const u8, n: usize, k: usize, fp8: bool, own: bool) void {
+        l.* = .{ .n = n, .k = k, .fp8 = fp8, .own = own or fp8 };
+        if (fp8) {
+            p.add(base ++ ".fp8", "f8e4m3", &.{ @intCast(n), @intCast(k) }, &l.w);
+            p.add(base ++ ".scale", "f32", &.{@intCast(n)}, &l.scale);
+        } else p.add(base ++ ".weight", "bf16", &.{ @intCast(n), @intCast(k) }, &l.w);
+    }
+
+    /// The bytes on the device; each item's file range checked against the header.
+    fn resolve(p: *Plan, h: Header) !u64 {
+        var total: u64 = 0;
+        for (p.items[0..p.n]) |*it| {
+            const t = h.json.tensors.map.get(it.name) orelse {
+                std.log.err("eagle head: no tensor {s} (an FP8 head needs eagle_convert.py's FP8 forms)", .{it.name});
+                return error.MissingEagleTensor;
+            };
+            if (!std.mem.eql(u8, t.dtype, it.dtype) or !std.mem.eql(u64, t.shape, it.shape[0..it.dims])) {
+                std.log.err("eagle head: {s} is {s} {any}, want {s} {any}", .{ it.name, t.dtype, t.shape, it.dtype, it.shape[0..it.dims] });
+                return error.EagleShapeMismatch;
+            }
+            const es: u64 = if (std.mem.eql(u8, it.dtype, "f32")) 4 else if (std.mem.eql(u8, it.dtype, "bf16")) 2 else 1;
+            var n: u64 = es;
+            for (it.shape[0..it.dims]) |x| n *= x;
+            if (t.offset + n > h.json.data_bytes) return error.ShortEagleHead;
+            it.src = h.data_at + t.offset;
+            it.bytes = n;
+            it.at = total;
+            total = (total + n + 255) / 256 * 256;
+        }
+        return total;
+    }
+};
+
 const Fns = struct {
     rmsnorm: cuda.Function,
     rope: cuda.Function,
@@ -151,27 +214,31 @@ const Fns = struct {
     top1: cuda.Function,
     topk: cuda.Function,
     rescore: cuda.Function,
+    gemv_bf16: cuda.Function,
+    gemv_fp8: cuda.Function,
+    top1_part: cuda.Function,
+    top1_join: cuda.Function,
 };
 
 pub const Eagle = struct {
     s: Shape,
     buf: cuda.DeviceBuffer, // the weights
-    // the weights (bf16, row-major [out, in])
+    // the weights (row-major [out, in]; the norms bf16)
     fc_norm: u64,
     e_norm: u64,
     g_norm: u64,
     attn_norm: u64,
     mlp_norm: u64,
     out_norm: u64,
-    fc: u64,
-    w_in: u64,
-    wq: u64,
-    wkv: u64,
-    wo: u64,
-    w13: u64,
-    w2: u64,
-    down: u64,
-    up: u64,
+    fc: Lin,
+    w_in: Lin,
+    wq: Lin,
+    wkv: Lin,
+    wo: Lin,
+    w13: Lin,
+    w2: Lin,
+    down: Lin,
+    up: Lin,
     tap_norms: u64 = 0,
     fb_norm: u64 = 0,
     q_norm: u64 = 0,
@@ -209,6 +276,9 @@ pub const Eagle = struct {
     lg: u64, // f32 [max_streams, vocab]
     cand: u64, // i64 [max_streams, max_cand]: two_stage candidates
     ex: u64, // f32 [max_streams, max_cand]: their exact logits
+    tpm: u64, // f32 [max_streams, top1_parts]: a low-rank top-1's parts (max, sum, id)
+    tpz: u64,
+    tpi: u64, // i32
     sp: u64, // i64 [max_steps, max_streams]: each step's positions, ring rows, then [max_streams] bases and lows
     srow: u64,
     sbase: u64,
@@ -271,8 +341,49 @@ pub const Eagle = struct {
             eg.conf_a = try std.fmt.parseFloat(f32, it.next() orelse return error.BadEagleConf);
             eg.conf_b = try std.fmt.parseFloat(f32, it.next() orelse "0");
         }
-        // the weights: one buffer, read in pieces
-        const bytes: usize = @intCast(hdr.json.data_bytes);
+        const fp8 = if (std.c.getenv("TF_DS_EAGLE_FP8")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        var own_all = false;
+        var own_wo = true;
+        if (std.c.getenv("TF_DS_EAGLE_GEMV")) |v| {
+            const m = std.mem.span(v);
+            if (std.mem.eql(u8, m, "all")) {
+                own_all = true;
+            } else if (std.mem.eql(u8, m, "cublas")) {
+                own_wo = false;
+            } else if (!std.mem.eql(u8, m, "wo")) return error.BadEagleGemv;
+        }
+        // the tensors this head runs (one form of each linear), each read from the file into one buffer
+        const D = s.dim;
+        const hq = s.heads * s.head_dim;
+        const hkv = s.kv_heads * s.head_dim;
+        const L = s.n_taps;
+        const d: u64 = @intCast(D);
+        var plan: Plan = .{};
+        plan.add("fc_norm", "bf16", &.{d}, &eg.fc_norm);
+        plan.add("e_norm", "bf16", &.{d}, &eg.e_norm);
+        plan.add("g_norm", "bf16", &.{d}, &eg.g_norm);
+        plan.add("attn_norm", "bf16", &.{d}, &eg.attn_norm);
+        plan.add("mlp_norm", "bf16", &.{d}, &eg.mlp_norm);
+        plan.add("out_norm", "bf16", &.{d}, &eg.out_norm);
+        plan.lin(&eg.fc, "fc", D, L * D, fp8, own_all);
+        plan.lin(&eg.w_in, "w_in", D, 2 * D, fp8, own_all);
+        plan.lin(&eg.wq, "wq", hq, D, fp8, own_all);
+        plan.lin(&eg.wkv, "wkv", 2 * hkv, D, fp8, own_all);
+        plan.lin(&eg.wo, "wo", D, hq, fp8, own_all or own_wo);
+        plan.lin(&eg.w13, "w13", 2 * s.inter, D, fp8, own_all);
+        plan.lin(&eg.w2, "w2", D, s.inter, fp8, own_all or own_wo);
+        plan.lin(&eg.down, "down", s.rank, D, fp8, own_all);
+        plan.lin(&eg.up, "up", s.vocab, s.rank, fp8, own_all);
+        if (s.tap_norm) {
+            plan.add("tap_norms", "bf16", &.{ @intCast(L), d }, &eg.tap_norms);
+            plan.add("fb_norm", "bf16", &.{d}, &eg.fb_norm);
+        }
+        if (s.qk_norm) {
+            plan.add("q_norm", "bf16", &.{@intCast(s.head_dim)}, &eg.q_norm);
+            plan.add("k_norm", "bf16", &.{@intCast(s.head_dim)}, &eg.k_norm);
+        }
+        if (s.cand_k > 0) plan.add("target_head", "bf16", &.{ @intCast(s.vocab), d }, &eg.target);
+        const bytes: usize = @intCast(try plan.resolve(hdr));
         eg.buf = try cuda.DeviceBuffer.alloc(e.d, bytes);
         errdefer eg.buf.free();
         {
@@ -280,61 +391,17 @@ pub const Eagle = struct {
             defer f.close(io);
             const piece = try gpa.alloc(u8, 64 << 20);
             defer gpa.free(piece);
-            var done: usize = 0;
-            while (done < bytes) {
-                const n = @min(piece.len, bytes - done);
-                if (try f.readPositionalAll(io, piece[0..n], hdr.data_at + done) != n) return error.ShortEagleHead;
-                try eg.buf.upload(done, piece[0..n]);
-                done += n;
-            }
-        }
-        const D = s.dim;
-        const hq = s.heads * s.head_dim;
-        const hkv = s.kv_heads * s.head_dim;
-        const L = s.n_taps;
-        const T = struct {
-            fn at(h: Header, base: u64, name: []const u8, shape: []const u64) !u64 {
-                const t = h.json.tensors.map.get(name) orelse return error.MissingEagleTensor;
-                if (!std.mem.eql(u8, t.dtype, "bf16") or !std.mem.eql(u64, t.shape, shape)) {
-                    std.log.err("eagle head: {s} has shape {any}, want {any}", .{ name, t.shape, shape });
-                    return error.EagleShapeMismatch;
+            for (plan.items[0..plan.n]) |it| {
+                var done: u64 = 0;
+                while (done < it.bytes) {
+                    const n: usize = @intCast(@min(piece.len, it.bytes - done));
+                    if (try f.readPositionalAll(io, piece[0..n], it.src + done) != n) return error.ShortEagleHead;
+                    try eg.buf.upload(@intCast(it.at + done), piece[0..n]);
+                    done += n;
                 }
-                var n: u64 = 2;
-                for (shape) |x| n *= x;
-                if (t.offset + n > h.json.data_bytes) return error.ShortEagleHead;
-                return base + t.offset;
+                it.dest.* = eg.buf.ptr + it.at;
             }
-        };
-        const b = eg.buf.ptr;
-        const u = struct {
-            fn v(x: usize) u64 {
-                return @intCast(x);
-            }
-        }.v;
-        eg.fc_norm = try T.at(hdr, b, "fc_norm", &.{u(D)});
-        eg.e_norm = try T.at(hdr, b, "e_norm", &.{u(D)});
-        eg.g_norm = try T.at(hdr, b, "g_norm", &.{u(D)});
-        eg.attn_norm = try T.at(hdr, b, "attn_norm", &.{u(D)});
-        eg.mlp_norm = try T.at(hdr, b, "mlp_norm", &.{u(D)});
-        eg.out_norm = try T.at(hdr, b, "out_norm", &.{u(D)});
-        eg.fc = try T.at(hdr, b, "fc.weight", &.{ u(D), u(L * D) });
-        eg.w_in = try T.at(hdr, b, "w_in.weight", &.{ u(D), u(2 * D) });
-        eg.wq = try T.at(hdr, b, "wq.weight", &.{ u(hq), u(D) });
-        eg.wkv = try T.at(hdr, b, "wkv.weight", &.{ u(2 * hkv), u(D) });
-        eg.wo = try T.at(hdr, b, "wo.weight", &.{ u(D), u(hq) });
-        eg.w13 = try T.at(hdr, b, "w13.weight", &.{ u(2 * s.inter), u(D) });
-        eg.w2 = try T.at(hdr, b, "w2.weight", &.{ u(D), u(s.inter) });
-        eg.down = try T.at(hdr, b, "down.weight", &.{ u(s.rank), u(D) });
-        eg.up = try T.at(hdr, b, "up.weight", &.{ u(s.vocab), u(s.rank) });
-        if (s.tap_norm) {
-            eg.tap_norms = try T.at(hdr, b, "tap_norms", &.{ u(L), u(D) });
-            eg.fb_norm = try T.at(hdr, b, "fb_norm", &.{u(D)});
         }
-        if (s.qk_norm) {
-            eg.q_norm = try T.at(hdr, b, "q_norm", &.{u(s.head_dim)});
-            eg.k_norm = try T.at(hdr, b, "k_norm", &.{u(s.head_dim)});
-        }
-        if (s.cand_k > 0) eg.target = try T.at(hdr, b, "target_head", &.{ u(s.vocab), u(D) });
         eg.mod = try cuda.Module.load(e.d, cuda.kernels.dsv41_eagle);
         errdefer eg.mod.unload();
         eg.f = .{
@@ -345,6 +412,10 @@ pub const Eagle = struct {
             .top1 = try eg.mod.function("tf_eagle_top1_kernel"),
             .topk = try eg.mod.function("tf_eagle_topk_kernel"),
             .rescore = try eg.mod.function("tf_eagle_rescore_kernel"),
+            .gemv_bf16 = try eg.mod.function("tf_eagle_gemv_bf16_kernel"),
+            .gemv_fp8 = try eg.mod.function("tf_eagle_gemv_fp8_kernel"),
+            .top1_part = try eg.mod.function("tf_eagle_top1_part_kernel"),
+            .top1_join = try eg.mod.function("tf_eagle_top1_join_kernel"),
         };
         eg.slots = slots;
         eg.ring = s.window + ring_extra;
@@ -377,6 +448,9 @@ pub const Eagle = struct {
         eg.lg = try a.take(M * s.vocab * 4);
         eg.cand = try a.take(M * max_cand * 8);
         eg.ex = try a.take(M * max_cand * 4);
+        eg.tpm = try a.take(M * top1_parts * 4);
+        eg.tpz = try a.take(M * top1_parts * 4);
+        eg.tpi = try a.take(M * top1_parts * 4);
         eg.sp = try a.take(max_steps * M * 8);
         eg.srow = try a.take(max_steps * M * 8);
         eg.sbase = try a.take(M * 8);
@@ -387,7 +461,7 @@ pub const Eagle = struct {
         eg.dbg = try a.take(max_steps * M * D * 2);
         try prompt.fill(e, eg.invalid, 0, 4);
         try e.s.synchronize();
-        std.log.info("eagle head: {s}, taps {any}, window {d}, qk_norm {}, candidates {d}, {d} MiB weights, {d} slots", .{ path, s.tapList(), s.window, s.qk_norm, eg.topk, bytes >> 20, slots });
+        std.log.info("eagle head: {s}, taps {any}, window {d}, qk_norm {}, candidates {d}, fp8 {}, own gemv {s}, {d} MiB weights, {d} slots", .{ path, s.tapList(), s.window, s.qk_norm, eg.topk, fp8, if (fp8 or own_all) "all" else if (own_wo) "wo, w2" else "none", bytes >> 20, slots });
         return eg;
     }
 
@@ -440,9 +514,42 @@ pub const Eagle = struct {
         try cuda.launch.launch(eg.f.rope, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, e.s, &a);
     }
 
-    /// x [rows, k] bf16 (row stride ldx) @ w [n, k]^T into out (row stride ldo).
-    fn mm(e: *const Engine, x: u64, ldx: usize, w: u64, out: u64, ldo: usize, f32_out: bool, rows: usize, k: usize, n: usize) !void {
-        try e.blas.linearDense(x, ldx, w, out, ldo, f32_out, rows, k, n);
+    /// x [rows, k] bf16 (row stride ldx) @ l^T into out (row stride ldo), as `mode`: the own GEMV (eagle.cu) for an fp8
+    /// linear and for an own bf16 one's calls of up to gemv_rows rows, else cuBLAS.
+    fn lin(eg: *const Eagle, e: *const Engine, x: u64, ldx: usize, l: Lin, out: u64, ldo: usize, mode: Out, rows: usize) !void {
+        if (rows == 0) return;
+        const eb: usize = if (l.fp8) 1 else 2;
+        const fits = x % 16 == 0 and ldx % 8 == 0 and (l.k * eb) % 16 == 0 and l.w % 16 == 0;
+        if (l.fp8 or (l.own and rows <= gemv_rows and fits)) {
+            if (!fits) return error.EagleUnaligned;
+            const chunks = l.k * eb / 16;
+            var G: usize = 32;
+            while (G > chunks) G /= 2;
+            const per = 32 / G;
+            const blocks = (l.n + 8 * per - 1) / (8 * per);
+            const osz: usize = if (mode == .f32) 4 else 2;
+            var r0: usize = 0;
+            while (r0 < rows) : (r0 += gemv_rows) {
+                var a: cuda.Args = .{};
+                a.add(l.w);
+                if (l.fp8) a.add(l.scale);
+                a.add(@as(c_int, @intCast(l.n)));
+                a.add(@as(c_int, @intCast(l.k)));
+                a.add(x + r0 * ldx * 2);
+                a.add(@as(c_longlong, @intCast(ldx)));
+                a.add(@as(c_int, @intCast(@min(gemv_rows, rows - r0))));
+                a.add(out + r0 * ldo * osz);
+                a.add(@as(c_longlong, @intCast(ldo)));
+                a.add(@intFromEnum(mode));
+                a.add(@as(c_int, @intCast(G)));
+                try cuda.launch.launch(if (l.fp8) eg.f.gemv_fp8 else eg.f.gemv_bf16, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = 256 } }, e.s, &a);
+            }
+            return;
+        }
+        switch (mode) {
+            .bf16, .f32 => try e.blas.linearDense(x, ldx, l.w, out, ldo, mode == .f32, rows, l.k, l.n),
+            .add => try e.blas.linearDenseAdd(x, ldx, l.w, out, ldo, rows, l.k, l.n),
+        }
     }
 
     /// The keys and values of `rows` rows of h (normed): wkv, k_norm on each key head (qk_norm), RoPE on the keys at
@@ -450,7 +557,7 @@ pub const Eagle = struct {
     fn keysOut(eg: *const Eagle, e: *const Engine, h: u64, pos: u64, rrow: u64, rows: usize) !void {
         const hd = eg.s.head_dim;
         const hkv = eg.s.kv_heads * hd;
-        try mm(e, h, eg.s.dim, eg.wkv, eg.kv, 2 * hkv, false, rows, eg.s.dim, 2 * hkv);
+        try eg.lin(e, h, eg.s.dim, eg.wkv, eg.kv, 2 * hkv, .bf16, rows);
         if (eg.s.qk_norm) for (0..eg.s.kv_heads) |kh| try eg.rmsOf(e, eg.kv + kh * hd * 2, 2 * hkv, eg.k_norm, eg.kv + kh * hd * 2, 2 * hkv, rows, hd);
         try eg.rope(e, eg.kv, 2 * hkv, eg.s.kv_heads, pos, rows);
         try e.ops.scatterRows(e.s, eg.kv, 2 * hkv * 2, rrow, eg.kring, hkv * 2, hkv * 2, rows);
@@ -463,7 +570,7 @@ pub const Eagle = struct {
         const D = eg.s.dim;
         try eg.rms(e, eg.ev, D, eg.e_norm, eg.cat, 2 * D, rows);
         try eg.rms(e, g, D, eg.g_norm, eg.cat + D * 2, 2 * D, rows);
-        try mm(e, eg.cat, 2 * D, eg.w_in, out, D, false, rows, 2 * D, D);
+        try eg.lin(e, eg.cat, 2 * D, eg.w_in, out, D, .bf16, rows);
     }
 
     // -- absorbs --------------------------------------------------------------------------------------------------
@@ -496,7 +603,7 @@ pub const Eagle = struct {
             src = eg.tin;
             ld = L * D;
         }
-        try mm(e, src, ld, eg.fc, eg.x, D, false, total, L * D, D);
+        try eg.lin(e, src, ld, eg.fc, eg.x, D, .bf16, total);
         try eg.rms(e, eg.x, D, eg.fc_norm, eg.h, D, total);
         try e.ops.scatterRows(e.s, eg.h, D * 2, eg.rrow, eg.gring, D * 2, D * 2, total);
         for (spans) |sp| if (sp.keep) note(&eg.st[sp.slot], sp.start, sp.n, eg.ring);
@@ -639,20 +746,42 @@ pub const Eagle = struct {
             try eg.step(e, x, pos, rrow, N, j > 1);
             try e.ops.copyRows(e.s, x, D * 2, eg.dbg + (j - 1) * N * D * 2, D * 2, D * 2, N);
             try eg.rms(e, x, D, eg.out_norm, eg.h, D, N);
-            try mm(e, eg.h, D, eg.down, eg.lr, eg.s.rank, false, N, D, eg.s.rank);
-            try mm(e, eg.lr, eg.s.rank, eg.up, eg.lg, eg.s.vocab, true, N, eg.s.rank, eg.s.vocab);
-            if (eg.topk > 0) try eg.rescoreTop(e, N);
-            var a: cuda.Args = .{};
-            a.add(if (eg.topk > 0) eg.ex else eg.lg);
-            a.add(@as(c_longlong, @intCast(if (eg.topk > 0) max_cand else eg.s.vocab)));
-            a.add(@as(c_int, @intCast(if (eg.topk > 0) eg.topk else eg.s.vocab)));
-            a.add(if (eg.topk > 0) eg.cand else @as(u64, 0));
-            a.add(@as(c_longlong, max_cand));
-            a.add(eg.out + j * N * 8);
-            a.add(eg.conf + (j - 1) * N * 4);
-            a.add(eg.conf_a);
-            a.add(eg.conf_b);
-            try cuda.launch.launch(eg.f.top1, .{ .grid = .{ .x = @intCast(N) }, .block = .{ .x = 1024 } }, e.s, &a);
+            try eg.lin(e, eg.h, D, eg.down, eg.lr, eg.s.rank, .bf16, N);
+            try eg.lin(e, eg.lr, eg.s.rank, eg.up, eg.lg, eg.s.vocab, .f32, N);
+            if (eg.topk > 0) {
+                try eg.rescoreTop(e, N);
+                var a: cuda.Args = .{};
+                a.add(eg.ex);
+                a.add(@as(c_longlong, max_cand));
+                a.add(@as(c_int, @intCast(eg.topk)));
+                a.add(eg.cand);
+                a.add(@as(c_longlong, max_cand));
+                a.add(eg.out + j * N * 8);
+                a.add(eg.conf + (j - 1) * N * 4);
+                a.add(eg.conf_a);
+                a.add(eg.conf_b);
+                try cuda.launch.launch(eg.f.top1, .{ .grid = .{ .x = @intCast(N) }, .block = .{ .x = 1024 } }, e.s, &a);
+            } else {
+                // the vocabulary's top-1 in top1_parts parts a row, then joined
+                var a: cuda.Args = .{};
+                a.add(eg.lg);
+                a.add(@as(c_longlong, @intCast(eg.s.vocab)));
+                a.add(@as(c_int, @intCast(eg.s.vocab)));
+                a.add(eg.tpm);
+                a.add(eg.tpz);
+                a.add(eg.tpi);
+                try cuda.launch.launch(eg.f.top1_part, .{ .grid = .{ .x = @intCast(N), .y = top1_parts }, .block = .{ .x = 256 } }, e.s, &a);
+                var b: cuda.Args = .{};
+                b.add(eg.tpm);
+                b.add(eg.tpz);
+                b.add(eg.tpi);
+                b.add(@as(c_int, top1_parts));
+                b.add(eg.out + j * N * 8);
+                b.add(eg.conf + (j - 1) * N * 4);
+                b.add(eg.conf_a);
+                b.add(eg.conf_b);
+                try cuda.launch.launch(eg.f.top1_join, .{ .grid = .{ .x = @intCast(N) }, .block = .{ .x = 32 } }, e.s, &b);
+            }
         }
     }
 
@@ -703,7 +832,7 @@ pub const Eagle = struct {
         const D = s.dim;
         const hq = s.heads * s.head_dim;
         try eg.rms(e, x, D, eg.attn_norm, eg.h, D, N);
-        try mm(e, eg.h, D, eg.wq, eg.q, hq, false, N, D, hq);
+        try eg.lin(e, eg.h, D, eg.wq, eg.q, hq, .bf16, N);
         if (s.qk_norm) try eg.rmsOf(e, eg.q, s.head_dim, eg.q_norm, eg.q, s.head_dim, N * s.heads, s.head_dim);
         try eg.rope(e, eg.q, hq, s.heads, pos, N);
         if (keys) try eg.keysOut(e, eg.h, pos, rrow, N);
@@ -723,9 +852,9 @@ pub const Eagle = struct {
         a.add(eg.att);
         a.add(@as(c_longlong, @intCast(hq)));
         try cuda.launch.launch(eg.f.attn, .{ .grid = .{ .x = @intCast(N), .y = @intCast(s.heads) }, .block = .{ .x = 128 } }, e.s, &a);
-        try e.blas.linearDenseAdd(eg.att, hq, eg.wo, x, D, N, hq, D);
+        try eg.lin(e, eg.att, hq, eg.wo, x, D, .add, N);
         try eg.rms(e, x, D, eg.mlp_norm, eg.h, D, N);
-        try mm(e, eg.h, D, eg.w13, eg.gu, 2 * s.inter, false, N, D, 2 * s.inter);
+        try eg.lin(e, eg.h, D, eg.w13, eg.gu, 2 * s.inter, .bf16, N);
         var b: cuda.Args = .{};
         b.add(eg.gu);
         b.add(@as(c_int, @intCast(s.inter)));
@@ -733,7 +862,7 @@ pub const Eagle = struct {
         b.add(@as(c_longlong, @intCast(N * s.inter)));
         const count = N * s.inter;
         try cuda.launch.launch(eg.f.silu_mul, .{ .grid = .{ .x = @intCast(@min((count + 255) / 256, 65535)) }, .block = .{ .x = 256 } }, e.s, &b);
-        try e.blas.linearDenseAdd(eg.y, s.inter, eg.w2, x, D, N, s.inter, D);
+        try eg.lin(e, eg.y, s.inter, eg.w2, x, D, .add, N);
     }
 };
 
