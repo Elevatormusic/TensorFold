@@ -211,8 +211,7 @@ pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
     return null;
 }
 
-/// Structured output: every token whose bit is clear in `mask` (token t: bit t % 32 of word t / 32, lanes/grammar.zig)
-/// gets -inf, so greedy and keyed draws pick among the allowed tokens only.
+/// Structured output: a token whose `mask` bit is clear (bit t % 32 of word t / 32, lanes/grammar.zig) gets -inf.
 pub fn applyMask(row: []f32, mask: []const u32) !void {
     if (mask.len * 32 < row.len) return error.InvalidGrammarMasks;
     for (row, 0..) |*x, t| {
@@ -590,8 +589,7 @@ pub const Lanes = struct {
         return l.first;
     }
 
-    /// `first` drawn among `mask`'s allowed tokens (structured output): the prompt's kept last row, masked, drawn at
-    /// the same keyed position as the plain first draw.
+    /// `first` among `mask`'s allowed tokens: the kept last prompt row, masked, at the plain first draw's keyed position.
     fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
         const self = of(ptr);
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
