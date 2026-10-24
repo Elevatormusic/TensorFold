@@ -14,11 +14,7 @@ const max_span = 4 << 30;
 /// The size of one direct read within such a stretch.
 const span_piece = 64 << 20;
 
-/// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
-/// plan_n: the N its decode plan is made for, when not n: a 2D node's column part of a TP2 slice keeps that slice's
-/// plan (linear.py pinned plans), so its columns sum in the slice's K order.
-/// An EXL3 linear (words, suh, svh), or a dense one: `dense` bf16 [n, k] row-major (a mixed pack stores some linears
-/// as plain `<prefix>.weight` tensors at source precision, EAQ v1.1's indexer path), words / suh / svh / k2 then 0.
+/// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N]; or dense.
 pub const Linear = struct {
     words: u64,
     suh: u64,
@@ -26,7 +22,9 @@ pub const Linear = struct {
     k: u32,
     n: u32,
     k2: u32,
+    /// The N of its decode plan when not n: a 2D column part keeps its TP2 slice's plan (linear.py pinned plans).
     plan_n: u32 = 0,
+    /// A mixed pack's plain bf16 `<prefix>.weight` [n, k] row-major (EAQ v1.1); words, suh, svh and k2 are then 0.
     dense: u64 = 0,
 
     pub fn isDense(l: Linear) bool {
@@ -320,12 +318,14 @@ const Loader = struct {
         return L.upload(tensor, L.aux.items);
     }
 
-    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips, or a whole linear the pack holds dense (see
-    /// denseLinear).
+    /// linear(prefix, cols, rows): Exl3Linear.from_tensors in strips, or a whole linear the pack holds dense.
     fn linear(L: *Loader, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize) !Linear {
         var kb: [256]u8 = undefined;
         var nb: [256]u8 = undefined;
-        if (cols == null and rows == null) if (try L.denseLinear(prefix)) |d| return d;
+        if (cols == null and rows == null) if (try L.denseLinear(prefix)) |d| {
+            if (!plan.denseRunnable(prefix)) return error.DenseLinearUnsupported;
+            return d;
+        };
         const tr = try L.entry(try plan.partKey(&kb, prefix, cols, rows, "tr"));
         const t = try L.shape(try plan.partKey(&kb, prefix, cols, rows, "tr"));
         const kt = t[0];
@@ -340,8 +340,7 @@ const Loader = struct {
         return .{ .words = words, .suh = suh, .svh = svh, .k = @intCast(kt * 16), .n = @intCast(nt * 16), .k2 = @intCast(w16 / 8) };
     }
 
-    /// A whole linear the source holds as a plain bf16 `<prefix>.weight` [n, k] (plan.zig's dense entry) instead of
-    /// trellis parts: uploaded as it is. Null when the source has its trellis (every linear of an all-EXL3 pack).
+    /// A whole linear the source holds as a plain bf16 `<prefix>.weight` [n, k], uploaded as it is; null: a trellis.
     fn denseLinear(L: *Loader, prefix: []const u8) !?Linear {
         var kb: [256]u8 = undefined;
         var nb: [256]u8 = undefined;

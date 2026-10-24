@@ -144,8 +144,12 @@ pub fn denseKey(buf: []u8, prefix: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}.weight|None", .{prefix});
 }
 
-/// Which linears a mixed pack holds dense (a plain `<prefix>.weight` and no trellis): `has(ctx, prefix)`. A whole
-/// linear the predicate names is planned as its dense entry; a split one (2D / TP column or row parts) is refused.
+/// Whether a dense linear has a run path: not wo_a's slices (Round.init reads their suh; decode runs groupedRotated).
+pub fn denseRunnable(prefix: []const u8) bool {
+    return std.mem.indexOf(u8, prefix, ".attn.wo_a.") == null;
+}
+
+/// Which whole linears a mixed pack holds dense (`has(ctx, prefix)`); a split (2D / TP part) dense linear is refused.
 pub const Dense = struct {
     ctx: *const anyopaque,
     has: *const fn (ctx: *const anyopaque, prefix: []const u8) bool,
@@ -176,6 +180,7 @@ const Builder = struct {
     fn exl3(b: *Builder, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize, k: ?usize, n: ?usize) !void {
         if (b.dense) |d| if (d.has(d.ctx, prefix)) {
             if (cols != null or rows != null) return error.DenseLinearSplit;
+            if (!denseRunnable(prefix)) return error.DenseLinearUnsupported;
             var buf: [256]u8 = undefined;
             return b.out.append(b.a, .{ .key = try b.a.dupe(u8, try denseKey(&buf, prefix)), .dtype = .bf16 });
         };
@@ -315,6 +320,9 @@ test "a mixed pack's dense linears: one bf16 .weight entry for a whole linear, a
         fn split(_: *const anyopaque, prefix: []const u8) bool {
             return std.mem.eql(u8, prefix, "layers.0.attn.wq_b");
         }
+        fn woA(_: *const anyopaque, prefix: []const u8) bool {
+            return std.mem.eql(u8, prefix, "layers.0.attn.wo_a.slice.0");
+        }
     };
     const ctx: u8 = 0;
     const w = try wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &ctx, .has = names.has });
@@ -332,6 +340,8 @@ test "a mixed pack's dense linears: one bf16 .weight entry for a whole linear, a
     try std.testing.expectEqual(@as(usize, 2), seen);
     // wq_b is a column slice of the rank's heads: no dense form of it
     try std.testing.expectError(error.DenseLinearSplit, wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &ctx, .has = names.split }));
+    // a whole wo_a slice has no dense run path yet: refused at plan time, not at Round.init
+    try std.testing.expectError(error.DenseLinearUnsupported, wantsDense(a, c, .{ .rank = 0, .world = 2 }, true, .{ .ctx = &ctx, .has = names.woA }));
 }
 
 test "each split tensor's ranges: TP2's slices, a 2D node's pair parts of them" {
