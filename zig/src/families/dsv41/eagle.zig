@@ -417,6 +417,8 @@ pub const Eagle = struct {
         var r: usize = 0;
         for (spans) |sp| {
             if (sp.slot >= eg.slots) return error.BadSlot;
+            // (more rows than the ring: two rows of one scatter go to one ring row, and either one can stay)
+            if (sp.keep and sp.n > eg.ring) return error.EagleAbsorbTooLarge;
             for (0..sp.n) |j| {
                 rows[r] = @intCast(if (sp.keep) sp.slot * eg.ring + (sp.start + j) % eg.ring else eg.slots * eg.ring);
                 r += 1;
@@ -690,7 +692,7 @@ pub fn selfTest(eg: *Eagle, gpa: std.mem.Allocator, io: std.Io, e: *const Engine
         eg.reset(0);
         var at: usize = 0;
         while (at < q0) {
-            const k = @min(chunk_rows, q0 - at);
+            const k = @min(chunk_rows, eg.ring, q0 - at);
             try prompt.upload(e, eg.tin, taps[at * L * D * 2 ..].ptr, k * L * D * 2);
             try eg.absorb(e, eg.tin, L * D, &.{.{ .slot = 0, .start = at, .n = k }});
             at += k;
