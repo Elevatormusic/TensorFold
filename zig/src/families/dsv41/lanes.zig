@@ -211,6 +211,14 @@ pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
     return null;
 }
 
+/// Structured output: a token whose `mask` bit is clear (bit t % 32 of word t / 32, lanes/grammar.zig) gets -inf.
+pub fn applyMask(row: []f32, mask: []const u32) !void {
+    if (mask.len * 32 < row.len) return error.InvalidGrammarMasks;
+    for (row, 0..) |*x, t| {
+        if (mask[t / 32] & (@as(u32, 1) << @intCast(t % 32)) == 0) x.* = -std.math.inf(f32);
+    }
+}
+
 /// The token a row's logits draw at absolute position `position`: greedy without sampling (or at temperature 0),
 /// else the served sampler with the stream's key.
 pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
@@ -256,6 +264,7 @@ const Lane = struct {
     held: [draft.max_block]u32 = undefined,
     confs: [draft.max_block]f32 = undefined,
     nheld: usize = 0,
+    first_row: ?[]f32 = null, // structured output: the prompt's last logits row, for first_masked (gpa-owned)
 };
 
 extern "c" fn exp(x: f64) f64;
@@ -331,6 +340,8 @@ pub const Lanes = struct {
         return .{ .ptr = self, .vtable = &.{
             .prefill = prefillFn,
             .first = firstFn,
+            .first_masked = firstMaskedFn,
+            .held = heldFn,
             .queue = queueFn,
             .read = readFn,
             .verify = verifyFn,
@@ -563,7 +574,12 @@ pub const Lanes = struct {
             std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
         }
         const token = try draw(logits, len, s.sampling);
-        self.streams.getPtr(s).?.first = self.take(token);
+        const lane = self.streams.getPtr(s).?;
+        lane.first = self.take(token);
+        if (s.grammar != null) {
+            if (lane.first_row) |old| self.gpa.free(old);
+            lane.first_row = try self.gpa.dupe(f32, logits);
+        }
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -571,6 +587,26 @@ pub const Lanes = struct {
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (position != s.prompt_len) return error.PositionMismatch;
         return l.first;
+    }
+
+    /// `first` among `mask`'s allowed tokens: the kept last prompt row, masked, at the plain first draw's position.
+    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const self = of(ptr);
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (position != s.prompt_len) return error.PositionMismatch;
+        const row = l.first_row orelse return error.NoPromptRow;
+        const masked = try self.gpa.dupe(f32, row);
+        defer self.gpa.free(masked);
+        try applyMask(masked, mask);
+        return self.take(try draw(masked, position, s.sampling));
+    }
+
+    /// The stream's held drafts as host tokens in window order (a grammar walks them and cuts the ones it rejects).
+    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+        const self = of(ptr);
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (out.len > l.nheld) return error.HeldMismatch;
+        @memcpy(out, l.held[0..out.len]);
     }
 
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -625,11 +661,15 @@ pub const Lanes = struct {
         const t2 = m.now();
         // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
         var greedy = true;
+        var masked = false;
         for (windows) |w| {
             if (w.stream.sampling) |sm| if (sm.temperature > 0) {
                 greedy = false;
             };
+            if (w.masks.len > 0) masked = true;
         }
+        // structured output: the masks apply to the host's rows, so a round with one takes the logits path
+        if (masked) greedy = false;
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();
@@ -644,9 +684,25 @@ pub const Lanes = struct {
             p.rows += rows.ids.len;
         };
         const V = m.vocab;
+        var scratch: []f32 = &.{};
+        defer if (scratch.len > 0) gpa.free(scratch);
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            const words = if (w.masks.len > 0) w.masks.len / w.rows() else 0;
+            if (words > 0 and words * w.rows() != w.masks.len) return error.InvalidGrammarMasks;
+            if (words > 0 and scratch.len == 0) scratch = try gpa.alloc(f32, V);
+            for (0..w.rows()) |r| {
+                if (greedy) {
+                    o.sampled[r] = tokens[row0 + r];
+                    continue;
+                }
+                const row = logits[(row0 + r) * V ..][0..V];
+                if (words > 0) {
+                    @memcpy(scratch, row);
+                    try applyMask(scratch, w.masks[r * words ..][0..words]);
+                    o.sampled[r] = try draw(scratch, w.positions[r], w.stream.sampling);
+                } else o.sampled[r] = try draw(row, w.positions[r], w.stream.sampling);
+            }
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
@@ -854,6 +910,7 @@ pub const Lanes = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.streams.fetchRemove(s) orelse return;
+        if (kv.value.first_row) |row| self.gpa.free(row);
         self.used[kv.value.slot] = false;
     }
 };
@@ -1080,6 +1137,22 @@ test "a round's rows: each window at its positions, its ids written over the rej
     try std.testing.expectEqualSlices(i32, &.{ 20, 21, 22 }, rows.windows.?[1].seq);
     try std.testing.expectEqual(@as(usize, 2), rows.windows.?[1].row);
     try std.testing.expectError(error.SequenceGap, b.build(gpa, &seqs, &.{.{ .slot = 1, .base = 0, .end = 2048, .start = 3, .absorb = false, .ids = &.{1} }}));
+}
+
+test "a grammar mask keeps the draws among its tokens" {
+    const base = [_]f32{ 9, 1, 8, 7, 3, 2, 0, 5 };
+    var row: [40]f32 = undefined;
+    for (&row, 0..) |*x, i| x.* = base[i % base.len];
+    var mask = [_]u32{ 0, 0 };
+    mask[0] |= 1 << 3; // token 3
+    mask[1] |= 1 << (35 - 32); // token 35
+    try applyMask(&row, &mask);
+    try std.testing.expectEqual(@as(u32, 3), try draw(&row, 9, null));
+    for (0..30) |p| {
+        const t = try draw(&row, p, .{ .seed = 7, .temperature = 1.0, .top_k = 20, .top_p = 1.0 });
+        try std.testing.expect(t == 3 or t == 35);
+    }
+    try std.testing.expectError(error.InvalidGrammarMasks, applyMask(&row, mask[0..1]));
 }
 
 test "greedy draws take the first largest logit" {
