@@ -4,8 +4,10 @@
 //!
 //! The head, for a row at position p with the target's taps at p (tap layers side by side, the final state last) and
 //! the next token x_{p+1}: g = RMSNorm(fc(taps)); x = w_in [RMSNorm(embed(x_{p+1})) ; RMSNorm(g)]; one decoder layer
-//! (heads x 128 queries, one key / value head, RoPE on 64 of 128 dims, attention over the stream's newest 129 positions,
-//! then a SwiGLU MLP); logits = up(down(RMSNorm(o))). A stream's chain from its pending token at q0: the real rows below
+//! (heads x 128 queries, one key / value head, with qk_norm an RMSNorm on each query and key head, RoPE on 64 of 128
+//! dims, attention over the stream's newest window + 1 positions, then a SwiGLU MLP); logits = up(down(RMSNorm(o))).
+//! A two_stage head takes the top K of those logits (K = cand_k, or TF_DS_EAGLE_TOPK up to 512) and drafts the argmax
+//! of their exact logits from the target's own head (a dense bf16 copy in the head file, on rank 0). A stream's chain from its pending token at q0: the real rows below
 //! q0 (their keys and values in the stream's ring), draft 1 from the row q0 - 1, and draft j > 1 from a row at position
 //! q0 + j - 2 with g = the step before's o and the token draft j - 1 (its key and value go into the ring too; the next
 //! pass's real rows write over them). tools/dsv41-zig/eagle/eagle_ref.py is this order of work in torch (the
@@ -31,6 +33,10 @@ pub const chunk_rows = 160;
 pub const max_taps = 8;
 /// The final hidden state's tap name (eagle_collect.py's FINAL): the target head's normed input.
 pub const final_tap: u16 = 1000;
+/// The keys an attention row reads at most (eagle.cu's score buffer): a window of 511.
+pub const max_keys = 512;
+/// A two_stage head's candidates a row at most.
+pub const max_cand = 512;
 const ring_extra = 16;
 const magic = "TFEHEAD1";
 
@@ -47,6 +53,8 @@ pub const Shape = struct {
     rope_theta: f32,
     eps: f32,
     tap_norm: bool,
+    qk_norm: bool = false,
+    cand_k: usize = 0, // a two_stage head's candidates (0: lowrank)
     taps: [max_taps]u16 = @splat(0),
     n_taps: usize = 0,
 
@@ -81,6 +89,9 @@ const HeaderJson = struct {
     rope_theta: f32,
     eps: f32,
     tap_norm: bool,
+    qk_norm: bool = false,
+    head_type: []const u8 = "lowrank",
+    cand_k: usize = 0,
     taps: []const u16,
     tensors: std.json.ArrayHashMap(TensorJson),
     data_bytes: u64,
@@ -105,8 +116,11 @@ pub const Header = struct {
         const j = try std.json.parseFromSliceLeaky(HeaderJson, a, text, .{ .ignore_unknown_fields = true });
         if (j.format != 1 or !std.mem.eql(u8, j.kind, "base")) return error.UnsupportedEagleHead;
         if (j.taps.len == 0 or j.taps.len > max_taps or j.kv_heads == 0 or j.heads % j.kv_heads != 0) return error.UnsupportedEagleHead;
-        if (j.head_dim != 128 or j.rope_dim > j.head_dim or j.rope_dim % 2 != 0 or j.window + 1 > 512) return error.UnsupportedEagleHead;
-        var s: Shape = .{ .dim = j.dim, .heads = j.heads, .kv_heads = j.kv_heads, .head_dim = j.head_dim, .inter = j.inter, .rank = j.rank, .vocab = j.vocab, .window = j.window, .rope_dim = j.rope_dim, .rope_theta = j.rope_theta, .eps = j.eps, .tap_norm = j.tap_norm };
+        if (j.head_dim != 128 or j.rope_dim > j.head_dim or j.rope_dim % 2 != 0 or j.window + 1 > max_keys) return error.UnsupportedEagleHead;
+        const two = std.mem.eql(u8, j.head_type, "two_stage");
+        if (!two and !std.mem.eql(u8, j.head_type, "lowrank")) return error.UnsupportedEagleHead;
+        if (two != (j.cand_k > 0) or j.cand_k > max_cand) return error.UnsupportedEagleHead;
+        var s: Shape = .{ .dim = j.dim, .heads = j.heads, .kv_heads = j.kv_heads, .head_dim = j.head_dim, .inter = j.inter, .rank = j.rank, .vocab = j.vocab, .window = j.window, .rope_dim = j.rope_dim, .rope_theta = j.rope_theta, .eps = j.eps, .tap_norm = j.tap_norm, .qk_norm = j.qk_norm, .cand_k = j.cand_k };
         for (j.taps, 0..) |t, i| {
             if (t == final_tap and i + 1 != j.taps.len) return error.UnsupportedEagleHead;
             if (i > 0 and t <= j.taps[i - 1]) return error.UnsupportedEagleHead; // the engine's order: ascending, final last
@@ -133,6 +147,8 @@ const Fns = struct {
     attn: cuda.Function,
     silu_mul: cuda.Function,
     top1: cuda.Function,
+    topk: cuda.Function,
+    rescore: cuda.Function,
 };
 
 pub const Eagle = struct {
@@ -156,6 +172,10 @@ pub const Eagle = struct {
     up: u64,
     tap_norms: u64 = 0,
     fb_norm: u64 = 0,
+    q_norm: u64 = 0,
+    k_norm: u64 = 0,
+    target: u64 = 0, // two_stage: the target head bf16 [vocab, dim]
+    topk: usize = 0, // two_stage: the candidates a row (cand_k, or TF_DS_EAGLE_TOPK)
     mod: cuda.Module,
     f: Fns,
     slots: usize,
@@ -185,6 +205,8 @@ pub const Eagle = struct {
     y: u64, // bf16 [max_streams, inter]
     lr: u64, // bf16 [max_streams, rank]
     lg: u64, // f32 [max_streams, vocab]
+    cand: u64, // i64 [max_streams, max_cand]: two_stage candidates
+    ex: u64, // f32 [max_streams, max_cand]: their exact logits
     sp: u64, // i64 [max_steps, max_streams]: each step's positions, ring rows, then [max_streams] bases and lows
     srow: u64,
     sbase: u64,
@@ -223,6 +245,15 @@ pub const Eagle = struct {
         eg.passes = 0;
         eg.tap_norms = 0;
         eg.fb_norm = 0;
+        eg.q_norm = 0;
+        eg.k_norm = 0;
+        eg.target = 0;
+        eg.topk = s.cand_k;
+        if (s.cand_k > 0) if (std.c.getenv("TF_DS_EAGLE_TOPK")) |v| {
+            const k = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadEagleTopK;
+            if (k == 0 or k > max_cand) return error.BadEagleTopK;
+            eg.topk = k;
+        };
         if (std.c.getenv("TF_DS_EAGLE_CONF")) |v| {
             var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
             eg.conf_a = try std.fmt.parseFloat(f32, it.next() orelse return error.BadEagleConf);
@@ -287,6 +318,11 @@ pub const Eagle = struct {
             eg.tap_norms = try T.at(hdr, b, "tap_norms", &.{ u(L), u(D) });
             eg.fb_norm = try T.at(hdr, b, "fb_norm", &.{u(D)});
         }
+        if (s.qk_norm) {
+            eg.q_norm = try T.at(hdr, b, "q_norm", &.{u(s.head_dim)});
+            eg.k_norm = try T.at(hdr, b, "k_norm", &.{u(s.head_dim)});
+        }
+        if (s.cand_k > 0) eg.target = try T.at(hdr, b, "target_head", &.{ u(s.vocab), u(D) });
         eg.mod = try cuda.Module.load(e.d, cuda.kernels.dsv41_eagle);
         errdefer eg.mod.unload();
         eg.f = .{
@@ -295,6 +331,8 @@ pub const Eagle = struct {
             .attn = try eg.mod.function("tf_eagle_attn_kernel"),
             .silu_mul = try eg.mod.function("tf_eagle_silu_mul_kernel"),
             .top1 = try eg.mod.function("tf_eagle_top1_kernel"),
+            .topk = try eg.mod.function("tf_eagle_topk_kernel"),
+            .rescore = try eg.mod.function("tf_eagle_rescore_kernel"),
         };
         eg.slots = slots;
         eg.ring = s.window + ring_extra;
@@ -325,6 +363,8 @@ pub const Eagle = struct {
         eg.y = try a.take(M * s.inter * 2);
         eg.lr = try a.take(M * s.rank * 2);
         eg.lg = try a.take(M * s.vocab * 4);
+        eg.cand = try a.take(M * max_cand * 8);
+        eg.ex = try a.take(M * max_cand * 4);
         eg.sp = try a.take(max_steps * M * 8);
         eg.srow = try a.take(max_steps * M * 8);
         eg.sbase = try a.take(M * 8);
@@ -335,7 +375,7 @@ pub const Eagle = struct {
         eg.dbg = try a.take(max_steps * M * D * 2);
         try prompt.fill(e, eg.invalid, 0, 4);
         try e.s.synchronize();
-        std.log.info("eagle head: {s}, taps {any}, {d} MiB weights, {d} slots", .{ path, s.tapList(), bytes >> 20, slots });
+        std.log.info("eagle head: {s}, taps {any}, window {d}, qk_norm {}, candidates {d}, {d} MiB weights, {d} slots", .{ path, s.tapList(), s.window, s.qk_norm, eg.topk, bytes >> 20, slots });
         return eg;
     }
 
@@ -353,6 +393,11 @@ pub const Eagle = struct {
     // -- the row kernels ------------------------------------------------------------------------------------------
 
     fn rms(eg: *const Eagle, e: *const Engine, x: u64, ldx: usize, w: u64, out: u64, ldo: usize, rows: usize) !void {
+        return eg.rmsOf(e, x, ldx, w, out, ldo, rows, eg.s.dim);
+    }
+
+    /// RMSNorm of `rows` rows of `d` features (rows ldx / ldo elements apart).
+    fn rmsOf(eg: *const Eagle, e: *const Engine, x: u64, ldx: usize, w: u64, out: u64, ldo: usize, rows: usize, d: usize) !void {
         if (rows == 0) return;
         var a: cuda.Args = .{};
         a.add(x);
@@ -360,7 +405,7 @@ pub const Eagle = struct {
         a.add(w);
         a.add(out);
         a.add(@as(c_longlong, @intCast(ldo)));
-        a.add(@as(c_int, @intCast(eg.s.dim)));
+        a.add(@as(c_int, @intCast(d)));
         a.add(eg.s.eps);
         try cuda.launch.launch(eg.f.rmsnorm, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, e.s, &a);
     }
@@ -383,11 +428,13 @@ pub const Eagle = struct {
         try e.blas.linearDense(x, ldx, w, out, ldo, f32_out, rows, k, n);
     }
 
-    /// The keys and values of `rows` rows of h (normed): wkv, RoPE on the keys at `pos`, into the rings at ring rows
-    /// `rrow` (i64 [rows], device).
+    /// The keys and values of `rows` rows of h (normed): wkv, k_norm on each key head (qk_norm), RoPE on the keys at
+    /// `pos`, into the rings at ring rows `rrow` (i64 [rows], device).
     fn keysOut(eg: *const Eagle, e: *const Engine, h: u64, pos: u64, rrow: u64, rows: usize) !void {
-        const hkv = eg.s.kv_heads * eg.s.head_dim;
+        const hd = eg.s.head_dim;
+        const hkv = eg.s.kv_heads * hd;
         try mm(e, h, eg.s.dim, eg.wkv, eg.kv, 2 * hkv, false, rows, eg.s.dim, 2 * hkv);
+        if (eg.s.qk_norm) for (0..eg.s.kv_heads) |kh| try eg.rmsOf(e, eg.kv + kh * hd * 2, 2 * hkv, eg.k_norm, eg.kv + kh * hd * 2, 2 * hkv, rows, hd);
         try eg.rope(e, eg.kv, 2 * hkv, eg.s.kv_heads, pos, rows);
         try e.ops.scatterRows(e.s, eg.kv, 2 * hkv * 2, rrow, eg.kring, hkv * 2, hkv * 2, rows);
         try e.ops.scatterRows(e.s, eg.kv + hkv * 2, 2 * hkv * 2, rrow, eg.vring, hkv * 2, hkv * 2, rows);
@@ -536,10 +583,13 @@ pub const Eagle = struct {
             try eg.rms(e, x, D, eg.out_norm, eg.h, D, N);
             try mm(e, eg.h, D, eg.down, eg.lr, eg.s.rank, false, N, D, eg.s.rank);
             try mm(e, eg.lr, eg.s.rank, eg.up, eg.lg, eg.s.vocab, true, N, eg.s.rank, eg.s.vocab);
+            if (eg.topk > 0) try eg.rescoreTop(e, N);
             var a: cuda.Args = .{};
-            a.add(eg.lg);
-            a.add(@as(c_longlong, @intCast(eg.s.vocab)));
-            a.add(@as(c_int, @intCast(eg.s.vocab)));
+            a.add(if (eg.topk > 0) eg.ex else eg.lg);
+            a.add(@as(c_longlong, @intCast(if (eg.topk > 0) max_cand else eg.s.vocab)));
+            a.add(@as(c_int, @intCast(if (eg.topk > 0) eg.topk else eg.s.vocab)));
+            a.add(if (eg.topk > 0) eg.cand else @as(u64, 0));
+            a.add(@as(c_longlong, max_cand));
             a.add(eg.out + j * N * 8);
             a.add(eg.conf + (j - 1) * N * 4);
             a.add(eg.conf_a);
@@ -561,6 +611,30 @@ pub const Eagle = struct {
         eg.streams = N;
         eg.steps = steps;
         eg.passes += 1;
+    }
+
+    /// two_stage: each row's top `topk` low-rank logits (lg) as candidates, then their exact logits (ex) from the target
+    /// head on the normed rows eg.h.
+    fn rescoreTop(eg: *Eagle, e: *const Engine, N: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(eg.lg);
+        a.add(@as(c_longlong, @intCast(eg.s.vocab)));
+        a.add(@as(c_int, @intCast(eg.s.vocab)));
+        a.add(@as(c_int, @intCast(eg.topk)));
+        a.add(eg.cand);
+        a.add(@as(c_longlong, max_cand));
+        try cuda.launch.launch(eg.f.topk, .{ .grid = .{ .x = @intCast(N) }, .block = .{ .x = 1024 } }, e.s, &a);
+        var b: cuda.Args = .{};
+        b.add(eg.target);
+        b.add(@as(c_int, @intCast(eg.s.dim)));
+        b.add(eg.h);
+        b.add(@as(c_longlong, @intCast(eg.s.dim)));
+        b.add(eg.cand);
+        b.add(@as(c_longlong, max_cand));
+        b.add(@as(c_int, @intCast(eg.topk)));
+        b.add(eg.ex);
+        b.add(@as(c_longlong, max_cand));
+        try cuda.launch.launch(eg.f.rescore, .{ .grid = .{ .x = @intCast(N), .y = @intCast((eg.topk + 7) / 8) }, .block = .{ .x = 256 }, .shared = @intCast(eg.s.dim * 4) }, e.s, &b);
     }
 
     /// An extend chunk: the rows' layer inputs (token ids, g ring rows, positions), their keys and values into the
@@ -587,6 +661,7 @@ pub const Eagle = struct {
         const hq = s.heads * s.head_dim;
         try eg.rms(e, x, D, eg.attn_norm, eg.h, D, N);
         try mm(e, eg.h, D, eg.wq, eg.q, hq, false, N, D, hq);
+        if (s.qk_norm) try eg.rmsOf(e, eg.q, s.head_dim, eg.q_norm, eg.q, s.head_dim, N * s.heads, s.head_dim);
         try eg.rope(e, eg.q, hq, s.heads, pos, N);
         if (keys) try eg.keysOut(e, eg.h, pos, rrow, N);
         var a: cuda.Args = .{};

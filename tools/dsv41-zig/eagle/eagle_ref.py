@@ -6,7 +6,8 @@ The engine's order of work for one stream (pending token at position q0, real ro
                         RoPE position p; its key and value go into the stream's ring at p.
   draft step 1:         the real row q0 - 1's output o_1 -> logits -> draft d_1 (top-1).
   draft step j > 1:     position q0 + j - 2, token d_{j-1}, g = o_{j-1}; its key and value go into the ring too.
-  attention of a row at position P: the ring rows at positions max(lo, P - 128) .. P (lo: the stream's first row).
+  attention of a row at position P: the ring rows at positions max(lo, P - window) .. P (lo: the stream's first row).
+  qk_norm: q and k RMSNorm per head (q_norm, k_norm over head_dim) before RoPE; v as it is.
 Activations are bf16 between the operations (fp32 inside each), as the engine's kernels and cuBLAS calls give them.
 
   python3 eagle_ref.py cross HEAD.pt --train-py PATH/eagle_train.py        the chain equals chain_forward's
@@ -23,9 +24,6 @@ import torch
 import torch.nn.functional as F
 
 from eagle_convert import read
-
-WINDOW = 128
-
 
 class Ref:
     """The converted head's tensors (bf16) and its math; `rnd`: round to bf16 between the operations."""
@@ -72,7 +70,10 @@ class Ref:
         H, hd = self.h["heads"], self.h["head_dim"]
         q = self.lin(hn, "wq.weight").view(-1, H, hd)
         kv = self.lin(hn, "wkv.weight")
-        return x, q, kv[:, :hd], kv[:, hd:]
+        k, v = kv[:, :hd], kv[:, hd:]
+        if self.h.get("qk_norm"):
+            q, k = self.rms(q, self.t["q_norm"]), self.rms(k, self.t["k_norm"])
+        return x, q, k, v
 
     def layer_out(self, x, att):
         x = self.r(x + self.lin(att.flatten(-2), "wo.weight"))
@@ -82,10 +83,25 @@ class Ref:
         return self.r(x + self.lin(y, "w2.weight"))
 
     def logits(self, o):
-        """fp32 logits (the engine's up projection writes fp32)."""
+        """fp32 logits (the engine's up projection writes fp32): the low-rank head's over the vocabulary."""
 
         d = self.lin(self.rms(o, self.t["out_norm"]), "down.weight")
         return d @ self.t["up.weight"].T
+
+    def draft(self, o, k: int | None = None):
+        """(token, p_top1, the logits it was picked from) of one row o [1, D]. lowrank: the argmax of logits(o) (ties:
+        the lower id). two_stage: the top k (default cand_k) of the low-rank logits (ties at the k-th: the lower ids),
+        their exact logits from the target head (fp32 sums), the argmax there; p over those k."""
+
+        lg = self.logits(o)[0]
+        if self.h.get("head_type", "lowrank") != "two_stage":
+            return int(lg.argmax()), float(lg.softmax(-1).max()), lg
+        k = k or self.h["cand_k"]
+        cand = torch.sort(lg, stable=True, dim=-1, descending=True).indices[:k]
+        on = self.rms(o, self.t["out_norm"])[0]
+        ex = self.t["target_head"][cand] @ on
+        best = int(ex.argmax())
+        return int(cand[best]), float(ex.softmax(-1)[best]), ex
 
     def attend(self, q, keys, vals):
         """q [H, hd]; keys / vals [n, hd] -> [H, hd] (fp32 scores, softmax, fp32 sum, bf16 out)."""
@@ -98,6 +114,7 @@ def chain(ref: Ref, taps, ids, q0: int, steps: int, lo: int = 0):
     """The engine's chain for one stream: taps [>= q0, L, D], ids [>= q0 + 1] (ids[q0]: the pending token), real rows
     lo .. q0 - 1. -> (drafts [steps], o [steps, D], p_top1 [steps], logits [steps, V])."""
 
+    W = ref.h["window"]
     P = torch.arange(lo, q0)
     g = ref.fuse(taps[lo:q0])
     x, q, k, v = ref.layer_in(ids[lo + 1:q0 + 1], g)
@@ -106,7 +123,7 @@ def chain(ref: Ref, taps, ids, q0: int, steps: int, lo: int = 0):
     ring_v = {int(p): v[i] for i, p in enumerate(P)}
     att = []
     for i, p in enumerate(P.tolist()):
-        win = list(range(max(lo, p - WINDOW), p + 1))
+        win = list(range(max(lo, p - W), p + 1))
         att.append(ref.attend(q[i], torch.stack([ring_k[w] for w in win]), torch.stack([ring_v[w] for w in win])))
     o_all = ref.layer_out(x, torch.stack(att))
     o = o_all[-1:]
@@ -117,14 +134,13 @@ def chain(ref: Ref, taps, ids, q0: int, steps: int, lo: int = 0):
             x, qj, kj, vj = ref.layer_in(torch.tensor([drafts[-1]]), ref.feedback(o))
             qj, kj = ref.rope(qj, torch.tensor([pos])), ref.rope(kj[:, None], torch.tensor([pos]))[:, 0]
             ring_k[pos], ring_v[pos] = kj[0], vj[0]
-            win = list(range(max(lo, pos - WINDOW), pos + 1))
+            win = list(range(max(lo, pos - W), pos + 1))
             att = ref.attend(qj[0], torch.stack([ring_k[w] for w in win]), torch.stack([ring_v[w] for w in win]))
             o = ref.layer_out(x, att[None])
-        lg = ref.logits(o)[0]
-        d = int(lg.argmax())
+        d, p, lg = ref.draft(o)
         drafts.append(d)
         outs.append(o[0])
-        probs.append(float(lg.softmax(-1)[d]))
+        probs.append(p)
         lgs.append(lg)
     return drafts, torch.stack(outs), probs, torch.stack(lgs)
 
@@ -162,18 +178,22 @@ def cross(a) -> None:
         for p in hm.parameters():
             p.copy_(p.to(torch.bfloat16).float())
     hm.eval()
-    head, tensors = eagle_convert.convert(ck)
+    head, tensors = eagle_convert.convert(ck, a.target_head)
+    two = head["head_type"] == "two_stage"
+    if two:
+        hm.lm = tensors["target_head"].float()
     D, V, L = head["dim"], head["vocab"], len(head["taps"])
     g = torch.Generator().manual_seed(7)
     embed = (torch.randn(V, D, generator=g) * 0.02).to(torch.bfloat16)
     ref = Ref(head, tensors, embed, rnd=False)
     perm = [head["train_taps"].index(t) for t in head["taps"]]                 # engine order <- training order
-    T, S = a.T, a.steps
+    T, S, q0s = cases_of(a, head["window"])
     taps, ids = fake_inputs(L, D, V, T + S, 3)
     worst = 0.0
     out = []
-    for q0 in a.q0:
-        d, o, _, _ = chain(ref, taps.float(), ids, q0, S)
+    drafts_equal = True
+    for q0 in q0s:
+        d, o, _, lgs = chain(ref, taps.float(), ids, q0, S)
         ids_tf = ids.clone()
         ids_tf[q0 + 1:q0 + S] = torch.tensor(d[:S - 1])                       # chain_forward's tokens = our drafts
         taps_train = torch.empty_like(taps)
@@ -186,13 +206,26 @@ def cross(a) -> None:
         for j in range(S):
             err = float((outs[j][t] - o[j]).abs().max() / o[j].abs().max())
             worst = max(worst, err)
-            out.append({"q0": q0, "step": j + 1, "rel_err": round(err, 7)})
-    print(json.dumps({"cross": "chain vs chain_forward", "worst_rel_err": worst, "cases": out}))
-    if worst > 1e-4:
+            case = {"q0": q0, "step": j + 1, "rel_err": round(err, 7)}
+            if two:  # the trainer's draft from its own o: the argmax of its two_stage logits
+                with torch.no_grad():
+                    case["draft_equal"] = int(hm.logits(outs[j][t:t + 1]).argmax()) == d[j]
+                drafts_equal = drafts_equal and case["draft_equal"]
+            out.append(case)
+    print(json.dumps({"cross": "chain vs chain_forward", "worst_rel_err": worst, "drafts_equal": drafts_equal,
+                      "cases": out}))
+    if worst > 1e-4 or not drafts_equal:
         raise SystemExit("MISMATCH")
 
 
 MAGIC_V = b"TFEVECS1"
+
+
+def cases_of(a, window: int):
+    """(T, steps, q0 list): by default T = window + 32 rows, and q0 at 1, 2, 64, window + 1, window + 2 and T."""
+
+    T = a.T or window + 32
+    return T, a.steps, a.q0 or [1, 2, 64, window + 1, window + 2, T]
 
 
 def vectors(a) -> None:
@@ -202,12 +235,12 @@ def vectors(a) -> None:
 
     head, tensors = read(a.head)
     D, V, L = head["dim"], head["vocab"], len(head["taps"])
-    T, S = a.T, a.steps
+    T, S, q0s = cases_of(a, head["window"])
     taps, ids = fake_inputs(L, D, V, T + S, 11)
     embed = torch.frombuffer(bytearray(open(a.embed, "rb").read()), dtype=torch.int16).view(torch.bfloat16).view(V, D)
     ref = Ref(head, tensors, embed, rnd=True)
     cases = []
-    for q0 in a.q0:
+    for q0 in q0s:
         d, o, p, lg = chain(ref, taps.float(), ids, q0, S)
         top2 = lg.topk(2, -1).values
         cases.append({"q0": q0, "drafts": d, "p_top1": p, "gap": (top2[:, 0] - top2[:, 1]).tolist(), "o": o})
@@ -233,10 +266,11 @@ def main() -> None:
     p.add_argument("head")
     p.add_argument("out", nargs="?")
     p.add_argument("--train-py", default=None)
+    p.add_argument("--target-head", default=None, help="cross, a two_stage head: the head dump prefix")
     p.add_argument("--embed", default=None, help="vectors: the target embedding, raw bf16 [vocab, dim]")
-    p.add_argument("--T", type=int, default=160)
+    p.add_argument("--T", type=int, default=None, help="rows of taps (default: the window + 32)")
     p.add_argument("--steps", type=int, default=5)
-    p.add_argument("--q0", type=int, nargs="+", default=[1, 2, 64, 129, 130, 160])
+    p.add_argument("--q0", type=int, nargs="+", default=None, help="default: 1 2 64 window+1 window+2 T")
     a = p.parse_args()
     cross(a) if a.mode == "cross" else vectors(a)
 

@@ -132,14 +132,44 @@ lg[3, 5] = lg[3].max() + 1e-3
 ids = torch.zeros(N, dtype=torch.long)
 conf = torch.zeros(N)
 pl, pi, pc = dev_t(lg), dev_t(ids), dev_t(conf)
-launch(fn("tf_eagle_top1_kernel"), (N,), 1024, [("p", pl.value), ("ll", Vv), ("i", Vv), ("p", pi.value), ("p", pc.value), ("f", 1.0), ("f", 0.0)])
+launch(fn("tf_eagle_top1_kernel"), (N,), 1024, [("p", pl.value), ("ll", Vv), ("i", Vv), ("p", 0), ("ll", 0), ("p", pi.value), ("p", pc.value), ("f", 1.0), ("f", 0.0)])
 gi, gc = back(pi, ids), back(pc, conf)
 p1 = lg.softmax(-1).max(-1)
 pr = p1.values.clamp(1e-7, 1 - 1e-7)
 res["top1_ids_equal"] = bool((gi == p1.indices).all())
 res["top1_conf"] = float((gc - torch.log(pr / (1 - pr))).abs().max())
 
+# two_stage: top-k candidates (ties at the k-th value by the lower id), their exact logits, top-1 through the map
+for k in (128, 512):
+    lk = (torch.randn(N, Vv, generator=gen) * 3).to(torch.bfloat16).float()   # bf16 values: many ties
+    lk[1, :] = 0.5                                                            # a row of one value
+    cand = torch.full((N, k), -1, dtype=torch.long)
+    pk, pcand = dev_t(lk), dev_t(cand)
+    launch(fn("tf_eagle_topk_kernel"), (N,), 1024, [("p", pk.value), ("ll", Vv), ("i", Vv), ("i", k), ("p", pcand.value), ("ll", k)])
+    got = back(pcand, cand).sort(-1).values
+    order = torch.sort(lk, stable=True, dim=-1, descending=True).indices[:, :k]   # stable: equal values by lower id
+    res[f"topk{k}_sets_equal"] = bool((got == order.sort(-1).values).all())
+Dk, k = 5120, 128
+Wt = (torch.randn(Vv, Dk, generator=gen) * 0.02).to(torch.bfloat16)
+xo = torch.randn(N, Dk, generator=gen).to(torch.bfloat16)
+cand = torch.randint(0, Vv, (N, k), generator=gen)
+ex = torch.zeros(N, k)
+pw, px, pcd, pex = dev_t(Wt), dev_t(xo), dev_t(cand), dev_t(ex)
+f = fn("tf_eagle_rescore_kernel")
+vals = [ctypes.c_uint64(pw.value), ctypes.c_int(Dk), ctypes.c_uint64(px.value), ctypes.c_longlong(Dk), ctypes.c_uint64(pcd.value),
+        ctypes.c_longlong(k), ctypes.c_int(k), ctypes.c_uint64(pex.value), ctypes.c_longlong(k)]
+arr = (ctypes.c_void_p * len(vals))(*[ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in vals])
+ok(cu.cuLaunchKernel(f, N, (k + 7) // 8, 1, 256, 1, 1, Dk * 4, None, arr, None), "launch")
+ok(cu.cuCtxSynchronize(), "sync")
+gx = back(pex, ex)
+want = torch.einsum("nkd,nd->nk", Wt.float()[cand], xo.float())
+res["rescore"] = float((gx - want).abs().max() / want.abs().max())
+ids2, conf2 = torch.zeros(N, dtype=torch.long), torch.zeros(N)
+pi2, pc2 = dev_t(ids2), dev_t(conf2)
+launch(fn("tf_eagle_top1_kernel"), (N,), 1024, [("p", pex.value), ("ll", k), ("i", k), ("p", pcd.value), ("ll", k), ("p", pi2.value), ("p", pc2.value), ("f", 1.0), ("f", 0.0)])
+res["top1_map_ids_equal"] = bool((back(pi2, ids2) == cand.gather(1, gx.argmax(-1, keepdim=True))[:, 0]).all())
+
 print(res)
 bad = res["rmsnorm"] > 1e-2 or res["rope"] > 0.05 or res["attn"] > 0.02 or res["silu_mul"] > 0.05 or \
-    not res["top1_ids_equal"] or res["top1_conf"] > 1e-3
+    not res["top1_ids_equal"] or res["top1_conf"] > 1e-3 or not res["topk128_sets_equal"] or     not res["topk512_sets_equal"] or res["rescore"] > 1e-4 or not res["top1_map_ids_equal"]
 print("FAIL" if bad else "PASS")

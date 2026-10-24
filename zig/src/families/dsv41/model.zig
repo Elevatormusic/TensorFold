@@ -894,27 +894,32 @@ pub const Model = struct {
         return m.logits[0..m.vocab];
     }
 
-    /// A prompt chunk that reached the head: its last rows' taps (the layer taps; a tap of a layer before the replay
-    /// cut holds the chunk's rows from its first, so its rows past the cut start `ch.start - start0` in) and, for a head
-    /// with the final tap, their final states (collapse_norm of the streams) into the TFE head's rings.
+    /// A prompt chunk that reached the head: its last rows' taps (a ring of rows at most, in pieces of the head's
+    /// absorb; the layer taps; a tap of a layer before the replay cut holds the chunk's rows from its first, so its
+    /// rows past the cut start `ch.start - start0` in) and, for a head with the final tap, their final states
+    /// (collapse_norm of the streams) into the TFE head's rings.
     fn eagleAbsorbChunk(m: *Model, eg: *eagle.Eagle, start0: usize) !void {
         const e = &m.eng;
         const c = e.c;
         const ch = &m.ch;
         const D = c.hidden;
         const L = eg.s.n_taps;
-        const k = @min(ch.n, eg.ring, eagle.chunk_rows);
-        const skip = ch.n - k; // rows no window reaches
+        const total = @min(ch.n, eg.ring);
         const cut = ch.start - start0;
-        for (eg.s.layerTaps(), 0..) |t, j| {
-            const off = (if (t < c.layers / 2) cut else 0) + skip;
-            try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j) + off * D * 2, D * 2, eg.tin + j * D * 2, L * D * 2, D * 2, k);
+        var at = ch.n - total; // (the rows before: no window reaches them)
+        while (at < ch.n) {
+            const k = @min(eagle.chunk_rows, ch.n - at);
+            for (eg.s.layerTaps(), 0..) |t, j| {
+                const off = (if (t < c.layers / 2) cut else 0) + at;
+                try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j) + off * D * 2, D * 2, eg.tin + j * D * 2, L * D * 2, D * 2, k);
+            }
+            if (eg.s.final()) {
+                try tri_basic.collapseNorm(e.t, ch.h + at * c.hc * D * 2, ch.pre + at * c.hc * 4, e.w.norm, eg.fin, c.eps, k, D);
+                try e.ops.copyRows(e.s, eg.fin, D * 2, eg.tin + (L - 1) * D * 2, L * D * 2, D * 2, k);
+            }
+            try eg.absorb(e, eg.tin, L * D, &.{.{ .slot = m.fill_slot, .start = ch.start + at, .n = k }});
+            at += k;
         }
-        if (eg.s.final()) {
-            try tri_basic.collapseNorm(e.t, ch.h + skip * c.hc * D * 2, ch.pre + skip * c.hc * 4, e.w.norm, eg.fin, c.eps, k, D);
-            try e.ops.copyRows(e.s, eg.fin, D * 2, eg.tin + (L - 1) * D * 2, L * D * 2, D * 2, k);
-        }
-        try eg.absorb(e, eg.tin, L * D, &.{.{ .slot = m.fill_slot, .start = ch.start + skip, .n = k }});
     }
 
     /// The TFE head's pass (rank 0): each request's drafts and confidences into m.eg's drafts / confs.

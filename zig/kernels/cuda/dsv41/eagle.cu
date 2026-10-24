@@ -137,27 +137,32 @@ extern "C" __global__ void tf_eagle_silu_mul_kernel(const __nv_bfloat16* gu, int
     }
 }
 
-// A draft step's token and confidence, a row a block (1024 threads): the first largest logit of [n] fp32 (rows ld
-// apart), its softmax probability p, and conf = a * log(p / (1 - p)) + b (the lane core reads sigmoid(conf) as the
-// draft's survival). ids [rows] int64, conf [rows] fp32.
+// A draft step's token and confidence, a row a block (1024 threads): the largest logit of [n] fp32 (rows ld apart; a
+// tie goes to the lower token id), its softmax probability p over the n, and conf = a * log(p / (1 - p)) + b (the lane
+// core reads sigmoid(conf) as the draft's survival). map: null (logit i is token i) or the row's token ids int64 [n]
+// (rows ldm apart: a two_stage head's candidates). ids [rows] int64, conf [rows] fp32.
 extern "C" __global__ void __launch_bounds__(1024) tf_eagle_top1_kernel(const float* logits, long long ld, int n,
+                                                                        const long long* map, long long ldm,
                                                                         long long* ids, float* conf, float a, float b) {
     __shared__ float sv[32];
-    __shared__ int si[32];
+    __shared__ long long si[32];
     __shared__ float sh[32];
+    constexpr long long none = 0x7fffffffffffffffLL;
     const float* row = logits + (long long)blockIdx.x * ld;
+    const long long* mrow = map ? map + (long long)blockIdx.x * ldm : nullptr;
     float bv = ninf();
-    int bi = 0x7fffffff;
+    long long bi = none;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float v = row[i];
-        if (v > bv || (v == bv && i < bi)) {
+        const long long id = mrow ? mrow[i] : i;
+        if (v > bv || (v == bv && id < bi)) {
             bv = v;
-            bi = i;
+            bi = id;
         }
     }
     for (int off = 16; off > 0; off >>= 1) {
         const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
-        const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+        const long long oi = __shfl_xor_sync(0xffffffffu, bi, off);
         if (ov > bv || (ov == bv && oi < bi)) {
             bv = ov;
             bi = oi;
@@ -171,10 +176,10 @@ extern "C" __global__ void __launch_bounds__(1024) tf_eagle_top1_kernel(const fl
     __syncthreads();
     if (warp == 0) {
         bv = lane < nw ? sv[lane] : ninf();
-        bi = lane < nw ? si[lane] : 0x7fffffff;
+        bi = lane < nw ? si[lane] : none;
         for (int off = 16; off > 0; off >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            const long long oi = __shfl_xor_sync(0xffffffffu, bi, off);
             if (ov > bv || (ov == bv && oi < bi)) {
                 bv = ov;
                 bi = oi;
@@ -187,14 +192,115 @@ extern "C" __global__ void __launch_bounds__(1024) tf_eagle_top1_kernel(const fl
     }
     __syncthreads();
     const float m = sv[0];
-    const int best = si[0];
+    const long long best = si[0];
     float z = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) z += expf(row[i] - m);
     z = block_sum(z, sh);
     if (threadIdx.x == 0) {
         const float p = 1.f / z;
         const float q = fminf(fmaxf(p, 1e-7f), 1.f - 1e-7f);
-        ids[blockIdx.x] = best == 0x7fffffff ? 0 : best;
+        ids[blockIdx.x] = best == none ? 0 : best;
         conf[blockIdx.x] = a * logf(q / (1.f - q)) + b;
     }
+}
+
+namespace {
+
+// An fp32's order as an unsigned key: a larger float, a larger key.
+__device__ __forceinline__ unsigned int fkey(const float v) {
+    const unsigned int u = __float_as_uint(v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+}  // namespace
+
+// A two_stage head's candidates, a row a block (1024 threads): the k largest of [n] fp32 logits (rows ld apart), a tie
+// at the k-th value taken by the lower token ids, as int64 ids into cand [rows, k] (rows ldc apart; the order inside a
+// row is not fixed). A radix select on the keys (4 passes of 8 bits), then the keys above the k-th and the first of
+// the equal ones in id order.
+extern "C" __global__ void __launch_bounds__(1024) tf_eagle_topk_kernel(const float* logits, long long ld, int n, int k,
+                                                                        long long* cand, long long ldc) {
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned int s_prefix, s_left, s_out, s_eq;
+    __shared__ int wsum[32];
+    const float* row = logits + (long long)blockIdx.x * ld;
+    long long* out = cand + (long long)blockIdx.x * ldc;
+    if (threadIdx.x == 0) {
+        s_prefix = 0u;
+        s_left = (unsigned int)k;
+        s_out = 0u;
+        s_eq = 0u;
+    }
+    unsigned int mask = 0u;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0u;
+        __syncthreads();
+        const unsigned int prefix = s_prefix;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const unsigned int key = fkey(row[i]);
+            if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned int left = s_left, b = 255u;
+            for (;; --b) {
+                if (hist[b] >= left || b == 0u) break;
+                left -= hist[b];
+            }
+            s_prefix = prefix | (b << shift);
+            s_left = left;
+        }
+        mask |= 255u << shift;
+        __syncthreads();
+    }
+    const unsigned int kth = s_prefix;
+    const unsigned int take_eq = s_left;  // the equal keys to take (the others: above kth)
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (fkey(row[i]) > kth) out[atomicAdd(&s_out, 1u)] = i;
+    }
+    // the equal keys in id order: a chunk of blockDim ids at a time, each thread's rank among the equal ones before it
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
+    for (int base = 0; base < n; base += blockDim.x) {
+        const int i = base + threadIdx.x;
+        const bool eq = i < n && fkey(row[i]) == kth;
+        const unsigned int bal = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) wsum[warp] = __popc(bal);
+        __syncthreads();
+        int before = 0;
+        for (int w = 0; w < warp; ++w) before += wsum[w];
+        before += __popc(bal & ((1u << lane) - 1u));
+        const unsigned int taken = s_eq;
+        if (eq && taken + (unsigned int)before < take_eq) out[(unsigned int)k - take_eq + taken + before] = i;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int all = 0;
+            for (int w = 0; w < nw; ++w) all += wsum[w];
+            s_eq = taken + (unsigned int)all;
+        }
+        __syncthreads();
+        if (s_eq >= take_eq) break;
+    }
+}
+
+// A two_stage head's exact logits: out[r, j] = W[cand[r, j]] . x[r] (W the target head bf16 [vocab, d], x bf16 rows
+// ldx apart, fp32 sums), fp32 out [rows, k] (rows ldo apart). Grid rows x ceil(k / 8), 256 threads: a warp a candidate.
+extern "C" __global__ void __launch_bounds__(256) tf_eagle_rescore_kernel(const __nv_bfloat16* W, int d,
+                                                                          const __nv_bfloat16* x, long long ldx,
+                                                                          const long long* cand, long long ldc, int k,
+                                                                          float* out, long long ldo) {
+    extern __shared__ float xs[];
+    const int r = blockIdx.x;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) xs[i] = bf(x[(long long)r * ldx + i]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int j = blockIdx.y * 8 + warp;
+    if (j >= k) return;
+    const __nv_bfloat16* w = W + cand[(long long)r * ldc + j] * (long long)d;
+    float s = 0.f;
+    for (int i = lane * 2; i < d; i += 64) {
+        const __nv_bfloat162 p = *reinterpret_cast<const __nv_bfloat162*>(w + i);
+        s += xs[i] * __low2float(p) + xs[i + 1] * __high2float(p);
+    }
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+    if (lane == 0) out[(long long)r * ldo + j] = s;
 }
