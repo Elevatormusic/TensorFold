@@ -1,35 +1,17 @@
-//! The TFE draft head (TF_DS_DRAFTER=eagle, TF_DS_EAGLE_HEAD=FILE): an EAGLE-style head trained on the target's hidden
-//! states (the EAGLE study's eagle_train.py Head; the ideas are from the public EAGLE papers, no code from them), on rank
-//! 0 only. Rank 0 sends rank 1 every draft in the verify frame, so rank 1 runs no head, and a pass has no collective.
-//!
-//! The head, for a row at position p with the target's taps at p (tap layers side by side, the final state last) and
-//! the next token x_{p+1}: g = RMSNorm(fc(taps)); x = w_in [RMSNorm(embed(x_{p+1})) ; RMSNorm(g)]; one decoder layer
-//! (heads x 128 queries, one key / value head, with qk_norm an RMSNorm on each query and key head, RoPE on 64 of 128
-//! dims, attention over the stream's newest window + 1 positions, then a SwiGLU MLP); logits = up(down(RMSNorm(o))).
-//! A two_stage head takes the top K of those logits (K = cand_k, or TF_DS_EAGLE_TOPK up to 512) and drafts the argmax
-//! of their exact logits from the target's own head (a dense bf16 copy in the head file, on rank 0).
-//!
-//! A stream's chain from its pending token at q0: the real rows below q0 (their keys and values in the stream's ring),
-//! draft 1 from the row q0 - 1, and draft j > 1 from a row at position q0 + j - 2 with g = the step before's o and the
-//! token draft j - 1 (its key and value go into the ring too; the next pass's real rows write over them).
-//! tools/dsv41-zig/eagle/eagle_ref.py is this order of work in torch (the self-test's reference), checked against the
-//! training code's chain.
-//!
-//! The g rows come with each round (absorbRound: the drafting streams' window rows, eager as the DSpark absorb) and each
-//! prompt chunk that reaches the head (the last ring rows). A pass first runs the rows from the stream's last extended
-//! position to q0 - 1 through the layer's input part (their keys and values), then `steps` single-row steps for all
-//! streams at once. The linears are bf16 cuBLAS calls or, for up to 16 rows, the own GEMV of
-//! zig/kernels/cuda/dsv41/eagle.cu (fp32 sums both), as are the row kernels. TF_DS_EAGLE_GEMV picks the own GEMV's
-//! linears: "wo" (the default: wo and w2, where cuBLAS's few-row kernel is slow), "all", or "cublas". With
-//! TF_DS_EAGLE_FP8=1 the head's linears are e4m3 with an fp32 scale a row (the file's "NAME.fp8" and "NAME.scale",
-//! eagle_convert.py's rule) through the own GEMV only; the norms, the target head's copy and the logits stay as they are.
-//! FP8 is the default when the head file has the FP8 forms; TF_DS_EAGLE_FP8=0 runs the bf16 forms.
-//! TF_DS_EAGLE_TAPDUMP=FILE writes every absorb's tap rows (tapDump; the prompt-path tap check, tfe_tapcheck.py).
+//! The TFE draft head (TF_DS_DRAFTER=eagle) on rank 0, an EAGLE-style head: tools/dsv41-zig/eagle/README.md.
 const std = @import("std");
 const cuda = @import("cuda");
 const prompt = @import("prompt.zig");
 
+const file = @import("eagle_file.zig");
+
 const Engine = prompt.Engine;
+pub const Shape = file.Shape;
+pub const Header = file.Header;
+const Lin = file.Lin;
+const Out = file.Out;
+/// TF_DS_EAGLE_CHECK=FILE: the head against eagle_ref.py's vectors (eagle_check.zig).
+pub const selfTest = @import("eagle_check.zig").selfTest;
 
 /// A pass's streams at most (the pool's).
 pub const max_streams = 16;
@@ -48,103 +30,10 @@ pub const max_cand = 512;
 /// The rows of one own GEMV launch (eagle.cu gemv_rows); more rows run in launches of this many.
 pub const gemv_rows = 16;
 /// The parts of a low-rank row's top-1 (eagle.cu tf_eagle_top1_part_kernel).
-const top1_parts = 64;
-const ring_extra = 16;
-const magic = "TFEHEAD1";
+pub const top1_parts = 64;
+pub const ring_extra = 16;
 
-pub const Shape = struct {
-    dim: usize,
-    heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    inter: usize,
-    rank: usize,
-    vocab: usize,
-    window: usize,
-    rope_dim: usize,
-    rope_theta: f32,
-    eps: f32,
-    tap_norm: bool,
-    qk_norm: bool = false,
-    cand_k: usize = 0, // a two_stage head's candidates (0: lowrank)
-    taps: [max_taps]u16 = @splat(0),
-    n_taps: usize = 0,
-
-    pub fn tapList(s: *const Shape) []const u16 {
-        return s.taps[0..s.n_taps];
-    }
-
-    /// Whether the last tap is the final state.
-    pub fn final(s: *const Shape) bool {
-        return s.n_taps > 0 and s.taps[s.n_taps - 1] == final_tap;
-    }
-
-    /// The layer taps (the final state left out), in the engine's order.
-    pub fn layerTaps(s: *const Shape) []const u16 {
-        return s.taps[0 .. s.n_taps - @intFromBool(s.final())];
-    }
-};
-
-const TensorJson = struct { offset: u64, shape: []const u64, dtype: []const u8 };
-const HeaderJson = struct {
-    format: u32,
-    kind: []const u8,
-    dim: usize,
-    heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    inter: usize,
-    rank: usize,
-    vocab: usize,
-    window: usize,
-    rope_dim: usize,
-    rope_theta: f32,
-    eps: f32,
-    tap_norm: bool,
-    qk_norm: bool = false,
-    head_type: []const u8 = "lowrank",
-    cand_k: usize = 0,
-    taps: []const u16,
-    tensors: std.json.ArrayHashMap(TensorJson),
-    data_bytes: u64,
-};
-
-/// A head file's header (eagle_convert.py): its shape and the data's first byte.
-pub const Header = struct {
-    shape: Shape,
-    json: HeaderJson,
-    data_at: u64,
-
-    /// Reads and checks the header of `path` (allocations in `a`, an arena the caller frees).
-    pub fn read(a: std.mem.Allocator, io: std.Io, path: []const u8) !Header {
-        var f = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer f.close(io);
-        var pre: [16]u8 = undefined;
-        if (try f.readPositionalAll(io, &pre, 0) != 16 or !std.mem.eql(u8, pre[0..8], magic)) return error.NotEagleHead;
-        const n = std.mem.readInt(u64, pre[8..16], .little);
-        if (n > 1 << 24) return error.NotEagleHead;
-        const text = try a.alloc(u8, @intCast(n));
-        if (try f.readPositionalAll(io, text, 16) != text.len) return error.ShortEagleHead;
-        const j = try std.json.parseFromSliceLeaky(HeaderJson, a, text, .{ .ignore_unknown_fields = true });
-        if (j.format != 1 or !std.mem.eql(u8, j.kind, "base")) return error.UnsupportedEagleHead;
-        if (j.taps.len == 0 or j.taps.len > max_taps or j.kv_heads == 0 or j.heads % j.kv_heads != 0) return error.UnsupportedEagleHead;
-        if (j.head_dim != 128 or j.rope_dim > j.head_dim or j.rope_dim % 2 != 0 or j.window + 1 > max_keys) return error.UnsupportedEagleHead;
-        const two = std.mem.eql(u8, j.head_type, "two_stage");
-        if (!two and !std.mem.eql(u8, j.head_type, "lowrank")) return error.UnsupportedEagleHead;
-        if (two != (j.cand_k > 0) or j.cand_k > max_cand) return error.UnsupportedEagleHead;
-        var s: Shape = .{ .dim = j.dim, .heads = j.heads, .kv_heads = j.kv_heads, .head_dim = j.head_dim, .inter = j.inter, .rank = j.rank, .vocab = j.vocab, .window = j.window, .rope_dim = j.rope_dim, .rope_theta = j.rope_theta, .eps = j.eps, .tap_norm = j.tap_norm, .qk_norm = j.qk_norm, .cand_k = j.cand_k };
-        for (j.taps, 0..) |t, i| {
-            if (t == final_tap and i + 1 != j.taps.len) return error.UnsupportedEagleHead;
-            if (i > 0 and t <= j.taps[i - 1]) return error.UnsupportedEagleHead; // the engine's order: ascending, final last
-            s.taps[i] = t;
-        }
-        s.n_taps = j.taps.len;
-        return .{ .shape = s, .json = j, .data_at = 16 + n };
-    }
-};
-
-/// A window of absorbed rows: `n` rows of positions start .. in `slot`, in input row order; keep false: a stream that
-/// does not draft (its rows are written nowhere).
+/// Absorbed rows: `n` rows of positions start .. in `slot` (input row order); keep false: not drafting (no write).
 pub const Span = struct { slot: usize, start: usize, n: usize, keep: bool = true };
 
 /// A stream of a pass: its slot, its pending token at position q0, its ids by position (seq[p] for p < q0).
@@ -153,62 +42,7 @@ pub const Req = struct { slot: usize, q0: usize, pending: i64, seq: []const i32 
 /// What a slot's rings hold: g rows of positions [g_lo, g_hi), keys and values of the real rows below `ext` from `lo`.
 const Slot = struct { live: bool = false, lo: usize = 0, ext: usize = 0, g_lo: usize = 0, g_hi: usize = 0 };
 
-/// A linear of the head: weights [n, k] row-major, bf16 or e4m3 (fp8) with an fp32 scale a row; own: the own GEMV for
-/// up to gemv_rows rows (always for fp8).
-const Lin = struct { w: u64 = 0, scale: u64 = 0, n: usize = 0, k: usize = 0, fp8: bool = false, own: bool = false };
-
-/// A linear's output: bf16, fp32, or added to the bf16 out (one rounding).
-const Out = enum(c_int) { bf16 = 0, f32 = 1, add = 2 };
-
-/// The tensors a head needs from its file: each one's place in the file and on the device (a multiple of 256 bytes).
-const Plan = struct {
-    items: [40]Item = undefined,
-    n: usize = 0,
-
-    const Item = struct { name: []const u8, dtype: []const u8, shape: [2]u64, dims: usize, dest: *u64, src: u64 = 0, bytes: u64 = 0, at: u64 = 0 };
-
-    fn add(p: *Plan, name: []const u8, dtype: []const u8, shape: []const u64, dest: *u64) void {
-        var sh: [2]u64 = .{ 0, 0 };
-        for (shape, 0..) |x, i| sh[i] = x;
-        p.items[p.n] = .{ .name = name, .dtype = dtype, .shape = sh, .dims = shape.len, .dest = dest };
-        p.n += 1;
-    }
-
-    /// A linear `base` [n, k]: "BASE.weight" bf16, or "BASE.fp8" e4m3 and "BASE.scale" fp32 [n].
-    fn lin(p: *Plan, l: *Lin, comptime base: []const u8, n: usize, k: usize, fp8: bool, own: bool) void {
-        l.* = .{ .n = n, .k = k, .fp8 = fp8, .own = own or fp8 };
-        if (fp8) {
-            p.add(base ++ ".fp8", "f8e4m3", &.{ @intCast(n), @intCast(k) }, &l.w);
-            p.add(base ++ ".scale", "f32", &.{@intCast(n)}, &l.scale);
-        } else p.add(base ++ ".weight", "bf16", &.{ @intCast(n), @intCast(k) }, &l.w);
-    }
-
-    /// The bytes on the device; each item's file range checked against the header.
-    fn resolve(p: *Plan, h: Header) !u64 {
-        var total: u64 = 0;
-        for (p.items[0..p.n]) |*it| {
-            const t = h.json.tensors.map.get(it.name) orelse {
-                std.log.err("eagle head: no tensor {s} (an FP8 head needs eagle_convert.py's FP8 forms)", .{it.name});
-                return error.MissingEagleTensor;
-            };
-            if (!std.mem.eql(u8, t.dtype, it.dtype) or !std.mem.eql(u64, t.shape, it.shape[0..it.dims])) {
-                std.log.err("eagle head: {s} is {s} {any}, want {s} {any}", .{ it.name, t.dtype, t.shape, it.dtype, it.shape[0..it.dims] });
-                return error.EagleShapeMismatch;
-            }
-            const es: u64 = if (std.mem.eql(u8, it.dtype, "f32")) 4 else if (std.mem.eql(u8, it.dtype, "bf16")) 2 else 1;
-            var n: u64 = es;
-            for (it.shape[0..it.dims]) |x| n *= x;
-            if (t.offset + n > h.json.data_bytes) return error.ShortEagleHead;
-            it.src = h.data_at + t.offset;
-            it.bytes = n;
-            it.at = total;
-            total = (total + n + 255) / 256 * 256;
-        }
-        return total;
-    }
-};
-
-const Fns = struct {
+pub const Fns = struct {
     rmsnorm: cuda.Function,
     rope: cuda.Function,
     attn: cuda.Function,
@@ -251,8 +85,7 @@ pub const Eagle = struct {
     f: Fns,
     slots: usize,
     ring: usize,
-    // the rings: keys and values bf16 [slots * ring + 1, kv_heads * 128], g bf16 [slots * ring + 1, dim] (the last
-    // row of each: a sink for the rows of streams that do not draft or get no drafts)
+    // the rings: k, v bf16 [slots * ring + 1, kv_heads * 128], g bf16 [.., dim]; each one's last row is a sink row
     kring: u64,
     vring: u64,
     gring: u64,
@@ -308,178 +141,8 @@ pub const Eagle = struct {
 
     const GraphKey = struct { streams: u32, steps: u32 };
 
-    /// The head of `path` (its header read as `hdr`) on the device, the module, rings for `slots` streams and the
-    /// scratch from the arena.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, e: *const Engine, a: *prompt.Arena, path: []const u8, hdr: Header, slots: usize) !*Eagle {
-        const s = hdr.shape;
-        const c = e.c;
-        if (s.dim != c.hidden or s.vocab != c.vocab) return error.EagleShapeMismatch;
-        if (slots == 0 or slots > max_streams) return error.BadStreams;
-        if (!cuda.kernels.available) return error.NoKernelImages;
-        const eg = try gpa.create(Eagle);
-        errdefer gpa.destroy(eg);
-        eg.* = undefined;
-        eg.st = @splat(.{});
-        eg.s = s;
-        eg.conf_a = 1.0;
-        eg.conf_b = 0.0;
-        eg.streams = 0;
-        eg.steps = 0;
-        eg.passes = 0;
-        eg.gpa = gpa;
-        eg.io = io;
-        eg.dump = null;
-        eg.dump_at = 0;
-        eg.graphs = null;
-        if (std.c.getenv("TF_DS_EAGLE_GRAPH")) |v| {
-            if (std.mem.eql(u8, std.mem.span(v), "1")) eg.graphs = .empty;
-        }
-        eg.tap_norms = 0;
-        eg.fb_norm = 0;
-        eg.q_norm = 0;
-        eg.k_norm = 0;
-        eg.target = 0;
-        eg.topk = s.cand_k;
-        if (s.cand_k > 0) if (std.c.getenv("TF_DS_EAGLE_TOPK")) |v| {
-            const k = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadEagleTopK;
-            if (k == 0 or k > max_cand) return error.BadEagleTopK;
-            eg.topk = k;
-        };
-        if (std.c.getenv("TF_DS_EAGLE_CONF")) |v| {
-            var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
-            eg.conf_a = try std.fmt.parseFloat(f32, it.next() orelse return error.BadEagleConf);
-            eg.conf_b = try std.fmt.parseFloat(f32, it.next() orelse "0");
-        }
-        // FP8: on when the file has the forms (TF_DS_EAGLE_FP8 unset), "1" requires them, "0" runs bf16
-        const fp8_env = if (std.c.getenv("TF_DS_EAGLE_FP8")) |v| std.mem.span(v) else "";
-        if (fp8_env.len > 0 and !std.mem.eql(u8, fp8_env, "0") and !std.mem.eql(u8, fp8_env, "1")) return error.BadEagleFp8;
-        const has_fp8 = hdr.json.tensors.map.get("fc.fp8") != null;
-        const fp8 = if (std.mem.eql(u8, fp8_env, "1")) true else if (std.mem.eql(u8, fp8_env, "0")) false else has_fp8;
-        if (fp8_env.len == 0 and !has_fp8) std.log.info("eagle head: no FP8 forms in {s}: the bf16 linears", .{path});
-        var own_all = false;
-        var own_wo = true;
-        if (std.c.getenv("TF_DS_EAGLE_GEMV")) |v| {
-            const m = std.mem.span(v);
-            if (std.mem.eql(u8, m, "all")) {
-                own_all = true;
-            } else if (std.mem.eql(u8, m, "cublas")) {
-                own_wo = false;
-            } else if (!std.mem.eql(u8, m, "wo")) return error.BadEagleGemv;
-        }
-        // the tensors this head runs (one form of each linear), each read from the file into one buffer
-        const D = s.dim;
-        const hq = s.heads * s.head_dim;
-        const hkv = s.kv_heads * s.head_dim;
-        const L = s.n_taps;
-        const d: u64 = @intCast(D);
-        var plan: Plan = .{};
-        plan.add("fc_norm", "bf16", &.{d}, &eg.fc_norm);
-        plan.add("e_norm", "bf16", &.{d}, &eg.e_norm);
-        plan.add("g_norm", "bf16", &.{d}, &eg.g_norm);
-        plan.add("attn_norm", "bf16", &.{d}, &eg.attn_norm);
-        plan.add("mlp_norm", "bf16", &.{d}, &eg.mlp_norm);
-        plan.add("out_norm", "bf16", &.{d}, &eg.out_norm);
-        plan.lin(&eg.fc, "fc", D, L * D, fp8, own_all);
-        plan.lin(&eg.w_in, "w_in", D, 2 * D, fp8, own_all);
-        plan.lin(&eg.wq, "wq", hq, D, fp8, own_all);
-        plan.lin(&eg.wkv, "wkv", 2 * hkv, D, fp8, own_all);
-        plan.lin(&eg.wo, "wo", D, hq, fp8, own_all or own_wo);
-        plan.lin(&eg.w13, "w13", 2 * s.inter, D, fp8, own_all);
-        plan.lin(&eg.w2, "w2", D, s.inter, fp8, own_all or own_wo);
-        plan.lin(&eg.down, "down", s.rank, D, fp8, own_all);
-        plan.lin(&eg.up, "up", s.vocab, s.rank, fp8, own_all);
-        if (s.tap_norm) {
-            plan.add("tap_norms", "bf16", &.{ @intCast(L), d }, &eg.tap_norms);
-            plan.add("fb_norm", "bf16", &.{d}, &eg.fb_norm);
-        }
-        if (s.qk_norm) {
-            plan.add("q_norm", "bf16", &.{@intCast(s.head_dim)}, &eg.q_norm);
-            plan.add("k_norm", "bf16", &.{@intCast(s.head_dim)}, &eg.k_norm);
-        }
-        if (s.cand_k > 0) plan.add("target_head", "bf16", &.{ @intCast(s.vocab), d }, &eg.target);
-        const bytes: usize = @intCast(try plan.resolve(hdr));
-        eg.buf = try cuda.DeviceBuffer.alloc(e.d, bytes);
-        errdefer eg.buf.free();
-        {
-            var f = try std.Io.Dir.cwd().openFile(io, path, .{});
-            defer f.close(io);
-            const piece = try gpa.alloc(u8, 64 << 20);
-            defer gpa.free(piece);
-            for (plan.items[0..plan.n]) |it| {
-                var done: u64 = 0;
-                while (done < it.bytes) {
-                    const n: usize = @intCast(@min(piece.len, it.bytes - done));
-                    if (try f.readPositionalAll(io, piece[0..n], it.src + done) != n) return error.ShortEagleHead;
-                    try eg.buf.upload(@intCast(it.at + done), piece[0..n]);
-                    done += n;
-                }
-                it.dest.* = eg.buf.ptr + it.at;
-            }
-        }
-        if (std.c.getenv("TF_DS_EAGLE_TAPDUMP")) |v| eg.dump = try std.Io.Dir.cwd().createFile(io, std.mem.span(v), .{ .truncate = true });
-        errdefer if (eg.dump) |f| f.close(io);
-        eg.mod = try cuda.Module.load(e.d, cuda.kernels.dsv41_eagle);
-        errdefer eg.mod.unload();
-        eg.f = .{
-            .rmsnorm = try eg.mod.function("tf_eagle_rmsnorm_kernel"),
-            .rope = try eg.mod.function("tf_eagle_rope_kernel"),
-            .attn = try eg.mod.function("tf_eagle_attn_kernel"),
-            .silu_mul = try eg.mod.function("tf_eagle_silu_mul_kernel"),
-            .top1 = try eg.mod.function("tf_eagle_top1_kernel"),
-            .topk = try eg.mod.function("tf_eagle_topk_kernel"),
-            .rescore = try eg.mod.function("tf_eagle_rescore_kernel"),
-            .gemv_bf16 = try eg.mod.function("tf_eagle_gemv_bf16_kernel"),
-            .gemv_fp8 = try eg.mod.function("tf_eagle_gemv_fp8_kernel"),
-            .top1_part = try eg.mod.function("tf_eagle_top1_part_kernel"),
-            .top1_join = try eg.mod.function("tf_eagle_top1_join_kernel"),
-        };
-        eg.slots = slots;
-        eg.ring = s.window + ring_extra;
-        const rows = slots * eg.ring;
-        eg.kring = try a.take((rows + 1) * hkv * 2);
-        eg.vring = try a.take((rows + 1) * hkv * 2);
-        eg.gring = try a.take((rows + 1) * D * 2);
-        try prompt.fill(e, eg.kring, 0, (rows + 1) * hkv * 2);
-        try prompt.fill(e, eg.vring, 0, (rows + 1) * hkv * 2);
-        try prompt.fill(e, eg.gring, 0, (rows + 1) * D * 2);
-        const R = chunk_rows;
-        const M = max_streams;
-        eg.ids = try a.take(R * 8);
-        eg.rrow = try a.take(R * 8);
-        eg.pos = try a.take(R * 8);
-        eg.tin = try a.take(R * L * D * 2);
-        eg.fin = try a.take(R * D * 2);
-        eg.ev = try a.take(R * D * 2);
-        eg.gv = try a.take(R * D * 2);
-        eg.cat = try a.take(R * 2 * D * 2);
-        eg.x = try a.take(R * D * 2);
-        eg.h = try a.take(R * D * 2);
-        eg.kv = try a.take(R * 2 * hkv * 2);
-        eg.xs = .{ try a.take(M * D * 2), try a.take(M * D * 2) };
-        eg.q = try a.take(M * hq * 2);
-        eg.att = try a.take(M * hq * 2);
-        eg.gu = try a.take(M * 2 * s.inter * 2);
-        eg.y = try a.take(M * s.inter * 2);
-        eg.lr = try a.take(M * s.rank * 2);
-        eg.lg = try a.take(M * s.vocab * 4);
-        eg.cand = try a.take(M * max_cand * 8);
-        eg.ex = try a.take(M * max_cand * 4);
-        eg.tpm = try a.take(M * top1_parts * 4);
-        eg.tpz = try a.take(M * top1_parts * 4);
-        eg.tpi = try a.take(M * top1_parts * 4);
-        eg.sp = try a.take(max_steps * M * 8);
-        eg.srow = try a.take(max_steps * M * 8);
-        eg.sbase = try a.take(M * 8);
-        eg.slo = try a.take(M * 8);
-        eg.out = try a.take((max_steps + 1) * M * 8);
-        eg.conf = try a.take(max_steps * M * 4);
-        eg.invalid = try a.take(4);
-        eg.dbg = try a.take(max_steps * M * D * 2);
-        try prompt.fill(e, eg.invalid, 0, 4);
-        try e.s.synchronize();
-        std.log.info("eagle head: {s}, taps {any}, window {d}, qk_norm {}, candidates {d}, fp8 {}, own gemv {s}, {d} MiB weights, {d} slots", .{ path, s.tapList(), s.window, s.qk_norm, eg.topk, fp8, if (fp8 or own_all) "all" else if (own_wo) "wo, w2" else "none", bytes >> 20, slots });
-        return eg;
-    }
+    /// The head of `path` (eagle_file.zig).
+    pub const open = file.open;
 
     pub fn close(eg: *Eagle, gpa: std.mem.Allocator) void {
         if (eg.graphs) |*g| {
@@ -531,8 +194,7 @@ pub const Eagle = struct {
         try cuda.launch.launch(eg.f.rope, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, e.s, &a);
     }
 
-    /// x [rows, k] bf16 (row stride ldx) @ l^T into out (row stride ldo), as `mode`: the own GEMV (eagle.cu) for an fp8
-    /// linear and for an own bf16 one's calls of up to gemv_rows rows, else cuBLAS.
+    /// x [rows, k] bf16 @ l^T into out (strides ldx, ldo) as `mode`: own GEMV (fp8; own bf16 to 16 rows), else cuBLAS.
     fn lin(eg: *const Eagle, e: *const Engine, x: u64, ldx: usize, l: Lin, out: u64, ldo: usize, mode: Out, rows: usize) !void {
         if (rows == 0) return;
         const eb: usize = if (l.fp8) 1 else 2;
@@ -557,7 +219,7 @@ pub const Eagle = struct {
                 a.add(@as(c_int, @intCast(@min(gemv_rows, rows - r0))));
                 a.add(out + r0 * ldo * osz);
                 a.add(@as(c_longlong, @intCast(ldo)));
-                a.add(@intFromEnum(mode));
+                a.add(@backingInt(mode));
                 a.add(@as(c_int, @intCast(G)));
                 try cuda.launch.launch(if (l.fp8) eg.f.gemv_fp8 else eg.f.gemv_bf16, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = 256 } }, e.s, &a);
             }
@@ -569,8 +231,7 @@ pub const Eagle = struct {
         }
     }
 
-    /// The keys and values of `rows` rows of h (normed): wkv, k_norm on each key head (qk_norm), RoPE on the keys at
-    /// `pos`, into the rings at ring rows `rrow` (i64 [rows], device).
+    /// Keys and values of `rows` normed rows h: wkv, k_norm (qk_norm), RoPE at `pos`, into ring rows `rrow` (device).
     fn keysOut(eg: *const Eagle, e: *const Engine, h: u64, pos: u64, rrow: u64, rows: usize) !void {
         const hd = eg.s.head_dim;
         const hkv = eg.s.kv_heads * hd;
@@ -581,8 +242,7 @@ pub const Eagle = struct {
         try e.ops.scatterRows(e.s, eg.kv + hkv * 2, 2 * hkv * 2, rrow, eg.vring, hkv * 2, hkv * 2, rows);
     }
 
-    /// The layer's input of `rows` rows: x = w_in [RMSNorm(embed rows ev) ; RMSNorm(g rows)] (g at `g`, row stride
-    /// dim) into `out`.
+    /// The layer input of `rows` rows: x = w_in [RMSNorm(embed rows ev) ; RMSNorm(g rows, stride dim)] into `out`.
     fn input(eg: *const Eagle, e: *const Engine, g: u64, out: u64, rows: usize) !void {
         const D = eg.s.dim;
         try eg.rms(e, eg.ev, D, eg.e_norm, eg.cat, 2 * D, rows);
@@ -592,8 +252,7 @@ pub const Eagle = struct {
 
     // -- absorbs --------------------------------------------------------------------------------------------------
 
-    /// The g rows of `spans` (their rows in order, taps bf16 [rows, taps * dim] at `taps`, row stride ldt elements):
-    /// g = RMSNorm(fc(taps)) into each kept span's ring rows, then the slots' bookkeeping.
+    /// g = RMSNorm(fc(taps)) of `spans` (taps bf16 [rows, taps * dim], stride ldt) into each kept span's ring rows.
     pub fn absorb(eg: *Eagle, e: *const Engine, taps: u64, ldt: usize, spans: []const Span) !void {
         var total: usize = 0;
         for (spans) |sp| total += sp.n;
@@ -626,9 +285,7 @@ pub const Eagle = struct {
         for (spans) |sp| if (sp.keep) note(&eg.st[sp.slot], sp.start, sp.n, eg.ring);
     }
 
-    /// TF_DS_EAGLE_TAPDUMP: one record of `n` absorbed rows of positions start .. in `slot`: u32 header length, the JSON
-    /// header {kind, slot, start, n, cut, taps, dim}, then the rows' taps bf16 [n, taps * dim] (the engine's tap order,
-    /// before tap_norm; at `src`, rows ld elements apart). cut: the rows a prompt chunk dropped at its replay floor.
+    /// TF_DS_EAGLE_TAPDUMP: one record (u32 length, JSON header, bf16 tap rows); the format: eagle/README.md.
     pub fn tapDump(eg: *Eagle, e: *const Engine, kind: []const u8, slot: usize, start: usize, n: usize, cut: usize, src: u64, ld: usize) !void {
         const f = eg.dump orelse return;
         if (n == 0) return;
@@ -647,8 +304,7 @@ pub const Eagle = struct {
         eg.dump_at += 4 + h.len + host.len;
     }
 
-    /// A round's windows (lanes.zig verify): every row's layer taps at `taps` (row stride layer taps * dim) and, for a
-    /// head with the final tap, the final states at `xc` (row stride dim), `rows` rows in all.
+    /// A round's windows (lanes.zig verify): layer taps at `taps` and, for a final-tap head, final states at `xc`.
     pub fn absorbRound(eg: *Eagle, e: *const Engine, taps: u64, xc: u64, rows: usize, spans: []const Span) !void {
         const D = eg.s.dim;
         const L = eg.s.n_taps;
@@ -672,8 +328,7 @@ pub const Eagle = struct {
 
     // -- the pass -------------------------------------------------------------------------------------------------
 
-    /// Each stream's `steps` drafts and confidences (into drafts / confs): the real rows each one lacks, then the
-    /// steps for all at once. A stream without the g row of q0 - 1 gets no drafts (confidence -30: survival ~0).
+    /// Each stream's `steps` drafts and confidences; a stream without the g row of q0 - 1 gets none (confidence -30).
     pub fn pass(eg: *Eagle, e: *const Engine, reqs: []const Req, steps: usize) !void {
         const N = reqs.len;
         if (N == 0 or N > max_streams or steps == 0 or steps > max_steps) return error.BadDraftPass;
@@ -752,8 +407,7 @@ pub const Eagle = struct {
         eg.passes += 1;
     }
 
-    /// The steps of a pass for N streams (their tables uploaded): eager, or a graph a (N, steps) with TF_DS_EAGLE_GRAPH
-    /// (every buffer and table is at a fixed place, so a replay runs the same work on the new tables).
+    /// A pass's steps for N streams: eager, or with TF_DS_EAGLE_GRAPH one CUDA graph a (N, steps) (fixed buffers).
     fn chain(eg: *Eagle, e: *const Engine, N: usize, steps: usize, cur: usize) !void {
         const g = if (eg.graphs) |*m| m else return eg.chainBody(e, N, steps, cur);
         const key: GraphKey = .{ .streams = @intCast(N), .steps = @intCast(steps) };
@@ -833,8 +487,7 @@ pub const Eagle = struct {
         }
     }
 
-    /// two_stage: each row's top `topk` low-rank logits (lg) as candidates, then their exact logits (ex) from the target
-    /// head on the normed rows eg.h.
+    /// two_stage: each row's top `topk` low-rank logits (lg) as candidates, then their exact logits (ex) on rows h.
     fn rescoreTop(eg: *Eagle, e: *const Engine, N: usize) !void {
         var a: cuda.Args = .{};
         a.add(eg.lg);
@@ -857,8 +510,7 @@ pub const Eagle = struct {
         try cuda.launch.launch(eg.f.rescore, .{ .grid = .{ .x = @intCast(N), .y = @intCast((eg.topk + 7) / 8) }, .block = .{ .x = 256 }, .shared = @intCast(eg.s.dim * 4) }, e.s, &b);
     }
 
-    /// An extend chunk: the rows' layer inputs (token ids, g ring rows, positions), their keys and values into the
-    /// rings, and each listed stream's last row's x into the steps' rows (xs[cur], row `who`).
+    /// An extend chunk: the rows' layer inputs, their keys and values into the rings, last rows' x into xs[cur].
     fn extend(eg: *Eagle, e: *const Engine, ids: []const i64, rows: []const i64, pos: []const i64, last: []const usize, who: []const usize, cur: usize) !void {
         const n = ids.len;
         const D = eg.s.dim;
@@ -873,8 +525,7 @@ pub const Eagle = struct {
         for (last, who) |r, i| try e.ops.copyRows(e.s, eg.x + r * D * 2, D * 2, eg.xs[cur] + i * D * 2, D * 2, D * 2, 1);
     }
 
-    /// One step of N rows on their residual rows x (in place: x becomes o): the attention (its keys and values first
-    /// unless the extend wrote them: `keys`), then the MLP.
+    /// One step of N residual rows x (x becomes o): attention (keys and values first if `keys`), then the MLP.
     fn step(eg: *Eagle, e: *const Engine, x: u64, pos: u64, rrow: u64, N: usize, keys: bool) !void {
         const s = eg.s;
         const D = s.dim;
@@ -914,8 +565,7 @@ pub const Eagle = struct {
     }
 };
 
-/// A slot's bookkeeping after g rows of positions start .. start + n went into its ring: a gap (or a first window)
-/// starts the slot over at `start`; rows rewritten below the extended position are extended again.
+/// A slot after g rows start .. start + n: a gap (or a first window) starts it over; rewritten rows extend again.
 fn note(st: *Slot, start: usize, n: usize, ring: usize) void {
     if (!st.live or start > st.g_hi or start < st.g_lo) {
         st.* = .{ .live = true, .lo = start, .ext = start, .g_lo = start, .g_hi = start };
@@ -940,84 +590,4 @@ test "a slot's rows: a first window, the next ones, a gap, a lag past the ring" 
     for (0..100) |k| note(&st, 302 + 2 * k, 2, 144);
     try std.testing.expectEqual(@as(usize, 502), st.g_hi);
     try std.testing.expectEqual(@as(usize, 502 - 144), st.g_lo);
-}
-
-// -- the self-test (TF_DS_EAGLE_CHECK=FILE: eagle_ref.py's vectors) -----------------------------------------------
-
-const VecJson = struct {
-    T: usize,
-    steps: usize,
-    dim: usize,
-    layers: usize,
-    taps: []const u16,
-    q0: []const usize,
-    drafts: []const []const i64,
-    p_top1: []const []const f64,
-    gap: []const []const f64,
-    sizes: []const usize,
-};
-
-/// The head against the reference's vectors in slot 0 (before serving; the slot is reset after): each case's rows
-/// absorbed, one pass, each step's o, draft and top-1 probability against the file's. One JSON line a case on stderr
-/// and a verdict; true when every step-1 o is within 3% (max abs diff over max abs) and every draft matches up to the
-/// first step whose reference top-2 logit gap is under 0.05 (a rounding can take either token there).
-pub fn selfTest(eg: *Eagle, gpa: std.mem.Allocator, io: std.Io, e: *const Engine, path: []const u8) !bool {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const all = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 30));
-    if (all.len < 16 or !std.mem.eql(u8, all[0..8], "TFEVECS1")) return error.NotEagleVectors;
-    const n: usize = @intCast(std.mem.readInt(u64, all[8..16], .little));
-    const v = try std.json.parseFromSliceLeaky(VecJson, a, all[16 .. 16 + n], .{ .ignore_unknown_fields = true });
-    const D = eg.s.dim;
-    const L = eg.s.n_taps;
-    if (v.dim != D or v.layers != L or !std.mem.eql(u16, v.taps, eg.s.tapList()) or v.steps > max_steps) return error.EagleVectorsMismatch;
-    const rows = v.T + v.steps;
-    var off: usize = 16 + n;
-    const taps = all[off..][0 .. rows * L * D * 2];
-    off += taps.len;
-    const ids_b = all[off..][0 .. rows * 4];
-    off += ids_b.len;
-    const o_ref = std.mem.bytesAsSlice(f32, @as([]align(1) const u8, all[off..][0 .. v.q0.len * v.steps * D * 4]));
-    const seq = try a.alloc(i32, rows);
-    for (seq, 0..) |*q, i| q.* = std.mem.readInt(i32, ids_b[i * 4 ..][0..4], .little);
-    const host_o = try a.alloc(u16, v.steps * D);
-    var pass_ok = true;
-    for (v.q0, 0..) |q0, ci| {
-        eg.reset(0);
-        var at: usize = 0;
-        while (at < q0) {
-            const k = @min(chunk_rows, eg.ring, q0 - at);
-            try prompt.upload(e, eg.tin, taps[at * L * D * 2 ..].ptr, k * L * D * 2);
-            try eg.absorb(e, eg.tin, L * D, &.{.{ .slot = 0, .start = at, .n = k }});
-            at += k;
-        }
-        try eg.pass(e, &.{.{ .slot = 0, .q0 = q0, .pending = seq[q0], .seq = seq[0..q0] }}, v.steps);
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(host_o.ptr, eg.dbg, v.steps * D * 2), "cuMemcpyDtoH");
-        var errs: [max_steps]f32 = @splat(0);
-        var p_eng: [max_steps]f32 = @splat(0);
-        var same = true;
-        for (0..v.steps) |j| {
-            var mx: f32 = 0;
-            var md: f32 = 0;
-            for (0..D) |i| {
-                const got: f32 = @bitCast(@as(u32, host_o[j * D + i]) << 16);
-                const want = o_ref[(ci * v.steps + j) * D + i];
-                mx = @max(mx, @abs(want));
-                md = @max(md, @abs(got - want));
-            }
-            errs[j] = md / @max(mx, 1e-12);
-            p_eng[j] = 1.0 / (1.0 + @exp(-(eg.confs[0][j] - eg.conf_b) / eg.conf_a));
-            if (same and eg.drafts[0][j] != v.drafts[ci][j]) {
-                if (v.gap[ci][j] >= 0.05) pass_ok = false;
-                same = false; // the chains differ from here: later steps compare nothing
-            }
-            if (!same) break;
-        }
-        if (errs[0] > 0.03) pass_ok = false;
-        std.debug.print("{{\"eagle_check\": {d}, \"rel_err\": {any}, \"drafts\": {any}, \"ref_drafts\": {any}, \"p\": {any}, \"ref_p\": {any}}}\n", .{ q0, errs[0..v.steps], eg.drafts[0][0..v.steps], v.drafts[ci], p_eng[0..v.steps], v.p_top1[ci] });
-    }
-    eg.reset(0);
-    std.debug.print("{{\"eagle_check\": \"{s}\", \"cases\": {d}}}\n", .{ if (pass_ok) "pass" else "fail", v.q0.len });
-    return pass_ok;
 }

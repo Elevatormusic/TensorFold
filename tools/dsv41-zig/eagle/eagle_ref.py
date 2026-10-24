@@ -82,12 +82,17 @@ class Ref:
             q, k = self.rms(q, self.t["q_norm"]), self.rms(k, self.t["k_norm"])
         return x, q, k, v
 
+    def add_lin(self, x, y, name):
+        """x + y @ W^T, the sum in fp32 and rounded once (the engine's linearDenseAdd and own GEMV mode 2)."""
+
+        return self.r(x + y @ self.t[name].T)
+
     def layer_out(self, x, att):
-        x = self.r(x + self.lin(att.flatten(-2), "wo.weight"))
+        x = self.add_lin(x, att.flatten(-2), "wo.weight")
         gu = self.lin(self.rms(x, self.t["mlp_norm"]), "w13.weight")
         g, u = gu.chunk(2, -1)
-        y = self.r(F.silu(g) * u)
-        return self.r(x + self.lin(y, "w2.weight"))
+        y = self.r(self.r(F.silu(g)) * u)  # (tf_eagle_silu_mul_kernel rounds SiLU(g) to bf16 before the multiply)
+        return self.add_lin(x, y, "w2.weight")
 
     def logits(self, o):
         """fp32 logits (the engine's up projection writes fp32): the low-rank head's over the vocabulary."""

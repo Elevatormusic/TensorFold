@@ -69,9 +69,7 @@ pub const Options = struct {
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
 };
 
-/// TF_DS_DRAFTER=eagle: the TFE draft head drafts (eagle.zig, its file TF_DS_EAGLE_HEAD, on rank 0) and no rank
-/// loads DSpark; unset or "dspark": DSpark (the served drafter). Every rank must have the same setting (the ranks'
-/// check compares their DSpark switch).
+/// TF_DS_DRAFTER=eagle: the TFE head drafts on rank 0, no rank loads DSpark; unset or "dspark": DSpark (all ranks).
 pub fn eagleDrafter() bool {
     const v = std.c.getenv("TF_DS_DRAFTER") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "eagle");
@@ -894,10 +892,7 @@ pub const Model = struct {
         return m.logits[0..m.vocab];
     }
 
-    /// A prompt chunk that reached the head: its last rows' taps (a ring of rows at most, in pieces of the head's
-    /// absorb; the layer taps; a tap of a layer before the replay cut holds the chunk's rows from its first, so its
-    /// rows past the cut start `ch.start - start0` in) and, for a head with the final tap, their final states
-    /// (collapse_norm of the streams) into the TFE head's rings.
+    /// A prompt chunk's last ring rows into the head: taps (below layers / 2 at ch.start - start0) and final states.
     fn eagleAbsorbChunk(m: *Model, eg: *eagle.Eagle, start0: usize) !void {
         const e = &m.eng;
         const c = e.c;

@@ -84,8 +84,7 @@ pub const Blas = struct {
         try b.check(b.api.cublasGemmEx(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, bf16_type, @intCast(k), x, bf16_type, @intCast(ldx), &zero, out, out_type, @intCast(ldo), 68, 99));
     }
 
-    /// linearDense with beta 1 and a bf16 out: out += x @ w^T (the TFE head's residual adds, eagle.zig), the sum in
-    /// fp32 and rounded once.
+    /// linearDense with beta 1, bf16 out: out += x @ w^T in fp32, rounded once (the TFE head's residual adds).
     pub fn linearDenseAdd(b: *const Blas, x: u64, ldx: usize, w: u64, out: u64, ldo: usize, rows: usize, k: usize, n: usize) Error!void {
         const one: f32 = 1;
         const bf16_type: c_int = 14; // CUDA_R_16BF

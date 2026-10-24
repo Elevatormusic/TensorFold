@@ -1,6 +1,4 @@
-// The TFE draft head (zig/src/families/dsv41/eagle.zig): its row kernels and its few-row linears. Ours. Each one
-// computes in fp32 and rounds to bf16 where tools/dsv41-zig/eagle/eagle_ref.py rounds (the reference of the
-// engine's self-test). Raw device pointers, the caller's stream.
+// The TFE draft head's kernels (eagle.zig): fp32 math, bf16 rounds as eagle_ref.py; tools/dsv41-zig/eagle/README.md.
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -57,8 +55,7 @@ extern "C" __global__ void tf_eagle_rmsnorm_kernel(const __nv_bfloat16* x, long 
     for (int i = threadIdx.x; i < d; i += blockDim.x) o[i] = __float2bfloat16_rn(bf(row[i]) * r * bf(w[i]));
 }
 
-// RoPE in place on the first rd features of each of `heads` heads (hd apart) of row r (rows ld apart) at position
-// pos[r]: the halves rotated, frequency theta^(-i / (rd / 2)). A row a block.
+// RoPE in place on the first rd features of each head of row r at pos[r] (halves rotated); a row a block.
 extern "C" __global__ void tf_eagle_rope_kernel(__nv_bfloat16* x, long long ld, int heads, int hd, int rd,
                                                 const long long* pos, float theta) {
     const int half = rd / 2;
@@ -76,11 +73,7 @@ extern "C" __global__ void tf_eagle_rope_kernel(__nv_bfloat16* x, long long ld, 
     }
 }
 
-// The window attention of one row and one query head (grid rows x heads, 128 threads; head_dim 128): the keys and
-// values of the row's stream ring (K, V bf16 [ring rows, kv_heads * 128], the stream's rows from base[r]) at the
-// positions max(lo[r], pos[r] - window) .. pos[r] (ring row base + position % ring), fp32 scores times `scale`, softmax,
-// the fp32 sum of the values, bf16 out [rows, heads * 128] (rows ldo apart). A thread a key for the scores; for the
-// values each warp sums a quarter of the keys (a lane 4 features), then the 4 warps' sums are added.
+// Window attention, a row and a query head a block (128 threads): ring keys max(lo, pos - window) .. pos; README.
 extern "C" __global__ void __launch_bounds__(128) tf_eagle_attn_kernel(
     const __nv_bfloat16* q, long long ldq, const __nv_bfloat16* K, const __nv_bfloat16* V, int kv_heads,
     const long long* base, const long long* pos, const long long* lo, int ring, int window, int heads, float scale,
@@ -162,10 +155,7 @@ extern "C" __global__ void tf_eagle_silu_mul_kernel(const __nv_bfloat16* gu, int
     }
 }
 
-// A draft step's token and confidence, a row a block (1024 threads): the largest logit of [n] fp32 (rows ld apart; a
-// tie goes to the lower token id), its softmax probability p over the n, and conf = a * log(p / (1 - p)) + b (the lane
-// core reads sigmoid(conf) as the draft's survival). map: null (logit i is token i) or the row's token ids int64 [n]
-// (rows ldm apart: a two_stage head's candidates). ids [rows] int64, conf [rows] fp32.
+// A step's draft and confidence, a row a block: top-1 of [n] fp32 (tie: lower id), conf = a * logit(p) + b; README.
 extern "C" __global__ void __launch_bounds__(1024) tf_eagle_top1_kernel(const float* logits, long long ld, int n,
                                                                         const long long* map, long long ldm,
                                                                         long long* ids, float* conf, float a, float b) {
@@ -229,10 +219,7 @@ extern "C" __global__ void __launch_bounds__(1024) tf_eagle_top1_kernel(const fl
     }
 }
 
-// The top-1 of long rows in two kernels (the low-rank head's 129280 logits): tf_eagle_top1_part_kernel (grid rows x
-// parts, 256 threads) takes each part's largest logit (a tie: the lower id) and its sum of exp(logit - that max);
-// tf_eagle_top1_join_kernel (grid rows, 32 threads) joins the parts and writes what tf_eagle_top1_kernel writes. The
-// part buffers: pm, pz fp32 and pi int32 [rows, parts].
+// The top-1 of long rows in two kernels: part (grid rows x parts) then join (grid rows, 32 threads); README.
 extern "C" __global__ void __launch_bounds__(256) tf_eagle_top1_part_kernel(const float* logits, long long ld, int n,
                                                                              float* pm, float* pz, int* pi) {
     __shared__ float sv[32];
@@ -357,9 +344,7 @@ __device__ __forceinline__ void chunk_w(const uint4 u, float* w) {
     }
 }
 
-// y[r, o] = scale[o] * sum_i x[r, i] * W[o, i] for rows r < rows <= 16 (fp32 sums): a group of G lanes an output
-// (G = 32, or the 16-byte chunks of a row when fewer), a lane every G-th chunk. mode 0: out bf16 = y; 1: out fp32 = y;
-// 2: out bf16 = out + y (one rounding, as cuBLAS's beta 1).
+// y[r, o] = scale[o] * sum_i x[r, i] * W[o, i], rows <= 16, G lanes an output; mode 0 bf16, 1 fp32, 2 out + y.
 template <bool F8>
 __device__ __forceinline__ void gemv_rows(const uint8_t* W, const float* scale, int n, int k, const __nv_bfloat16* x,
                                           long long ldx, int rows, void* out, long long ldo, int mode, int G) {
@@ -426,8 +411,7 @@ __device__ __forceinline__ void gemv_rows(const uint8_t* W, const float* scale, 
 
 }  // namespace
 
-// The TFE head's linears for a few rows: x bf16 [rows <= 16, k] (rows ldx apart, 16-byte aligned) @ W [n, k]^T
-// (row-major, bf16 or e4m3 with an fp32 scale an output row: W[o] = scale[o] * q[o]); see gemv_rows. 256 threads.
+// The head's few-row linears: x bf16 [rows <= 16, k] (16-byte aligned) @ W [n, k]^T, bf16 or e4m3 + row scale.
 extern "C" __global__ void __launch_bounds__(256) tf_eagle_gemv_bf16_kernel(const uint8_t* W, int n, int k,
                                                                             const __nv_bfloat16* x, long long ldx,
                                                                             int rows, void* out, long long ldo,
@@ -452,10 +436,7 @@ __device__ __forceinline__ unsigned int fkey(const float v) {
 
 }  // namespace
 
-// A two_stage head's candidates, a row a block (1024 threads): the k largest of [n] fp32 logits (rows ld apart), a tie
-// at the k-th value taken by the lower token ids, as int64 ids into cand [rows, k] (rows ldc apart; the order inside a
-// row is not fixed). A radix select on the keys (4 passes of 8 bits), then the keys above the k-th and the first of
-// the equal ones in id order.
+// A two_stage head's candidates, a row a block: the k largest of [n] fp32 logits (radix select; tie: lower ids).
 extern "C" __global__ void __launch_bounds__(1024) tf_eagle_topk_kernel(const float* logits, long long ld, int n, int k,
                                                                         long long* cand, long long ldc) {
     __shared__ unsigned int hist[256];
@@ -520,8 +501,7 @@ extern "C" __global__ void __launch_bounds__(1024) tf_eagle_topk_kernel(const fl
     }
 }
 
-// A two_stage head's exact logits: out[r, j] = W[cand[r, j]] . x[r] (W the target head bf16 [vocab, d], x bf16 rows
-// ldx apart, fp32 sums), fp32 out [rows, k] (rows ldo apart). Grid rows x ceil(k / 8), 256 threads: a warp a candidate.
+// A two_stage head's exact logits: out[r, j] = W[cand[r, j]] . x[r] (fp32 sums), a warp a candidate.
 extern "C" __global__ void __launch_bounds__(256) tf_eagle_rescore_kernel(const __nv_bfloat16* W, int d,
                                                                           const __nv_bfloat16* x, long long ldx,
                                                                           const long long* cand, long long ldc, int k,

@@ -250,8 +250,7 @@ pub const Profile = struct {
     prefills: u64 = 0,
 };
 
-/// TF_DS_ACCEPT_LOG=N: the held drafts kept by position (a draft is kept when it and every earlier one equal the
-/// round's draws), summed over the windows and written on stderr as one JSON line each N rounds.
+/// TF_DS_ACCEPT_LOG=N: kept held drafts by position (a draft kept: it and all before equal the draws), on stderr.
 pub const AcceptLog = struct {
     every: u64,
     rounds: u64 = 0,
