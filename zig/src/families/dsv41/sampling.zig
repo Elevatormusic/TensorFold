@@ -3,8 +3,7 @@
 //! > 0, the row's top_k + MARGIN largest logits (torch.topk's set; of equal values the lower ids) ordered by value, then
 //! id (np.lexsort), the first top_k of them; each candidate's score is its logit over the temperature plus a Gumbel draw
 //! keyed by (seed, position, token id) through a splitmix64 chain, so a verify row draws as the serial run at its
-//! position. top_k 0 takes the nucleus rule instead (nucleusRow, cuda.sampling.nucleus_rows). top_p sets the scores
-//! past the smallest prefix whose probability mass reaches top_p to -inf (the scaled
+//! position. top_p sets the scores past the smallest prefix whose probability mass reaches top_p to -inf (the scaled
 //! logits' exp over their sum: numpy's pairwise sum, then cumulative sums in order); min_p those under ln(min_p) of the
 //! top. The token is the first best score. float64 as numpy computes it on the served image (numpy 2.1: its exp and log
 //! are libm's, a row's sum of 20 its 8-accumulator pairwise sum; zrec np_libm.py).
@@ -248,18 +247,12 @@ fn candidateBefore(_: void, a: Candidate, b: Candidate) bool {
     return a.v > b.v or (a.v == b.v and a.id < b.id);
 }
 
-/// nucleus_rows for one row (top_k off): the keyed draw over the top_p nucleus, then min_p. Each token's mass is
-/// floor(exp(scaled - top) * 2^40); the nucleus is the shortest prefix of the (value, then id) order whose mass sum
-/// reaches ceil(top_p * total); min_p keeps the prefix within ln(min_p) of the top; the token is the first best
-/// scaled + Gumbel score of the kept prefix. Without a top_p cut and min_p, every token of the row is kept.
-/// The whole row is on the host here, so the rule needs no candidate count (the Python one reads 1024 a rank first;
-/// its result is the same). Like it, this one first keeps the best 1,024 tokens with mass in a bounded heap and sorts
-/// only those; a nucleus that is longer (a flat row) sorts every token with mass. Mass uses libm's exp; the Python rule uses torch's CUDA exp, which can differ in the last
-/// bit, so a token at a mass edge can differ from the Python engine; drafted and serial runs here use this one rule.
+/// nucleus_rows for one row (top_k 0, cuda.sampling): the keyed draw over the top_p nucleus, then the min_p floor.
 pub fn nucleusRow(row: []const f32, position: u64, s: Sampling) !i64 {
     const t = @max(s.temperature, 1e-6);
     var top: f64 = -std.math.inf(f64);
     for (row) |x| top = @max(top, @as(f64, x) / t);
+    // the nucleus: the shortest (value, then id) order prefix whose mass sum reaches ceil(top_p * total)
     const cut = 0.0 < s.top_p and s.top_p < 1.0;
     const floor = if (s.min_p > 0.0) top + log(s.min_p) else -std.math.inf(f64);
     if (!cut) {
@@ -280,14 +273,14 @@ pub fn nucleusRow(row: []const f32, position: u64, s: Sampling) !i64 {
         }
         return @intCast(best orelse argmax(row));
     }
-    // One pass: the row's total mass, and the best top_cap tokens with mass in a bounded heap (the worst one on top).
-    // The cut nearly always ends among them, so the full row needs no sort.
+    // one pass: the total mass, and the best top_cap tokens in a bounded heap (the cut nearly always ends among them)
     var total: u64 = 0;
     var n: usize = 0;
     var heap: [top_cap]Candidate = undefined;
     var hn: usize = 0;
     for (row, 0..) |x, j| {
         const v = @as(f64, x) / t;
+        // libm's exp; Python uses torch's CUDA exp, so a token at a mass edge can differ from the Python engine
         const m: u64 = @intFromFloat(@floor(exp(v - top) * mass_unit));
         total += m;
         if (m == 0) continue;
