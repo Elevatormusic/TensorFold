@@ -48,6 +48,7 @@ pub const round2d = @import("round2d.zig");
 pub const draft2d = @import("draft2d.zig");
 pub const markov_tokens = @import("markov_tokens.zig");
 pub const draft = @import("draft.zig");
+pub const eagle = @import("eagle.zig");
 pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
 pub const lanes = @import("lanes.zig");
@@ -97,6 +98,7 @@ test {
     refAll(draft2d);
     refAll(markov_tokens);
     refAll(draft);
+    refAll(eagle);
     refAll(sampling);
     refAll(model);
     refAll(lanes);

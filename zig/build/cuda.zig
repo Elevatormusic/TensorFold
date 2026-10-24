@@ -62,6 +62,7 @@ const kernels = [_]Kernel{
     .{ .name = "dsv41_torch", .flags = torch_ops }, // ours: DeepSeek-V4.1 torch arithmetic at torch's rounding points
     .{ .name = "dsv41_rdma", .src = "dsv41/rdma_gather", .flags = &.{"-O3"} }, // ours: the decode gathers' RDMA kernel pair
     .{ .name = "dsv41_experts_par", .src = "dsv41/experts_par", .flags = &.{ "-O3", "-lineinfo" } }, // ours: the exl3 extension's gate / up with the parity split's rest in its grid (tensorfold_exl3_experts_v19's flags)
+    .{ .name = "dsv41_eagle", .src = "dsv41/eagle", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the TFE draft head's row kernels (eagle.zig)
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.

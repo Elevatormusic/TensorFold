@@ -14,6 +14,8 @@ const prompt = @import("prompt.zig");
 const prompt2d = @import("prompt2d.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
+const eagle = @import("eagle.zig");
+const tri_basic = @import("tri_basic.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
@@ -66,6 +68,12 @@ pub const Options = struct {
     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
 };
+
+/// TF_DS_DRAFTER=eagle: the TFE head drafts on rank 0, no rank loads DSpark; unset or "dspark": DSpark (all ranks).
+pub fn eagleDrafter() bool {
+    const v = std.c.getenv("TF_DS_DRAFTER") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "eagle");
+}
 
 /// TF_DS_2D_GU=parity (the served switch): the 2D split's experts with half the gate / up blocks a pair and the ninth by
 /// expert parity (plan.Split.parity); the rank cache must be one written for it.
@@ -122,6 +130,7 @@ pub const Model = struct {
     pgraphs: ?draft.PassGraphs = null, // the drafter pass as CUDA graphs (with graphs)
     dpool: ?draft.Pool = null,
     dr: ?draft.Drafter = null,
+    eg: ?*eagle.Eagle = null, // TF_DS_DRAFTER=eagle: the TFE draft head (rank 0 only; eagle.zig)
     tables: ?engram_io.Tables = null,
     epool: ?*engram_io.Pool = null,
     aio: ?*engram_aio.Aio = null,
@@ -200,6 +209,7 @@ pub const Model = struct {
         m.t_absorb = 0;
         m.dpool = null;
         m.dr = null;
+        m.eg = null;
         m.tables = null;
         m.epool = null;
         m.aio = null;
@@ -228,9 +238,25 @@ pub const Model = struct {
         errdefer m.cache_file.close(io);
         var sp = try prompt2d.split(o.rank, o.world);
         sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
-        m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
+        const use_eagle = eagleDrafter();
+        if (use_eagle and o.world != 2) return error.NotPortedYet;
+        const dspark = o.drafts and !use_eagle;
+        m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, dspark);
         errdefer m.w.deinit();
-        if (o.drafts and m.w.dspark == null) return error.NoDrafter;
+        if (dspark and m.w.dspark == null) return error.NoDrafter;
+        // the TFE head's taps are the ones the forward writes (rank 0; rank 1 runs no head and writes none)
+        var eagle_hdr: ?eagle.Header = null;
+        if (use_eagle and o.drafts) {
+            if (o.rank == 0) {
+                const path = std.mem.span(std.c.getenv("TF_DS_EAGLE_HEAD") orelse return error.NoEagleHead);
+                eagle_hdr = try eagle.Header.read(a, io, path);
+                const lt = eagle_hdr.?.shape.layerTaps();
+                for (lt) |t| if (t >= c.layers) return error.UnsupportedEagleHead;
+                c.dspark_taps = .{};
+                for (lt, 0..) |t, i| c.dspark_taps.items[i] = t;
+                c.dspark_taps.len = lt.len;
+            } else c.dspark_taps = .{};
+        }
 
         const neighbor_rdma = try neighbor.configured();
         if (neighbor_rdma and o.world != 4) return error.NotFourNodes;
@@ -246,7 +272,7 @@ pub const Model = struct {
             .streams = @intCast(o.streams),
             .round_rows = @intCast(o.round_rows),
             .rails = if (o.rdma_devices) |list| @intCast(std.mem.count(u8, list, ",") + 1) else 0,
-            .drafts = @intFromBool(o.drafts),
+            .drafts = @intFromBool(dspark),
             .replay_floor = @intFromBool(prompt.replay_floor),
             .idx_split = @intCast(prompt.split_from),
             .neighbor_rdma = @intFromBool(neighbor_rdma),
@@ -347,7 +373,7 @@ pub const Model = struct {
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
         if (m.two) |t| if (t.ir != 0 and o.side and m.par == null) try m.rd.usePar(&m.eng); // parity in two launches: the rest beside the main gate / up
-        if (o.drafts) {
+        if (dspark) {
             m.dpool = try draft.Pool.init(&m.eng, &m.arena, m.streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
             if (o.graphs) {
@@ -355,6 +381,12 @@ pub const Model = struct {
                 m.dr.?.graphs = &m.pgraphs.?;
             }
         }
+        if (eagle_hdr) |hdr| {
+            m.eg = try eagle.Eagle.open(gpa, io, &m.eng, &m.arena, std.mem.span(std.c.getenv("TF_DS_EAGLE_HEAD").?), hdr, m.streams);
+            // TF_DS_EAGLE_CHECK=FILE: the head against eagle_ref.py's vectors before serving (its verdict on stderr)
+            if (std.c.getenv("TF_DS_EAGLE_CHECK")) |v| _ = try eagle.selfTest(m.eg.?, gpa, io, &m.eng, std.mem.span(v));
+        }
+        errdefer if (m.eg) |x| x.close(gpa);
         try m.synchronize();
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
 
@@ -402,6 +434,7 @@ pub const Model = struct {
         m.spans.deinit(m.gpa);
         if (m.graphs) |*g| g.deinit();
         if (m.pgraphs) |*g| g.deinit();
+        if (m.eg) |x| x.close(m.gpa);
         if (m.timer) |t| {
             t.deinit();
             m.gpa.destroy(t);
@@ -515,7 +548,7 @@ pub const Model = struct {
     }
 
     pub fn drafting(m: *const Model) bool {
-        return m.dr != null;
+        return m.dr != null or m.eg != null;
     }
 
     // -- the primitives (both ranks, in the same order) ----------------------------------------------------------
@@ -633,6 +666,7 @@ pub const Model = struct {
         m.view = try m.caches.view(&m.eng, slot, base);
         for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
         m.fill_slot = slot;
+        if (m.eg) |x| x.reset(slot);
     }
 
     /// The prompt's chunk of n rows from position `start` (seq: the stream's ids through the chunk's end) through every
@@ -654,7 +688,7 @@ pub const Model = struct {
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
         if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
-        const taps = m.dr != null;
+        const taps = m.dr != null or m.eg != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
         // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
@@ -738,6 +772,7 @@ pub const Model = struct {
             for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j), dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, ch.n);
             try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
         }
+        if (m.eg) |eg| try m.eagleAbsorbChunk(eg, start);
         // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
         // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize.
         // The profile (--profile 2) times a chunk to its end, so it alone waits.
@@ -791,6 +826,13 @@ pub const Model = struct {
                 n += 1;
             }
             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
+        }
+        if (m.eg) |eg| {
+            // the drafting windows' g rows (the others' rows go to the ring's sink row)
+            const wins = rows.windows orelse return error.BadRound;
+            var spans: [max_streams]eagle.Span = undefined;
+            for (wins, absorb, 0..) |win, yes, i| spans[i] = .{ .slot = @intCast(rows.slots.?[win.row]), .start = @intCast(rows.pos[win.row]), .n = win.n, .keep = yes };
+            try eg.absorbRound(e, m.rd.taps, m.rd.xc, rows.ids.len, spans[0..wins.len]);
         }
         try m.synchronize();
         if (m.prof) m.t_absorb = m.now() - t1;
@@ -848,6 +890,39 @@ pub const Model = struct {
         try m.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.ch.head_g, m.vocab * 4), "cuMemcpyDtoH");
         return m.logits[0..m.vocab];
+    }
+
+    /// A prompt chunk's last ring rows into the head: taps (below layers / 2 at ch.start - start0) and final states.
+    fn eagleAbsorbChunk(m: *Model, eg: *eagle.Eagle, start0: usize) !void {
+        const e = &m.eng;
+        const c = e.c;
+        const ch = &m.ch;
+        const D = c.hidden;
+        const L = eg.s.n_taps;
+        const total = @min(ch.n, eg.ring);
+        const cut = ch.start - start0;
+        var at = ch.n - total; // (the rows before: no window reaches them)
+        while (at < ch.n) {
+            const k = @min(eagle.chunk_rows, ch.n - at);
+            for (eg.s.layerTaps(), 0..) |t, j| {
+                const off = (if (t < c.layers / 2) cut else 0) + at;
+                try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j) + off * D * 2, D * 2, eg.tin + j * D * 2, L * D * 2, D * 2, k);
+            }
+            if (eg.s.final()) {
+                try tri_basic.collapseNorm(e.t, ch.h + at * c.hc * D * 2, ch.pre + at * c.hc * 4, e.w.norm, eg.fin, c.eps, k, D);
+                try e.ops.copyRows(e.s, eg.fin, D * 2, eg.tin + (L - 1) * D * 2, L * D * 2, D * 2, k);
+            }
+            try eg.tapDump(e, "prompt", m.fill_slot, ch.start + at, k, cut, eg.tin, L * D);
+            try eg.absorb(e, eg.tin, L * D, &.{.{ .slot = m.fill_slot, .start = ch.start + at, .n = k }});
+            at += k;
+        }
+    }
+
+    /// The TFE head's pass (rank 0): each request's drafts and confidences into m.eg's drafts / confs.
+    pub fn eaglePass(m: *Model, reqs: []const eagle.Req, steps: usize) !void {
+        const eg = m.eg orelse return error.NoDrafter;
+        try eg.pass(&m.eng, reqs, steps);
+        try m.ringsOk();
     }
 
     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
