@@ -446,9 +446,9 @@ pub const Round = struct {
     fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
         if (rd.clk != 0 and rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio)) {
             const now = cuda.launch.count;
-            rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
+            rd.launches[@backingInt(p)] += now -% rd.launch_mark;
             rd.launch_mark = now;
-            try rd.clock(e, @intFromEnum(p));
+            try rd.clock(e, @backingInt(p));
         }
         if (rd.timer) |t| try t.mark(e.s, p);
     }
@@ -800,7 +800,6 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
 fn linearBytes(l: weights.Linear) [2]u64 {
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
-
 
 /// A measurement's L2 prefetches left out (TF_DS_L2_SKIP, read at Model.open: bit 1 the "attn" fork after q, 2 the "moe"
 /// fork after wo_b, 4 the "next" fork after the experts); 0 in service.
