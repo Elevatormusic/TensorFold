@@ -589,7 +589,7 @@ pub const Lanes = struct {
         return l.first;
     }
 
-    /// `first` among `mask`'s allowed tokens: the kept last prompt row, masked, at the plain first draw's keyed position.
+    /// `first` among `mask`'s allowed tokens: the kept last prompt row, masked, at the plain first draw's position.
     fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
         const self = of(ptr);
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
