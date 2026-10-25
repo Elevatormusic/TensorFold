@@ -125,7 +125,14 @@ kernel cache at start; page-cache state was not recorded for either side.
   by the round's cost and the drafter's block of five.
 - Exact prefill is slower than the kit (789-835 vs 1154 at 8K); replay is faster. The engine's code default is exact
   prefill; the deployed configuration (the launch line below) uses replay, DeepSeek's deployment mode.
-- Prefill compute/communication overlap (gathers are ~14% of a chunk); the start-up warm-ups (~29 s of the 65 s).
+- Prefill compute/communication overlap: built (two halves, one stream for every collective, stage-major) and measured
+  at 0% (28.07 s against 28.14 s at chunk 4096, 30.90 s against 30.87 s at 2048, cold 64K). Not kept: half 1's attention
+  waits for half 0's ring writes, and each expert launch gets half the rows. The start-up warm-ups are ~29 s of the 65 s.
+- Prefill chunk size is the lever instead: 4096 rows is 28.14 s against 30.87 s at 2048 on a cold 64K prompt (16K
+  7.35 against 7.84 s, 32K 14.40 against 15.49 s, decode unchanged at 60.4 / 59.9 / 64.5 / 69.2 tok/s), and a chunk
+  size is not bit-neutral: 4096 gives other (reproducible) tokens than 2048. 8192 rows does not run: its MoE step asks
+  for ~1.3 GiB more than `engine._memory_ceiling` leaves (weights + `MemAvailable - floor`), and the CUDA OOM breaks the
+  lane until a restart.
 - Memory headroom: ~99 GiB weights a rank leaves ~5-8 GiB; 1M context fits but costs ~10% prefill speed.
 
 ## 7. Reproduce
@@ -139,7 +146,7 @@ kernel cache at start; page-cache state was not recorded for either side.
 # route but /health require that key (pass the same file to kit_bench.py with --key-file).
 # the served configuration: TF_DS_RANK_CACHE=<CACHE_DIR> keeps each rank's weights in one file (~106 GB a rank,
 # written on the first start)
-TF_DS_REPLAY=1 TF_DS_PREFILL_CHUNK=2048 TF_DS_RANK_CACHE=<CACHE_DIR> tensorfold serve <MODEL_DIR> \
+TF_DS_REPLAY=1 TF_DS_PREFILL_CHUNK=4096 TF_DS_RANK_CACHE=<CACHE_DIR> tensorfold serve <MODEL_DIR> \
   --tp 2 --rank R --master <HEAD_IP> --host 127.0.0.1 --port 18891 --context 262144 --vision --parallel 4 \
   --mtp-drafts 5 --temperature 0
 python3 tools/dsv41/kit_bench.py --base http://127.0.0.1:18891 --model <name> decode|concurrent|prefill|depth
