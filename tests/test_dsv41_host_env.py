@@ -276,6 +276,12 @@ class PageCacheTests(unittest.TestCase):
             self.assertTrue(hostenv.drop_page_cache(f.fileno()))
             advise.assert_called_once_with(f.fileno(), 0, 0, FADV_DONTNEED)
 
+    def test_a_byte_range_is_passed_through(self):
+        advise, (a, b) = self.patched()
+        with a, b, open(self.path, "rb") as f:
+            self.assertTrue(hostenv.drop_page_cache(f.fileno(), 4096, 8192))
+            advise.assert_called_once_with(f.fileno(), 4096, 8192, FADV_DONTNEED)
+
     def test_a_path_is_opened_advised_and_closed(self):
         seen = []
         advise, (a, b) = self.patched()
@@ -347,6 +353,19 @@ class LoaderReleaseTests(unittest.TestCase):
         self.assertEqual(drop.call_count, 2)
         self.assertTrue(all(isinstance(c.args[0], int) for c in drop.call_args_list))
 
+    def test_shards_get_drops_the_bytes_it_read(self):
+        import json
+        import struct
+
+        header = json.dumps({"x": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}}).encode()
+        (self.dir / "a.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + b"\x01\x02\x03\x04")
+        sh = self.weights.Shards(self.dir)
+        with mock.patch.object(self.weights, "drop_page_cache") as drop:
+            self.assertEqual(sh.get("x").tolist(), [1, 2, 3, 4])
+        drop.assert_called_once()
+        self.assertEqual(drop.call_args.args[1:], (8 + len(header), 4))
+        sh.close()
+
     def test_rank_cache_drops_its_file_when_it_writes_and_when_it_reads(self):
         import torch
 
@@ -364,8 +383,9 @@ class LoaderReleaseTests(unittest.TestCase):
             reader = self.weights.RankCache.open(str(cache_dir), model, 0, 2, "t")
             self.assertTrue(reader.reading)
             self.assertEqual(reader.take("k").tolist(), list(range(8)))
+            self.assertEqual(drop.call_args.args[1:], (0, 16))        # the span it read, as soon as it read it
             self.assertTrue(reader.close(ok=True))
-            self.assertEqual(drop.call_count, 2)
+            self.assertEqual(drop.call_count, 3)
 
 
 if __name__ == "__main__":

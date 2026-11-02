@@ -126,6 +126,7 @@ class Shards:
             if not n:
                 raise IOError(f"short read of {name}")
             got += n
+        drop_page_cache(f.fileno(), base + lo, hi - lo)  # GB10: the cache and the GPU copy share one memory
         t = torch.frombuffer(buf, dtype=dt) if buf else torch.empty(0, dtype=dt)
         return t.reshape(shape)
 
@@ -220,6 +221,7 @@ class RankCache:
             if k <= 0:
                 raise IOError(f"short read of {self.path}")
             got += k
+        drop_page_cache(self.fd, off, n)                  # as Shards.get: the cache holds only the reads ahead
         return buf
 
     def take(self, key: str) -> torch.Tensor:
