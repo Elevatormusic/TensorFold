@@ -136,6 +136,25 @@ def test_text_larger_than_the_cache_budget_is_not_kept():
     assert text not in pieces._kept
 
 
+def test_a_bounded_cache_reuses_tokens_and_encodes_evicted_pieces_again():
+    tok = Counting(tokenizer())
+    pieces = pieces_of(tok, budget=256)
+    first = "turn 0" + END
+    assert pieces.ids(first) == full(tok.tok, first)
+    assert first in pieces._kept
+    tok.encoded.clear()
+    assert pieces.ids(first) == full(tok.tok, first)
+    assert tok.encoded == []
+    for n in range(1, 20):
+        text = f"turn {n}" + END
+        assert pieces.ids(text) == full(tok.tok, text)
+        assert pieces._kept and pieces._used <= 256
+    assert first not in pieces._kept
+    tok.encoded.clear()
+    assert pieces.ids(first) == full(tok.tok, first)
+    assert tok.encoded == [first]
+
+
 def test_the_cuda_server_encodes_chat_prompts_through_its_pieces(tmp_path):
     pytest.importorskip("jinja2")
     from tensorfold.cuda.server import App
