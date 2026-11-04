@@ -1,7 +1,7 @@
 """Token ids of re-sent chat prompts: each piece between added tokens is encoded once, then reused.
 
-Use pieces only when the pre-tokenizer does not depend on the original input position. A chat client re-sends its
-whole conversation every turn; only the pieces it has not sent before need the tokenizer.
+Use pieces only for a deterministic model whose pre-tokenizer does not depend on the original input position.
+A chat client re-sends its whole conversation every turn; only new pieces need the tokenizer.
 """
 
 from __future__ import annotations
@@ -41,6 +41,20 @@ def _has_local_pre_tokenizer(tok: Any) -> bool:
         return False
 
 
+def _deterministic_model(tok: Any) -> bool:
+    """Read the model options without serializing its vocabulary."""
+
+    try:
+        from tokenizers.models import BPE, Unigram, WordLevel, WordPiece
+
+        model = tok.model
+        if type(model) is BPE:
+            return model.dropout is None or model.dropout == 0.0
+        return type(model) in (Unigram, WordLevel, WordPiece)
+    except Exception:  # noqa: BLE001  unknown model metadata must not enable the optional cache
+        return False
+
+
 class PromptPieces:
     """``ids(text)`` equals ``tok.encode(text, add_special_tokens=False).ids``."""
 
@@ -61,7 +75,7 @@ class PromptPieces:
             return None                              # these options apply to the whole input, not each piece
         if getattr(tok, "encode_special_tokens", False):        # special tokens are encoded as text, not split out
             return None
-        if not _has_local_pre_tokenizer(tok):
+        if not _deterministic_model(tok) or not _has_local_pre_tokenizer(tok):
             return None
         first = [token for token in tok.get_added_tokens_decoder().values() if not token.normalized]
         # rstrip takes the spaces after a token into its match, and single_word skips a match inside a word

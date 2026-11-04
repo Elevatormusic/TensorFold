@@ -45,6 +45,10 @@ class Counting:
     def pre_tokenizer(self):
         return self.tok.pre_tokenizer
 
+    @property
+    def model(self):
+        return self.tok.model
+
     def encode_batch(self, texts, add_special_tokens=False):
         self.encoded += texts
         return self.tok.encode_batch(texts, add_special_tokens=add_special_tokens)
@@ -276,3 +280,69 @@ def test_a_real_custom_pre_tokenizer_can_encode_without_enabling_pieces():
     tok.pre_tokenizer = pre_tokenizers.PreTokenizer.custom(Custom())
     assert PromptPieces.of(tok) is None
     assert full(tok, "<s>hello") == [tok.token_to_id("<s>"), tok.token_to_id("hello")]
+
+
+@pytest.mark.parametrize("dropout", [0.5, 1.0])
+def test_bpe_dropout_does_not_enable_piece_reuse(dropout):
+    tok = tokenizer()
+    tok.model.dropout = dropout
+    assert isinstance(tok.model, models.BPE) and tok.model.dropout == dropout
+    assert PromptPieces.of(tok) is None
+
+
+@pytest.mark.parametrize("dropout", [0.5, 1.0])
+def test_bpe_dropout_server_uses_the_whole_input_route(tmp_path, monkeypatch, dropout):
+    tok = tokenizer()
+    tok.model.dropout = dropout
+    app = server_for_tokenizer(tmp_path, tok)
+    assert isinstance(app.tok.model, models.BPE) and app.tok.model.dropout == dropout
+    encoded = []
+    encode = app._encode
+
+    def whole_input(text, add_special_tokens):
+        encoded.append((text, add_special_tokens))
+        return encode(text, add_special_tokens)
+
+    monkeypatch.setattr(app, "_encode", whole_input)
+    messages = [{"role": "user", "content": "hello"}]
+    prompt = app.prepare({"messages": messages, "max_tokens": 1}, True).prompt
+    text = app.template.render(messages, tools=None, enable_thinking=False)
+    assert encoded == [(text, False)] and prompt
+    assert app._prompt_pieces() is None
+
+
+@pytest.mark.parametrize("dropout", [None, 0.0])
+def test_bpe_without_dropout_keeps_real_cache_reuse(dropout):
+    tok = Counting(tokenizer())
+    tok.model.dropout = dropout
+    assert tok.model.dropout == dropout
+    pieces = pieces_of(tok)
+    text = TURN + "hello" + END
+    assert pieces.ids(text) == full(tok.tok, text) and tok.encoded
+    tok.encoded.clear()
+    assert pieces.ids(text) == full(tok.tok, text)
+    assert tok.encoded == []
+
+
+class UnknownModelState:
+    def __init__(self, tok, state):
+        self.tok, self.state = tok, state
+
+    @property
+    def model(self):
+        if isinstance(self.state, Exception):
+            raise self.state
+        return self.state
+
+    def __getattr__(self, name):
+        return getattr(self.tok, name)
+
+
+@pytest.mark.parametrize("state", [None, object(), SimpleNamespace(dropout=None), RuntimeError("unknown model")])
+def test_unknown_model_metadata_keeps_the_normal_server_path(tmp_path, state):
+    app = server_for_tokenizer(tmp_path, metaspace_tokenizer("never"))
+    app.tok = UnknownModelState(app.tok, state)
+    messages = [{"role": "user", "content": "hello"}]
+    actual = app.prepare({"messages": messages, "max_tokens": 1}, True).prompt
+    assert actual == full(app.tok, "<s>hello")
+    assert app._prompt_pieces() is None
