@@ -33,7 +33,8 @@ def test_by_default_an_unoffered_call_stays_text(monkeypatch):
 def test_the_flag_drops_an_unoffered_call_and_logs_it(drop, capsys):
     content, calls = parse_tool_calls("Done." + _dsml("apply_patch"), TOOLS)
     assert (content, calls) == ("Done.", None)
-    assert "apply_patch" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "reason=unoffered_tool_call" in out and "apply_patch" not in out      # the log has no tool name
 
 
 def test_the_flag_keeps_the_offered_call_next_to_an_unoffered_one(drop):
@@ -94,7 +95,8 @@ def test_the_flag_drops_a_complete_glm_block(drop):
 def test_the_flag_logs_a_dropped_call_in_single_call_mode(drop, capsys):
     content, calls = parse_tool_calls("Done." + _dsml("apply_patch"), TOOLS, max_calls=1)
     assert (content, calls) == ("Done.", None)
-    assert "apply_patch" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "reason=unoffered_tool_call" in out and "apply_patch" not in out
 
 def test_without_tools_the_answer_is_unchanged_by_default(monkeypatch):
     monkeypatch.delenv("TF_DROP_UNOFFERED_TOOL_CALLS", raising=False)
@@ -105,7 +107,8 @@ def test_without_tools_the_answer_is_unchanged_by_default(monkeypatch):
 def test_without_tools_the_flag_drops_each_call_and_logs_it(drop, capsys):
     answer = "Done." + _dsml("apply_patch") + " Bye."
     assert answer_without_tools(answer, finished=True) == "Done. Bye."
-    assert "offered no tools" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "offered no tools" in out and "reason=markup_without_tools" in out and "apply_patch" not in out
 
 
 def test_without_tools_a_streamed_call_never_shows(drop, capsys):
