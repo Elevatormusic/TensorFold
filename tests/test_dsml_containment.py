@@ -187,6 +187,20 @@ class OpenBlocks(Flag):
         text = "<tool_call><function=write></function>\n" + calls(invoke("read", param("path", "a")))
         self.assertEqual(parse_tool_calls(text, TOOLS), (text, None))
 
+    def test_white_space_after_a_real_open_call_does_not_promote_nested_dsml(self):
+        nested = calls(invoke("read", param("path", "nested")))
+        for prefix in (' {"name":"write","arguments":{"text":"',
+                       ' <function=write><parameter=q>', ' write<arg_key>q<arg_value>',
+                       ' tag <arg_key>q<arg_value>'):
+            for quote in ("", '"'):
+                for suffix in ("", "</tool_call>"):
+                    text = quote + "<tool_call>" + prefix + nested + suffix
+                    content, found = parse_tool_calls(text, TOOLS)
+                    if not suffix:
+                        self.assertIsNone(found, text)
+                    self.assertNotIn("read", names(found), text)
+                    self.assertNotIn("nested", hide_tool_calls(text, finished=True))
+
 
 class NestedCalls(Flag):
     def test_a_nested_call_in_an_argument_is_argument_text(self):

@@ -94,11 +94,13 @@ def dsml_block_end(text: str, start: int) -> int:
 
 
 def _named_in_prose(text: str, start: int, end: int) -> bool:
-    """An opening tag written inline in prose (in backticks or quotes, or before a space or punctuation), not a call."""
+    """Accept a quoted tag, punctuation or an explicit tag reference; white space alone is not prose."""
 
     before = text[start - 1:start]
     after = text[end:end + 1]
-    return bool(before) and before in "`'\"" or bool(after) and after in " `'\".,;:!?)"
+    quoted = bool(before) and before in "`'\"" and after == before
+    reference = re.match(r"[ \t]+tags?\b(?!\s*[<{])", text[end:]) is not None
+    return quoted or reference or bool(after) and after in ".,;:!?)"
 
 
 def top_level_blocks(text: str, *, any_case: bool = True) -> tuple[list[Block], int]:
