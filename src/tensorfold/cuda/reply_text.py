@@ -7,11 +7,11 @@ import os
 import re
 import uuid
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, NamedTuple
 
 from tensorfold.dsml_calls import (CALL_CLOSE as _CALL_CLOSE, CALL_OPEN as _CALL_OPEN, DSML_OPEN as _DSML_OPEN,
-                                   ILL_FORMED, OPEN_DSML, OPEN_TAG, count_suppressed, parse_calls_block,
-                                   top_level_blocks)
+                                   EXTRA_CALL, ILL_FORMED, NO_TOOLS, OPEN_DSML, OPEN_TAG, UNOFFERED, UNRESOLVED,
+                                   count_suppressed, parse_calls_block, top_level_blocks)
 from tensorfold.server.stopping import StopPolicy
 from tensorfold.server.tools import parse_glm_tool_call_block
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas
@@ -25,36 +25,84 @@ _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parame
 # ``tensorfold.dsml_calls`` finds the blocks: a call is a complete, well formed block at the top level of the reply.
 
 
-def _segments(text: str, suppressed: list[tuple[str, int]]) -> Iterator[str | tuple[str, str]]:
-    """The reply as text (a plain string) and call blocks ((its markup, its JSON payload)), in order.
+class Unrun(NamedTuple):
+    """A tool-call block that did not run: removed from the reply, or kept in it as text."""
+
+    reason: str            # the label of tool_calls_suppressed_total
+    action: str            # "removed" or "kept_as_text"
+    offset: int            # character where the block begins in the reply, or -1 when the parser does not know
+    length: int            # characters of the block (an open block: through the end of the reply)
+    holds_call: bool = False    # an open block that holds a complete call
+
+
+_WHY = {
+    OPEN_DSML: "the reply ended inside a DSML calls block",
+    OPEN_TAG: "a <tool_call> tag never closed and holds a complete call",
+    ILL_FORMED: "the DSML calls block is not well formed",
+    UNOFFERED: "the call names a tool that the request did not offer",
+    UNRESOLVED: "the call has no usable name or no arguments as a JSON object",
+    EXTRA_CALL: "the request allows one call and the reply made more",
+    NO_TOOLS: "the request offered no tools",
+}
+_VERB = {"removed": "was removed from the reply", "kept_as_text": "was kept in the reply as text"}
+_MAX_LINES = 5                    # lines for one reply; the rest are counted and summed in one more line
+
+
+def report_unrun(events: list[Unrun], request_id: str = "") -> None:
+    """Count each block that did not run and print one ``WARNING`` line for it. A line holds the request id, the
+    action, the reason, the length and the place, and nothing from the reply: no text of a block, no tool name, no
+    argument."""
+
+    if not events:
+        return
+    count_suppressed(event.reason for event in events)
+    who = request_id or "req-?"
+    for event in events[:_MAX_LINES]:
+        where = f", at character {event.offset}" if event.offset >= 0 else ""
+        holds = ", it holds a complete call" if event.holds_call else ""
+        print(f"[tensorfold] WARNING: {who} a tool call block {_VERB[event.action]} and did not run: "
+              f"reason={event.reason} ({_WHY[event.reason]}), length={event.length} characters{where}{holds}",
+              flush=True)
+    if len(events) > _MAX_LINES:
+        print(f"[tensorfold] WARNING: {who} {len(events) - _MAX_LINES} more tool call blocks did not run "
+              f"in this reply", flush=True)
+
+
+def _segments(text: str, suppressed: list[Unrun]) -> Iterator[str | tuple[str, str, tuple[int, int]]]:
+    """The reply as text (a plain string) and call blocks ((its markup, its JSON payload, its place in the reply)), in
+    order. The place is the start and end of the block in ``text``; all invokes of one DSML block share it.
 
     A DSML invoke becomes the payload of a ``<tool_call>`` block. Only blocks at the top level are calls: an open
     ``<tool_call>`` block, a block that is not well formed and everything inside a block stay text or argument text.
     An open DSML calls block (the reply ended inside it) is removed with everything after it: it is not a call, and
-    the stream hides it too. A block that keeps a later call as text adds (reason, character offset) to
-    ``suppressed``."""
+    the stream hides it too. Each block that did not run adds an ``Unrun`` to ``suppressed``: every open DSML block,
+    an open ``<tool_call>`` tag only when it holds a complete block, and every closed DSML block that is not well
+    formed."""
 
     blocks, open_at = top_level_blocks(text)
     dsml_open = open_at >= 0 and text.startswith(_DSML_OPEN, open_at)
     if open_at >= 0:
         opener = _DSML_OPEN if dsml_open else _CALL_OPEN
-        if top_level_blocks(text[open_at + len(opener):])[0]:        # a complete block that the open one holds
-            suppressed.append((OPEN_DSML if dsml_open else OPEN_TAG, open_at))
+        holds = bool(top_level_blocks(text[open_at + len(opener):])[0])     # a complete block that the open one holds
+        if dsml_open:
+            suppressed.append(Unrun(OPEN_DSML, "removed", open_at, len(text) - open_at, holds))
+        elif holds:                 # a lone <tool_call> tag is text, as the model wrote it: told only with a call in it
+            suppressed.append(Unrun(OPEN_TAG, "kept_as_text", open_at, len(text) - open_at, True))
     cursor = 0
     for block in blocks:
         yield text[cursor:block.start]
         cursor = block.end
         if block.kind == "tag":
-            yield text[block.start:block.end], block.inner.strip()
+            yield text[block.start:block.end], block.inner.strip(), (block.start, block.end)
             continue
         invokes = parse_calls_block(block.inner)
         if invokes is None:
-            suppressed.append((ILL_FORMED, block.start))
+            suppressed.append(Unrun(ILL_FORMED, "kept_as_text", block.start, block.end - block.start))
             yield text[block.start:block.end]
             continue
         for name, args in invokes:
             payload = json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
-            yield _CALL_OPEN + payload + _CALL_CLOSE, payload
+            yield _CALL_OPEN + payload + _CALL_CLOSE, payload, (block.start, block.end)
     yield text[cursor:open_at] if dsml_open else text[cursor:]
 
 
@@ -124,26 +172,28 @@ def drop_unoffered_calls() -> bool:
     return os.environ.get("TF_DROP_UNOFFERED_TOOL_CALLS", "0") == "1"
 
 
-def keep_unoffered_call(text: str, name: Any) -> str:
+def keep_unoffered_call(text: str) -> str:
     """The content kept for a parsed call to a tool the request did not offer: its text, or nothing with the flag."""
 
-    if not drop_unoffered_calls():
-        return text
-    print(f"[tensorfold] dropped a call to a tool the request did not offer: {str(name)[:80]!r}", flush=True)
-    return ""
+    return "" if drop_unoffered_calls() else text
 
 
-def answer_without_tools(answer: str, *, finished: bool) -> str:
+def answer_without_tools(answer: str, *, finished: bool, request_id: str = "") -> str:
     """The answer of a request that offers no tools: as it is, or with the flag, without its tool-call blocks (each
     call is unoffered). While streaming, a block that has begun waits until it ends, as with tools. The finished
-    answer logs that blocks were dropped."""
+    answer logs and counts each block that was removed."""
 
     if not drop_unoffered_calls():
         return answer
     # the parser finds tags in any case, and keeps a block that is not well formed as text
     shown = hide_tool_calls(answer, finished=finished, any_case=True, keep_ill_formed=True)
     if finished and shown != answer:
-        print("[tensorfold] dropped tool-call markup from a request that offered no tools", flush=True)
+        blocks, open_at = top_level_blocks(answer, any_case=True)
+        removed = [Unrun(NO_TOOLS, "removed", b.start, b.end - b.start) for b in blocks
+                   if not (b.kind == "dsml" and parse_calls_block(b.inner) is None)]
+        if open_at >= 0:
+            removed.append(Unrun(NO_TOOLS, "removed", open_at, len(answer) - open_at))
+        report_unrun(removed, request_id)
     return shown
 
 
@@ -189,7 +239,8 @@ def _tool_name(tool: dict[str, Any]) -> str:
     return str((fn or tool).get("name") or "").strip() if isinstance(tool, dict) else ""
 
 
-def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
+def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None,
+                     request_id: str = "") -> tuple[str, list[dict[str, Any]] | None]:
     """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..`` or JSON calls."""
 
     if not tools:
@@ -198,14 +249,15 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []
     residue: list[str] = []
-    suppressed: list[tuple[str, int]] = []
+    suppressed: list[Unrun] = []
     for segment in _segments(text, suppressed):
         if isinstance(segment, str):
             residue.append(segment)
             continue
-        markup, block = segment
-        if max_calls is not None and len(calls) >= max_calls:
-            continue
+        markup, block, (start, end) = segment
+
+        def unrun(reason: str, action: str = "removed") -> Unrun:
+            return Unrun(reason, action, start, end - start)
         name, args = None, {}
         parsed = False                                  # the whole payload parsed, not only its name
         try:
@@ -222,6 +274,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
             m = _TOOL_FUNCTION_BLOCK_RE.match(block)
             if m:
                 if max_calls is not None and _TOOL_PARAMETER_BLOCK_RE.sub("", m.group(2)).strip():
+                    suppressed.append(unrun(UNRESOLVED))
                     continue
                 name = m.group(1).strip()
                 # typed parameters (array, object, number...) decode per the tool's schema, as the Mac server does
@@ -237,26 +290,30 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
                     # no text outside the arguments, as the complete parser requires
                     parsed = parse_glm_tool_call_block(block, tools, complete=True) is not None
         if not name or str(name).lower() not in known:
+            whole = bool(name and parsed)                # a whole call to a tool that is not offered
             if max_calls is None:
-                residue.append(keep_unoffered_call(markup, name) if name and parsed else markup)
-            elif name and parsed and drop_unoffered_calls():
-                keep_unoffered_call(markup, name)    # single-call mode removes the block anyway: log it
+                kept = keep_unoffered_call(markup) if whole else markup
+                residue.append(kept)
+                action = "kept_as_text" if kept else "removed"
+            else:
+                action = "removed"                       # single-call mode removes the block anyway
+            suppressed.append(unrun(UNOFFERED if whole else UNRESOLVED, action))
             continue
         if max_calls is not None:
             try:
                 if not isinstance(args, dict):
-                    continue
+                    raise ValueError("the arguments are not an object")
                 json.dumps(args, allow_nan=False)
             except (ValueError, TypeError):
+                suppressed.append(unrun(UNRESOLVED))
+                continue
+            if len(calls) >= max_calls:                  # a good call after the one that the request allows
+                suppressed.append(unrun(EXTRA_CALL))
                 continue
         calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
                       "function": {"name": known[str(name).lower()],
                                    "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}})
-    if suppressed:
-        reason, offset = min(suppressed, key=lambda found: found[1])
-        count_suppressed({reason for reason, _ in suppressed})
-        print(f"[tensorfold] WARNING: a tool call was kept as text: {reason} at character {offset} of the reply "
-              f"({len(suppressed)} such block{'s' if len(suppressed) > 1 else ''})", flush=True)
+    report_unrun(suppressed, request_id)
     return "".join(residue).strip(), calls or None
 
 
