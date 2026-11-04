@@ -17,7 +17,8 @@ DSML_OPEN, DSML_CLOSE = f"<{DSML} calls>", f"</{DSML} calls>"
 _INVOKE_RE = re.compile(rf'<{re.escape(DSML)} invoke name="([^"]+)">')
 _PARAM_RE = re.compile(rf'<{re.escape(DSML)} parameter name="([^"]+)"(?: string="(true|false)")?>')
 _SPACE_RE = re.compile(r"\s*")
-_PROSE_TAG_RE = re.compile(r"[ \t]+tags?(?![\w.:-])(?!\s*[<{])")
+# A following prose word proves a reference; an unfinished name or parameter tag does not.
+_PROSE_TAG_RE = re.compile(r"[ \t]+tags?(?![\w.:-])(?=[ \t]+[^\W\d_])")
 
 
 def _pair(open_tag: str, close_tag: str, flags: int = 0) -> tuple[re.Pattern, re.Pattern]:
@@ -129,8 +130,8 @@ def top_level_blocks(text: str, *, any_case: bool = True) -> tuple[list[Block], 
         if tag is None and dsml < 0:
             return blocks, -1
         if tag is not None and (dsml < 0 or tag.start() < dsml):
-            if dsml >= 0 and _named_in_prose(text, tag.start(), tag.end()):
-                # A literal tag reference cannot take a closing tag from the following DSML arguments.
+            if _named_in_prose(text, tag.start(), tag.end()):
+                # A literal tag reference cannot take a closing tag from later reply text.
                 pos = tag.end()
                 continue
             closer = _close_of(text, tag.end(), tag_tags)
