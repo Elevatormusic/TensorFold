@@ -74,6 +74,14 @@ CUDA `--parallel auto` serves one request at a time. To share rounds, set `--par
 one for Qwen3.8-27B or Flash Next on one or two ranks. Pass the same N on both ranks.
 GLM and Nemotron CUDA keep serial request scheduling.
 
+DeepSeek-V4.1 vision uses text placeholders by default. This mode supports templates that accept the
+server's image placeholder in text. For an image-aware template, such as the official DeepSeek template,
+set `TF_DS_VISION_TEMPLATE=native` in the server environment before startup. This mode passes decoded
+image blocks to the template. The template must emit exactly one image token per image. Set
+`TF_DS_VISION_TEMPLATE=placeholder` to select the default explicitly. Other values stop startup.
+This setting is a server option. A request cannot change it. Both modes reject client image placeholders
+and keep special-token spellings in client text as plain text.
+
 For two ranks, start a container on each host with network devices and locked-memory support:
 
 ```bash

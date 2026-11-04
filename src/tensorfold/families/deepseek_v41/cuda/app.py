@@ -5,6 +5,7 @@ numeric effort."""
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import Any, Callable
 
 from tensorfold.cuda.server import App, PreparedRequest
@@ -29,6 +30,10 @@ class DsApp(App):
     plain_assistant_keep = GROUNDING
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        image_template = os.environ.get("TF_DS_VISION_TEMPLATE", "placeholder")
+        if image_template not in ("placeholder", "native"):
+            raise ValueError("TF_DS_VISION_TEMPLATE must be placeholder or native")
+        self.native_image_template = image_template == "native"
         super().__init__(*args, **kwargs)
         # --vision-max-images: images take DsVision.split's path, not the shared image limits, so its own count
         # check gets the server's value (DsVision's default is 8)
@@ -76,8 +81,7 @@ class DsApp(App):
         return super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
 
     def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
-        """A chat with image_url parts (user turns and tool results): each image becomes DeepSeek's placeholder
-        block, the prompt renders as text, and each placeholder token grows into the image's span."""
+        """Decode image parts, render the selected template format, then expand each image token."""
 
         body = self._response_format(body, chat)
         vision = getattr(self.engine, "vision", None)
@@ -85,13 +89,15 @@ class DsApp(App):
         if vision is None or not isinstance(messages, list) or not vision.has_images(messages):
             return super()._prepare(body, chat)
         try:
-            text_messages, pictures = vision.split(messages)
+            native = self.native_image_template
+            text_messages, pictures = (vision.split(messages, native=True) if native else vision.split(messages))
         except (ValueError, OSError) as exc:
             raise RequestError(f"image input: {exc}") from exc
         from .vision import PLACEHOLDER
 
-        # split refused every placeholder that the client wrote, so each one left in content is the server's own
-        prepared = super()._prepare({**body, "messages": text_messages}, chat, plain_keep=(PLACEHOLDER,))
+        # split rejects client placeholders in both modes. Native templates write their own image tokens.
+        options = {"template_images": True} if native else {"plain_keep": (PLACEHOLDER,)}
+        prepared = super()._prepare({**body, "messages": text_messages}, chat, **options)
         try:
             vp = vision.expand(prepared.prompt, pictures)
         except ValueError as exc:
