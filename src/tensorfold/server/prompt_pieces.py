@@ -1,12 +1,12 @@
 """Token ids of re-sent chat prompts: each piece between added tokens is encoded once, then reused.
 
-A tokenizer splits its input at the added tokens it matches before normalization and encodes each part on its own, so
-a piece that ends in one encodes alone to the ids it gets inside the whole text. A chat client re-sends its whole
-conversation every turn; only the pieces it has not sent before need the tokenizer.
+Use pieces only when the pre-tokenizer does not depend on the original input position. A chat client re-sends its
+whole conversation every turn; only the pieces it has not sent before need the tokenizer.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from array import array
@@ -14,6 +14,31 @@ from collections import OrderedDict
 from typing import Any
 
 BUDGET = 1 << 21        # cache units: token IDs, text characters and 64 units per entry
+
+
+def _local_pre_tokenizer(state: Any) -> bool:
+    """Refuse pre-tokenizers that need the original offset or whose state is unknown."""
+
+    if not isinstance(state, dict):
+        return False
+    kind = state.get("type")
+    if kind == "Sequence":
+        children = state.get("pretokenizers")
+        return isinstance(children, list) and all(_local_pre_tokenizer(child) for child in children)
+    if kind == "Metaspace":
+        return state.get("prepend_scheme") in ("always", "never")
+    return isinstance(kind, str) and kind in {
+        "BertPreTokenizer", "ByteLevel", "CharDelimiterSplit", "Digits", "FixedLength", "Punctuation", "Split",
+        "UnicodeScripts", "Whitespace", "WhitespaceSplit",
+    }
+
+
+def _has_local_pre_tokenizer(tok: Any) -> bool:
+    try:
+        pre = tok.pre_tokenizer
+        return pre is None or _local_pre_tokenizer(json.loads(pre.__getstate__()))
+    except Exception:  # noqa: BLE001  custom state can refuse serialization; use the whole-input path then
+        return False
 
 
 class PromptPieces:
@@ -35,6 +60,8 @@ class PromptPieces:
         if getattr(tok, "padding", None) is not None or getattr(tok, "truncation", None) is not None:
             return None                              # these options apply to the whole input, not each piece
         if getattr(tok, "encode_special_tokens", False):        # special tokens are encoded as text, not split out
+            return None
+        if not _has_local_pre_tokenizer(tok):
             return None
         first = [token for token in tok.get_added_tokens_decoder().values() if not token.normalized]
         # rstrip takes the spaces after a token into its match, and single_word skips a match inside a word

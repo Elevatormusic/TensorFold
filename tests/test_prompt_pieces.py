@@ -41,6 +41,10 @@ class Counting:
     def get_added_tokens_decoder(self):
         return self.tok.get_added_tokens_decoder()
 
+    @property
+    def pre_tokenizer(self):
+        return self.tok.pre_tokenizer
+
     def encode_batch(self, texts, add_special_tokens=False):
         self.encoded += texts
         return self.tok.encode_batch(texts, add_special_tokens=add_special_tokens)
@@ -170,3 +174,105 @@ def test_the_cuda_server_encodes_chat_prompts_through_its_pieces(tmp_path):
         messages += [{"role": "assistant", "content": f"answer {turn}"}, {"role": "user", "content": f"more {turn}"}]
     pieces = app._prompt_pieces()
     assert pieces is not None and "def call(x): return 12 * x" + END in pieces._kept
+
+
+def metaspace_tokenizer(scheme="first", nested=False):
+    tok = Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1, "▁hello": 2, "and": 3, "▁and": 4},
+                                     unk_token="[UNK]"))
+    tok.add_tokens([AddedToken("<s>", normalized=False)])
+    state = {"type": "Metaspace", "replacement": "▁", "prepend_scheme": scheme, "split": True}
+    if nested:
+        state = {"type": "Sequence", "pretokenizers": [
+            {"type": "WhitespaceSplit"}, {"type": "Sequence", "pretokenizers": [state]}]}
+    document = json.loads(tok.to_str())
+    document["pre_tokenizer"] = state
+    tok = Tokenizer.from_str(json.dumps(document))
+    if nested:
+        assert json.loads(tok.pre_tokenizer.__getstate__())["pretokenizers"][1]["type"] == "Sequence"
+    return tok
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested-sequence"])
+def test_position_sensitive_metaspace_keeps_whole_input_ids(nested):
+    tok = metaspace_tokenizer(nested=nested)
+    assert full(tok, "<s>hello") != full(tok, "<s>") + full(tok, "hello")
+    pieces = PromptPieces.of(tok)
+    for text in ("<s>hello", "<s>and<s>hello", "hello<s>hello"):
+        actual = full(tok, text) if pieces is None else pieces.ids(text)
+        assert actual == full(tok, text)
+    assert pieces is None
+
+
+def server_for_tokenizer(tmp_path, tok):
+    pytest.importorskip("jinja2")
+    from tensorfold.cuda.server import App
+
+    tok.save(str(tmp_path / "tokenizer.json"))
+    template = "{% for m in messages %}<s>{{ m.content }}{% endfor %}"
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": template}))
+    return App(SimpleNamespace(eos=(0,)), tmp_path, "test")
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "nested-sequence"])
+def test_the_server_falls_back_for_position_sensitive_metaspace(tmp_path, nested):
+    app = server_for_tokenizer(tmp_path, metaspace_tokenizer(nested=nested))
+    messages = [{"role": "user", "content": "hello"}]
+    for _ in range(2):
+        actual = app.prepare({"messages": messages, "max_tokens": 1}, True).prompt
+        text = app.template.render(messages, tools=None, enable_thinking=False)
+        assert actual == full(app.tok, text)
+        assert app._prompt_pieces() is None
+        messages += [{"role": "assistant", "content": "and"}, {"role": "user", "content": "hello"}]
+
+
+@pytest.mark.parametrize("scheme", ["always", "never"])
+def test_position_independent_metaspace_keeps_real_cache_reuse(scheme):
+    tok = Counting(metaspace_tokenizer(scheme))
+    pieces = pieces_of(tok)
+    text = "<s>hello<s>and<s>hello"
+    assert pieces.ids(text) == full(tok.tok, text)
+    assert tok.encoded
+    tok.encoded.clear()
+    assert pieces.ids(text) == full(tok.tok, text)
+    assert tok.encoded == []
+
+
+class UnknownPreTokenizer:
+    def __init__(self, state):
+        self.state = state
+
+    def __getstate__(self):
+        if isinstance(self.state, Exception):
+            raise self.state
+        return self.state
+
+
+class UnknownPreState:
+    def __init__(self, tok, state):
+        self.tok = tok
+        self.pre_tokenizer = UnknownPreTokenizer(state)
+
+    def __getattr__(self, name):
+        return getattr(self.tok, name)
+
+
+@pytest.mark.parametrize("state", [b"not json", b"[]", b'{}', b'{"type":"FuturePreTokenizer"}',
+                                    b'{"type":"Sequence"}', None, RuntimeError("custom state is not serializable")])
+def test_unknown_pre_tokenizer_state_keeps_the_normal_server_path(tmp_path, state):
+    app = server_for_tokenizer(tmp_path, metaspace_tokenizer("never"))
+    app.tok = UnknownPreState(app.tok, state)
+    messages = [{"role": "user", "content": "hello"}]
+    actual = app.prepare({"messages": messages, "max_tokens": 1}, True).prompt
+    assert actual == full(app.tok, "<s>hello")
+    assert app._prompt_pieces() is None
+
+
+def test_a_real_custom_pre_tokenizer_can_encode_without_enabling_pieces():
+    class Custom:
+        def pre_tokenize(self, text):
+            pass
+
+    tok = metaspace_tokenizer("never")
+    tok.pre_tokenizer = pre_tokenizers.PreTokenizer.custom(Custom())
+    assert PromptPieces.of(tok) is None
+    assert full(tok, "<s>hello") == [tok.token_to_id("<s>"), tok.token_to_id("hello")]
