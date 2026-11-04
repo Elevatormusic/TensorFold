@@ -104,6 +104,28 @@ def test_the_pieces_kept_stay_within_the_budget():
         assert pieces._held <= 50 and pieces._held == sum(len(ids) for ids in pieces._kept.values())
 
 
+def test_text_that_encodes_to_no_tokens_stays_within_the_budget():
+    tok = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tok.normalizer = normalizers.Strip()
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok.add_tokens([AddedToken(MARK, normalized=False)])
+    pieces = pieces_of(tok, budget=256)
+    for n in range(1, 100):
+        text = MARK + " " * n
+        assert pieces.ids(text) == full(tok, text)
+        assert pieces._used <= 256
+        assert pieces._used == sum(len(piece) + len(ids) + 64 for piece, ids in pieces._kept.items())
+    assert len(pieces._kept) < 4
+
+
+def test_text_larger_than_the_cache_budget_is_not_kept():
+    tok = tokenizer()
+    pieces = pieces_of(tok, budget=128)
+    text = " " * 1000 + TURN
+    assert pieces.ids(text) == full(tok, text)
+    assert text not in pieces._kept
+
+
 def test_the_cuda_server_encodes_chat_prompts_through_its_pieces(tmp_path):
     pytest.importorskip("jinja2")
     from tensorfold.cuda.server import App

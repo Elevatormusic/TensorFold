@@ -13,7 +13,7 @@ from array import array
 from collections import OrderedDict
 from typing import Any
 
-BUDGET = 1 << 21        # tokens kept across all pieces (4 bytes each, plus the pieces' text)
+BUDGET = 1 << 21        # cache units: token IDs, text characters and 64 units per entry
 
 
 class PromptPieces:
@@ -23,6 +23,7 @@ class PromptPieces:
         self._tok, self._cut, self._budget = tok, cut, budget
         self._kept: OrderedDict[str, array] = OrderedDict()      # least recently used first
         self._held = 0
+        self._used = 0
         self._lock = threading.Lock()
 
     @classmethod
@@ -65,8 +66,12 @@ class PromptPieces:
     def _keep(self, new: dict[str, array]) -> None:
         with self._lock:
             for piece, ids in new.items():
-                if piece not in self._kept and len(ids) <= self._budget:
+                cost = len(ids) + len(piece) + 64
+                if piece not in self._kept and cost <= self._budget:
                     self._kept[piece] = ids
                     self._held += len(ids)
-            while self._held > self._budget:
-                self._held -= len(self._kept.popitem(last=False)[1])
+                    self._used += cost
+            while self._used > self._budget:
+                piece, ids = self._kept.popitem(last=False)
+                self._held -= len(ids)
+                self._used -= len(ids) + len(piece) + 64
