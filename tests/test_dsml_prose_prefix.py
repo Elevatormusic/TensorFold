@@ -53,7 +53,7 @@ def test_prose_and_argument_closer_stream_like_the_whole_reply_at_every_cut(tmp_
                 "temperature": 0, "parallel_tool_calls": parallel}
         whole = app.run(body, True, lambda delta: True)
         deltas = []
-        streamed = app.run({**body, "stream": True}, True, lambda delta: deltas.append(delta) or True)
+        streamed = app.run({**body, "stream": True}, True, lambda delta, target=deltas: target.append(delta) or True)
         content = "".join(delta.get("content", "") for delta in deltas) + streamed["final"].get("content", "")
         assert content == whole["content"], (prose, parallel, cut)
         assert streamed["finish"] == whole["finish"], cut
@@ -143,7 +143,7 @@ def assert_every_cut(tmp_path, reply, parallel, expected_content, expected_calls
                 "parallel_tool_calls": parallel}
         whole = app.run(body, True, lambda delta: True)
         deltas = []
-        streamed = app.run({**body, "stream": True}, True, lambda delta: deltas.append(delta) or True)
+        streamed = app.run({**body, "stream": True}, True, lambda delta, target=deltas: target.append(delta) or True)
         content = "".join(delta.get("content", "") for delta in deltas) + streamed["final"].get("content", "")
         assert content == whole["content"], (parallel, cut)
         assert streamed["finish"] == whole["finish"], cut
