@@ -90,6 +90,16 @@ def test_special_tokens_encoded_as_text_get_no_pieces():
     assert PromptPieces.of(tok) is None
 
 
+@pytest.mark.parametrize("option", ["padding", "truncation"])
+def test_whole_input_padding_or_truncation_gets_no_pieces(option):
+    tok = tokenizer()
+    if option == "padding":
+        tok.enable_padding(length=32)
+    else:
+        tok.enable_truncation(max_length=4)
+    assert PromptPieces.of(tok) is None
+
+
 def test_a_tokenizer_without_added_tokens_or_batches_gets_no_pieces():
     assert PromptPieces.of(Tokenizer(models.BPE())) is None
     assert PromptPieces.of(object()) is None

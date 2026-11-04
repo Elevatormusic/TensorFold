@@ -32,6 +32,8 @@ class PromptPieces:
 
         if not all(callable(getattr(tok, name, None)) for name in ("encode_batch", "get_added_tokens_decoder")):
             return None
+        if getattr(tok, "padding", None) is not None or getattr(tok, "truncation", None) is not None:
+            return None                              # these options apply to the whole input, not each piece
         if getattr(tok, "encode_special_tokens", False):        # special tokens are encoded as text, not split out
             return None
         first = [token for token in tok.get_added_tokens_decoder().values() if not token.normalized]
