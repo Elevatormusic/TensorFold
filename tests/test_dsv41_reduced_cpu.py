@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
 import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -181,3 +182,51 @@ def test_nccl_wrapper_rejects_bad_count_or_dtype_before_launch(receive):
     comm.world = 2
     with pytest.raises(ValueError, match="send must hold world"):
         comm.reduce_scatter(torch.arange(12, dtype=torch.float32), receive)
+
+
+@pytest.mark.parametrize("switches", [(False, False), (True, True), (False, True)])
+def test_startup_agrees_reducer_mode_before_warmup(monkeypatch, switches):
+    source = ROOT / "src/tensorfold/families/deepseek_v41/cuda/engine.py"
+    tree = ast.parse(source.read_text())
+    engine = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Engine")
+    init = next(node for node in engine.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    packet = next(node for node in init.body if isinstance(node, ast.If)
+                  and ast.unparse(node.test) == "nccl is not None")
+    warm = next(node for node in init.body if isinstance(node, ast.If) and ast.unparse(node.test) == "WARM")
+    assert init.body.index(packet) < init.body.index(warm)
+    wrapper = ast.parse("def agree(self, nccl, parallel, world):\n    pass\n")
+    wrapper.body[0].body = [packet]
+    markov = ModuleType("tensorfold.families.deepseek_v41.cuda.markov")
+    markov.ON, markov.SPLIT = True, True
+    monkeypatch.setitem(sys.modules, markov.__name__, markov)
+    cpu_torch = SimpleNamespace(int64=torch.int64,
+        tensor=lambda values, **kwargs: torch.tensor(values, dtype=kwargs["dtype"]),
+        empty=lambda shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]))
+    link, errors, warmed = Link(), [], []
+
+    class Flags(Rank):
+        def barrier(self):
+            self.link.barrier.wait()
+
+    def start(rank):
+        namespace = {"__package__": "tensorfold.families.deepseek_v41.cuda", "torch": cpu_torch,
+                     "RS": switches[rank]}
+        try:
+            exec(compile(wrapper, str(source), "exec"), namespace)
+            namespace["agree"](SimpleNamespace(vcfg=None), Flags(link, rank), 4, 2)
+            warmed.append(rank)
+        except BaseException as error:
+            errors.append(error)
+            link.barrier.abort()
+
+    threads = [threading.Thread(target=start, args=(rank,), daemon=True) for rank in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not any(thread.is_alive() for thread in threads)
+    if switches[0] == switches[1]:
+        assert errors == [] and sorted(warmed) == [0, 1]
+    else:
+        assert warmed == [] and len(errors) == 2
+        assert all(isinstance(error, ValueError) and "TF_DS_RS" in str(error) for error in errors)
