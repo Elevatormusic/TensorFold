@@ -112,6 +112,15 @@ def test_folding_refuses_finite_input_that_overflows_the_float32_table():
         lp.fold_rotated(a, suh)
 
 
+def test_folding_keeps_large_finite_factors_that_fit_the_float32_table():
+    a = np.zeros((1, 128), dtype=np.float32)
+    a[0, 0] = np.finfo(np.float32).max
+    folded = lp.fold_rotated(a, np.ones(128, dtype=np.float32))
+    expected = np.float32(float(a[0, 0]) / np.sqrt(128.0))
+    assert np.isfinite(folded).all() and expected > np.finfo(np.float32).max / 16
+    np.testing.assert_array_equal(folded, np.full_like(a, expected))
+
+
 def test_only_the_shared_expert_reads_a_rotated_input_and_the_factors_must_fit():
     f = make(lf.WO_B, 2)
     with pytest.raises(ValueError, match="only the packed shared expert"):
