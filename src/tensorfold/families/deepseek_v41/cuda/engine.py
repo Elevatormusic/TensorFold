@@ -538,13 +538,33 @@ class DsEngine:
                      if use_drafts else ""), flush=True)
         return stats
 
+    def _emit_tokens(self, on_tokens, tokens) -> bool:
+        """Share rank 0's stop decision before any rank starts the next decode round."""
+
+        error = None
+        stop = False
+        if self.rank == 0:
+            try:
+                stop = bool(on_tokens(tokens))
+            except BaseException as exc:
+                # Workers must leave the round before rank 0 reports a callback error.
+                stop, error = True, exc
+        if self.world > 1:
+            mine = torch.tensor([int(stop)], dtype=torch.int64, device="cuda")
+            every = torch.empty((self.world,), dtype=torch.int64, device="cuda")
+            self.nccl.all_gather(mine, every)
+            stop = bool(every[0].item())
+        if error is not None:
+            raise error
+        return stop
+
     def _serial(self, sc, first, max_tokens, sampling, eos, on_tokens, constraint=None) -> list[int]:
         from . import constrain
 
         out = [first]
-        on_tokens([first])
+        stop = self._emit_tokens(on_tokens, [first])
         tok = first
-        while len(out) < max_tokens and tok not in eos and not constrain.ended(constraint):
+        while not stop and len(out) < max_tokens and tok not in eos and not constrain.ended(constraint):
             p = sc.length
             if self.runner is not None:
                 lg, _ = self.runner.forward(sc, [tok], p, False)
@@ -554,7 +574,7 @@ class DsEngine:
             tok = self._sample(lg, [p + 1], sampling)[0]
             constrain.advance(constraint, [tok])
             out.append(tok)
-            on_tokens([tok])
+            stop = self._emit_tokens(on_tokens, [tok])
         return out
 
     def _choose_k(self, conf, kmax: int, draft_ms: float) -> int:
@@ -585,11 +605,11 @@ class DsEngine:
 
         m, d = self.model, self.drafter
         out = [first]
-        on_tokens([first])
+        stop = self._emit_tokens(on_tokens, [first])
         tok = first
         rounds = drafted = accepted = 0
         t_draft = t_verify = t_absorb = 0.0
-        while len(out) < max_tokens and tok not in eos and not constrain.ended(constraint):
+        while not stop and len(out) < max_tokens and tok not in eos and not constrain.ended(constraint):
             P = sc.length
             ta = time.perf_counter()
             if self.runner is not None:
@@ -635,7 +655,7 @@ class DsEngine:
             new = new[:max_tokens - len(out)]
             constrain.advance(constraint, new)
             out += new
-            on_tokens(new)
+            stop = self._emit_tokens(on_tokens, new)
             tok = out[-1]
         self.last_spec_times = {"draft_ms": 1000 * t_draft / max(rounds, 1), "verify_ms": 1000 * t_verify / max(rounds, 1),
                                 "absorb_ms": 1000 * t_absorb / max(rounds, 1)}

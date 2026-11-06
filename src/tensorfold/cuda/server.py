@@ -18,6 +18,7 @@ from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.plain_text import PlainText
 from tensorfold.server.probabilities import TokenBytes, probability_options
+from tensorfold.server.prompt_pieces import PromptPieces
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
 from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
@@ -117,6 +118,15 @@ class App:
             if made is None:
                 made = self.__dict__["_plain_text_made"] = PlainText(
                     self.tok, assistant_keep=self.plain_assistant_keep)
+            return made
+
+    def _prompt_pieces(self) -> PromptPieces | None:
+        """The chat prompts' encoded pieces, made once; None for a tokenizer they cannot follow."""
+
+        with _MADE:
+            made = self.__dict__.get("_prompt_pieces_made")
+            if made is None:
+                made = self.__dict__["_prompt_pieces_made"] = PromptPieces.of(self.tok)
             return made
 
     @property
@@ -250,8 +260,12 @@ class App:
                     raise RequestError(f"{name} must be an integer token count") from exc
         return max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens))
 
-    def _prepare(self, body: dict[str, Any], chat: bool, plain_keep: tuple[str, ...] = ()) -> PreparedRequest:
-        """``plain_keep``: spellings that the server itself wrote into this request's message content."""
+    def _prepare(self, body: dict[str, Any], chat: bool, plain_keep: tuple[str, ...] = (), *,
+                 template_images: bool = False) -> PreparedRequest:
+        """``plain_keep`` keeps server token spellings. ``template_images`` accepts decoded image blocks.
+
+        Only a family image decoder can set ``template_images``. Request fields cannot set it.
+        """
 
         from jinja2.exceptions import TemplateError
 
@@ -301,7 +315,7 @@ class App:
                 except TemplateError as exc:     # the checkpoint's template refuses the request (``raise_exception``)
                     raise RequestError(f"the chat template rejected the request: {exc}") from exc
 
-            if has_images(body["messages"]):
+            if has_images(body["messages"]) and not template_images:
                 rendered = prepare_images(self.vision, body["messages"],
                                           lambda messages: render(messages, allow_images=True),
                                           context_limit=self._context_limit(),
@@ -311,18 +325,22 @@ class App:
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             plain = self._plain_text()
             # the shield sees the messages as the template gets them: a JSON escape or a split text part hides nothing
-            shield = plain.shield(self.template.prepared(body["messages"]), tools, kwargs,
+            messages = (self.template.prepared(body["messages"], allow_images=True) if template_images
+                        else self.template.prepared(body["messages"])) if plain else None
+            shield = plain.shield(messages, tools, kwargs,
                                   content_keep=plain_keep) if plain else None
             if shield is not None and (shield.table or plain.normalizes):    # a spelling in the request's text: plain text, not a token
                 try:
+                    images = {"allow_images": True} if template_images else {}
                     text = self.template.render(shield.messages, tools=shield.tools, enable_thinking=thinking,
-                                                extra=shield.extra)
+                                                extra=shield.extra, **images)
                 except TemplateError as exc:
                     raise RequestError(f"the chat template rejected the request: {shield.spelled(str(exc))}") from exc
                 prompt = plain.encode(text, shield)
             else:
-                text = render(body["messages"])
-                prompt = self._encode(text, False)
+                text = render(body["messages"], **({"allow_images": True} if template_images else {}))
+                pieces = self._prompt_pieces()
+                prompt = self._encode(text, False) if pieces is None else pieces.ids(text)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
