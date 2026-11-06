@@ -500,7 +500,7 @@ class MultiDecoder:
                                   graph_pool=engine.runner.pool if graphs and engine.runner.pool is not None else None)
         self.eos = tuple(engine.eos)
         self.streams: dict[int, Stream] = {}           # decoding (and just ended) streams
-        self.filling: list[Stream] = []                 # admitted, their prompts filling their slots (oldest first)
+        self.filling: list[Stream] = []                 # admitted prompts, in next-chunk order
         self.chunk_s, self.since_fill = 0.0, 0.0        # the last prompt chunk's time; decoding since then
         self.gate_log = 0.0                             # (the admission gate's last log line)
         self.slack0: int | None = None                  # torch's free bytes that no trim gives back (see ``_slack``)
@@ -1071,7 +1071,9 @@ class MultiDecoder:
             self._step(False)
 
     def _quick(self, s: Stream) -> bool:
-        return len(s.prompt) - s.filled <= QUICK_ROWS
+        from .engine import PREFILL_CHUNK
+
+        return len(s.prompt) - s.filled <= min(QUICK_ROWS, PREFILL_CHUNK)
 
     def _fill(self, s: Stream) -> list[Stream]:
         """One chunk of a filling stream's prompt; at its last one its first token, and it decodes from the next
@@ -1092,6 +1094,9 @@ class MultiDecoder:
             self.chunk_s, self.since_fill = dt, 0.0
             self.round_end = None                      # (ROUND_STATS: a fill is not host time between rounds)
             if last is None:
+                # Every rank rotates after the same chunk, so the next prompt can make progress.
+                self.filling.remove(s)
+                self.filling.append(s)
                 return []
             self.filling.remove(s)
             s.steps = None

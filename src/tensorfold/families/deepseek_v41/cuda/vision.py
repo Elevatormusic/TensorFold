@@ -295,9 +295,10 @@ class DsVision:
                    and any(isinstance(p, dict) and p.get("type") in ("image_url", "image") for p in m["content"])
                    for m in messages or [])
 
-    def split(self, messages: list) -> tuple[list, list[Picture]]:
+    def split(self, messages: list, *, native: bool = False) -> tuple[list, list[Picture]]:
         """Messages with every image part replaced by the placeholder (content as one string, DeepSeek's join) and
-        the decoded pictures in prompt order. ValueError for anything DeepSeek's encoding refuses."""
+        the decoded pictures in prompt order. ``native`` keeps image blocks for image-aware templates.
+        ValueError for anything DeepSeek's encoding refuses."""
 
         out, pictures = [], []
         for m in messages:
@@ -308,7 +309,7 @@ class DsVision:
                 out.append(m)
                 continue
             role = m.get("role")
-            texts = []
+            texts, blocks = [], []
             for part in content:
                 kind = part.get("type") if isinstance(part, dict) else None
                 if kind in ("image_url", "image"):
@@ -323,6 +324,7 @@ class DsVision:
                     with memtrace.phase("decode"):
                         pictures.append(decode(load_image_bytes(url, self.allow_urls, self.max_bytes), self.cfg))
                     texts.append(PLACEHOLDER)
+                    blocks.append({"type": "image"})
                 elif kind == "text":
                     text = part.get("text")
                     if not isinstance(text, str):
@@ -330,9 +332,11 @@ class DsVision:
                     if PLACEHOLDER in text:
                         raise ValueError("message text must not contain the image placeholder token")
                     texts.append(text)
+                    blocks.append({"type": "text", "text": text})
                 else:
                     raise ValueError("content parts must be text or image_url")
-            out.append({**m, "content": "\n\n".join(texts)})
+            use_blocks = native and any(part["type"] == "image" for part in blocks)
+            out.append({**m, "content": blocks if use_blocks else "\n\n".join(texts)})
         return out, pictures
 
     def expand(self, ids: list[int], pictures: list[Picture]) -> VisionPrompt:
