@@ -51,6 +51,21 @@ def test_a_written_manifest_is_accepted_by_the_server_and_its_provenance_is_kept
     assert run(monkeypatch, capsys, folder, model)[0] == 0                      # and it checks out again
 
 
+def test_a_file_replaced_after_inspection_cannot_get_a_report_or_manifest(tmp_path, model, monkeypatch, capsys):
+    folder = standard(tmp_path / "a", seed=1)
+    original = lf.inspect_folder
+
+    def replaced(*args, **kwargs):
+        spec = original(*args, **kwargs)
+        standard(folder, seed=2)
+        return spec
+
+    monkeypatch.setattr(lf, "inspect_folder", replaced)
+    code, out, err = run(monkeypatch, capsys, folder, model, "--write-manifest")
+    assert code == 1 and out == "" and "changed after inspection" in err
+    assert not (folder / lf.MANIFEST).exists()
+
+
 def test_what_the_server_would_refuse_is_refused_with_the_reason_and_exit_one(tmp_path, model, monkeypatch, capsys):
     bad = write_adapter(tmp_path / "bad", {"mtp.0.attn.wo_b": factors(__import__("numpy").random.default_rng(0),
                                                                       CFG.dim, 1024, 2)})

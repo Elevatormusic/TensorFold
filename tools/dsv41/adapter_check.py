@@ -44,8 +44,10 @@ def main() -> int:
     sha = hashlib.sha256(config.read_bytes()).hexdigest()
     try:
         spec = lf.inspect_folder(args.adapter, dims, config_sha=sha)
-        for module in spec.modules:                                  # a value that is not finite is refused at load
-            lf.read_factors(spec, module)
+        with lf.snapshot_weights(spec.weights, spec.sha256) as (source, _):
+            parsed = lf.read_header(source)
+            for module in spec.modules:                              # the checks read the bytes whose hash we report
+                lf.read_factors(spec, module, parsed, source=source)
     except lf.AdapterError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
