@@ -16,15 +16,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "src"))
 
 from tensorfold.families.deepseek_v41.config import Cfg  # noqa: E402
 from tensorfold.families.deepseek_v41.cuda import lora_format as lf  # noqa: E402
+from tensorfold.families.deepseek_v41.cuda.lora_place import span  # noqa: E402
 
 
 def rank_bytes(spec: lf.AdapterSpec, dims: lf.Dims, world: int, slots: int) -> int:
-    """Float32 table bytes one rank holds for this adapter alone: slots a module, the rank rounded up to fours."""
+    """Table bytes for this adapter's module shapes, including each slot's int32 rank and float32 scale."""
 
+    if slots < 1:
+        raise ValueError("--slots must be positive (the number of configured adapters)")
     total = 0
     for m in spec.modules:
         width, out = dims.shape(m.kind)
-        total += (slots + 1) * lf.padded_rank(m.rank) * (width // world + out) * 4
+        lo, hi = span(width, 0, world)
+        total += (slots + 1) * (lf.padded_rank(m.rank) * (hi - lo + out) + 2) * 4
     return total
 
 
@@ -44,17 +48,18 @@ def main() -> int:
     sha = hashlib.sha256(config.read_bytes()).hexdigest()
     try:
         spec = lf.inspect_folder(args.adapter, dims, config_sha=sha)
+        nbytes = rank_bytes(spec, dims, args.tp, args.slots)
         with lf.snapshot_weights(spec.weights, spec.sha256) as (source, _):
             parsed = lf.read_header(source)
             for module in spec.modules:                              # the checks read the bytes whose hash we report
                 lf.read_factors(spec, module, parsed, source=source)
-    except lf.AdapterError as exc:
+    except ValueError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
     report = spec.describe()
     report["base"] = {"model_type": "deepseek_v41", "hidden_size": dims.dim, "num_hidden_layers": dims.n_layers,
                       "config_sha256": sha}
-    report["bytes_per_rank"] = rank_bytes(spec, dims, args.tp, args.slots)
+    report["bytes_per_rank"] = nbytes
     if args.write_manifest:
         manifest = {"format": lf.FORMAT, "base": report["base"], "files": {lf.WEIGHTS: {"sha256": spec.sha256}},
                     "modules": {m.name: {"rank": m.rank} for m in spec.modules},

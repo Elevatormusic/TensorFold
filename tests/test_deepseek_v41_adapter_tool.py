@@ -13,10 +13,15 @@ from tensorfold.families.deepseek_v41.cuda import lora_format as lf
 TOOL = pathlib.Path(__file__).resolve().parents[1] / "tools" / "dsv41" / "adapter_check.py"
 
 
-def run(monkeypatch, capsys, *argv):
+def load_tool():
     spec = importlib.util.spec_from_file_location("adapter_check_under_test", TOOL)
     tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tool)
+    return tool
+
+
+def run(monkeypatch, capsys, *argv):
+    tool = load_tool()
     monkeypatch.setattr("sys.argv", ["adapter_check.py", *map(str, argv)])
     code = tool.main()
     out = capsys.readouterr()
@@ -36,9 +41,35 @@ def test_it_prints_the_modules_and_the_memory_a_rank_would_hold(tmp_path, model,
     assert code == 0 and "ok: 2 modules" in out and "layers.1.attn.wo_b: rank 2" in out
     code, out, _ = run(monkeypatch, capsys, folder, model, "--json", "--tp", "2", "--slots", "1")
     report = json.loads(out)
-    # slots+1 slots, rank rounded up to 4, float32: wo_b reads half of 1024 and writes 256, w2 half of 512 and writes 256
-    assert report["bytes_per_rank"] == 2 * 4 * (1024 // 2 + 256) * 4 + 2 * 4 * (512 // 2 + 256) * 4
+    # Two slots in each module: padded factors, one int32 rank and one float32 scale per slot.
+    assert report["bytes_per_rank"] == 2 * (4 * (1024 // 2 + 256) + 2) * 4 + 2 * (4 * (512 // 2 + 256) + 2) * 4
     assert set(report["modules"]) == {WO_B.format(1), SHARED.format(2)}
+
+
+@pytest.mark.parametrize("world,slots", [(0, 1), (-1, 1), (3, 1), (8, 1), (2, 0), (2, -1)])
+def test_invalid_table_geometry_cannot_print_a_report_or_write_a_manifest(tmp_path, model, monkeypatch, capsys,
+                                                                        world, slots):
+    folder = standard(tmp_path / "a")
+    before = sorted((p.name, p.read_bytes()) for p in folder.iterdir())
+    code, out, err = run(monkeypatch, capsys, folder, model, "--tp", world, "--slots", slots, "--write-manifest")
+    assert code == 1 and out == "" and err.startswith("refused: ")
+    assert "does not split" in err or "--slots must be positive" in err
+    assert sorted((p.name, p.read_bytes()) for p in folder.iterdir()) == before
+
+
+@pytest.mark.parametrize("world,slots", [(1, 1), (2, 3), (4, 2)])
+def test_the_offline_estimate_matches_real_cpu_tables(tmp_path, world, slots):
+    torch = pytest.importorskip("torch")
+    from tensorfold.families.deepseek_v41.cuda.lora_tables import Tables
+
+    dims = lf.Dims.of(CFG)
+    spec = lf.inspect_folder(standard(tmp_path / "a", ranks=(5, 17)), dims)
+    actual = required = 0
+    for module in spec.modules:
+        width, out = dims.shape(module.kind)
+        actual += Tables.empty(slots + 1, module.rank, width // world, out, False, torch.bfloat16, "cpu").nbytes
+        required += Tables.required_bytes(slots + 1, module.rank, width // world, out)
+    assert load_tool().rank_bytes(spec, dims, world, slots) == actual == required
 
 
 def test_a_written_manifest_is_accepted_by_the_server_and_its_provenance_is_kept(tmp_path, model, monkeypatch, capsys):
