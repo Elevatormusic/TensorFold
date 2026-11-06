@@ -388,9 +388,8 @@ class LoaderReleaseTests(unittest.TestCase):
         with mock.patch.object(os, "posix_fadvise", side_effect=OSError(22, "Invalid argument"), create=True):
             self.assertEqual(shards.get("x").tolist(), list(range(4)))
         shards.entries["x"][2]["data_offsets"] = [0, 8]
-        with mock.patch.object(self.weights, "drop_page_cache") as drop:
-            with self.assertRaisesRegex(OSError, "short read of x"):
-                shards.get("x")
+        with mock.patch.object(self.weights, "drop_page_cache") as drop, self.assertRaisesRegex(OSError, "short read of x"):
+            shards.get("x")
         drop.assert_not_called()
 
     def rank_reader(self):
@@ -420,9 +419,8 @@ class LoaderReleaseTests(unittest.TestCase):
         reader = self.rank_reader()
         with mock.patch.object(os, "posix_fadvise", side_effect=OSError(22, "Invalid argument"), create=True):
             self.assertEqual(reader._read(16, 32).tolist(), list(range(16, 48)))
-        with mock.patch.object(self.weights, "drop_page_cache") as drop:
-            with self.assertRaisesRegex(OSError, "short read"):
-                reader._read(120, 16)
+        with mock.patch.object(self.weights, "drop_page_cache") as drop, self.assertRaisesRegex(OSError, "short read"):
+            reader._read(120, 16)
         drop.assert_not_called()
 
     def test_shards_close_drops_every_open_file(self):
