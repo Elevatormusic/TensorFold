@@ -59,7 +59,9 @@ with nothing left is left out; a value that is not finite is refused. A packed f
 range after rotation is refused too.
 The product of a module's scale and its configured strength must fit finite float32 before registry agreement or table
 allocation. Finite inputs whose product overflows, or exceeds the float32 range, are refused. A zero module alpha is
-valid; a configured zero strength remains refused.
+valid; a configured zero strength remains refused. After factor-finiteness checks, a module whose combined scale converts
+to float32 zero is left out before folding or table allocation. A zero scale cannot run an overflowing product and then
+multiply infinity by zero. A nonzero float32 subnormal scale remains active.
 
 `python3 tools/dsv41/adapter_check.py FOLDER MODEL_DIR --tp 2 --slots 2` runs the same checks offline, with no weights
 loaded: it prints the modules, the table memory a rank would hold, and exits 1 with the reason where the server would

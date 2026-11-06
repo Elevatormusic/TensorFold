@@ -83,6 +83,39 @@ def test_an_invalid_registry_scale_stops_before_snapshots_or_table_allocation(re
         load(registry)
 
 
+@pytest.mark.parametrize("alpha,strength", [(0.0, 1.0), (1e-40, 1e-10)])
+def test_a_zero_stored_scale_skips_tables_and_folding(tmp_path, monkeypatch, alpha, strength):
+    config = {"lora_alpha": alpha or 1.0}
+    if alpha == 0.0:
+        config["alpha_pattern"] = {r"layers\.1\.attn\.wo_b": 0, r"layers\.2\.ffn\.shared_experts\.w2": 0}
+    folder = standard(tmp_path / "a", ranks=(1, 1), config=config)
+    registry = lr.AdapterRegistry.load([("a", str(folder), strength)], CFG, model_dir(tmp_path / "model"))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a zero stored scale reached table allocation or folding")
+
+    monkeypatch.setattr(Tables, "empty", forbidden)
+    monkeypatch.setattr(lp, "fold_rotated", forbidden)
+    assert load(registry).layers == {}
+
+
+def test_a_zero_alpha_does_not_skip_serialized_factor_finiteness_checks(tmp_path):
+    a, b = factors(np.random.default_rng(3), CFG.dim, WO_IN, 1)
+    a[0, 0] = np.nan
+    folder = write_adapter(tmp_path / "a", {WO_B.format(1): (a, b)},
+                           config={"alpha_pattern": {r"layers\.1\.attn\.wo_b": 0}})
+    registry = lr.AdapterRegistry.load([("a", str(folder), 1.0)], CFG, model_dir(tmp_path / "model"))
+    with pytest.raises(lf.AdapterError, match="NaN or infinity"):
+        load(registry)
+
+
+def test_a_nonzero_subnormal_table_scale_keeps_its_rank():
+    table = Tables.empty(2, 1, 128, 128, False, torch.bfloat16, "cpu")
+    scale = float.fromhex("0x1p-149")
+    table.put(1, np.ones((1, 128), np.float32), np.ones((128, 1), np.float32), scale)
+    assert int(table.ranks[1]) == 1 and float(table.scales[1]) == scale
+
+
 @pytest.mark.parametrize("scale", [float("inf"), float("nan"), 1e40])
 def test_invalid_table_scales_cannot_publish_partial_factors(scale):
     table = Tables.empty(2, 1, 128, 128, False, torch.bfloat16, "cpu")

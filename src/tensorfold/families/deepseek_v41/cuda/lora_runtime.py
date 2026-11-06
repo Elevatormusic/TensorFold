@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 import torch
 
-from .lora_format import SHARED_W2, WO_B, AdapterError, Dims, read_factors, read_header, snapshot_weights
+from .lora_format import SHARED_W2, WO_B, AdapterError, Dims, read_factors, read_header, snapshot_weights, stored_scale
 from .lora_place import place
 from .lora_registry import AdapterRegistry
 from .lora_tables import Tables
@@ -151,7 +151,7 @@ class LoraRuntime:
             loaded = []
             for entry, module in items:
                 f = read_factors(entry.spec, module, headers[entry.slot], source=sources[entry.slot])
-                if f is None:
+                if f is None or stored_scale(f.scale, entry.strength, module.name) == 0.0:
                     dropped += 1
                 else:
                     loaded.append((entry, f))
@@ -180,5 +180,5 @@ class LoraRuntime:
         rt = cls(registry, layers, device, kernel)
         names = ", ".join(f"{e.name} ({len(e.spec.modules)} modules)" for e in registry.entries)
         log(f"[tensorfold] rank {rank}: adapters {names}: {len(layers)} layers, {total / 2**20:.1f} MiB of factors"
-            f"{f', {dropped} all-zero modules left out' if dropped else ''} in {time.perf_counter() - t0:.1f} s")
+            f"{f', {dropped} zero-effect modules left out' if dropped else ''} in {time.perf_counter() - t0:.1f} s")
         return rt

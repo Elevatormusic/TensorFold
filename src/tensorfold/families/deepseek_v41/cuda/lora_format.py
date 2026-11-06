@@ -123,6 +123,12 @@ def effective_scale(scale: float, strength: float, where: str = "adapter") -> fl
     return value
 
 
+def stored_scale(scale: float, strength: float, where: str = "adapter") -> float:
+    """The validated value after the float32 conversion used by the scale table."""
+
+    return float(np.float32(effective_scale(scale, strength, where)))
+
+
 def module_name(layer: int, kind: str) -> str:
     return f"layers.{layer}.attn.wo_b" if kind == WO_B else f"layers.{layer}.ffn.shared_experts.w2"
 
