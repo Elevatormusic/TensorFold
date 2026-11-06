@@ -143,7 +143,7 @@ class LoraRuntime:
                 wanted.setdefault((m.layer, m.kind), []).append((e, m))
         headers = {e.slot: read_header(sources[e.slot]) for e in registry.entries}
         layers: dict[int, LayerTables] = {}
-        total = dropped = 0
+        total = dropped = zero_scaled = 0
         for (layer, kind), items in sorted(wanted.items()):
             if layer >= len(weights.layers):
                 raise AdapterError(f"layer {layer}: this engine holds {len(weights.layers)} layers")
@@ -151,8 +151,10 @@ class LoraRuntime:
             loaded = []
             for entry, module in items:
                 f = read_factors(entry.spec, module, headers[entry.slot], source=sources[entry.slot])
-                if f is None or stored_scale(f.scale, entry.strength, module.name) == 0.0:
+                if f is None:
                     dropped += 1
+                elif stored_scale(f.scale, entry.strength, module.name) == 0.0:
+                    zero_scaled += 1
                 else:
                     loaded.append((entry, f))
             if not loaded:
@@ -180,5 +182,6 @@ class LoraRuntime:
         rt = cls(registry, layers, device, kernel)
         names = ", ".join(f"{e.name} ({len(e.spec.modules)} modules)" for e in registry.entries)
         log(f"[tensorfold] rank {rank}: adapters {names}: {len(layers)} layers, {total / 2**20:.1f} MiB of factors"
-            f"{f', {dropped} zero-effect modules left out' if dropped else ''} in {time.perf_counter() - t0:.1f} s")
+            f"{f', {dropped} all-zero modules left out' if dropped else ''}"
+            f"{f', {zero_scaled} zero-scale modules left out' if zero_scaled else ''} in {time.perf_counter() - t0:.1f} s")
         return rt

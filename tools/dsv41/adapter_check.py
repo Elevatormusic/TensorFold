@@ -1,5 +1,7 @@
-"""Validate a LoRA adapter folder against a DeepSeek-V4.1 checkpoint without loading any weights, print what it edits and
-what it costs a rank, and optionally write its tensorfold_adapter.json. Exit 1 with the reason when the server would refuse it.
+"""Validate a LoRA adapter at default strength 1.0 without loading base model weights.
+
+Print its modules and table bytes, and optionally write tensorfold_adapter.json. Runtime checks the configured strength;
+an adapter with a compensating strength can be valid even when this default-strength check refuses it.
 
   python3 adapter_check.py ADAPTER_DIR MODEL_DIR [--tp 2] [--slots 2] [--write-manifest] [--json]
 
@@ -49,6 +51,8 @@ def main() -> int:
     try:
         spec = lf.inspect_folder(args.adapter, dims, config_sha=sha)
         nbytes = rank_bytes(spec, dims, args.tp, args.slots)
+        for module in spec.modules:
+            lf.effective_scale(module.scale, 1.0, module.name)
         with lf.snapshot_weights(spec.weights, spec.sha256) as (source, _):
             parsed = lf.read_header(source)
             for module in spec.modules:                              # the checks read the bytes whose hash we report
@@ -60,6 +64,7 @@ def main() -> int:
     report["base"] = {"model_type": "deepseek_v41", "hidden_size": dims.dim, "num_hidden_layers": dims.n_layers,
                       "config_sha256": sha}
     report["bytes_per_rank"] = nbytes
+    report["checked_strength"] = 1.0
     if args.write_manifest:
         manifest = {"format": lf.FORMAT, "base": report["base"], "files": {lf.WEIGHTS: {"sha256": spec.sha256}},
                     "modules": {m.name: {"rank": m.rank} for m in spec.modules},
@@ -69,6 +74,7 @@ def main() -> int:
         print(json.dumps(report, indent=2))
         return 0
     print(f"ok: {len(spec.modules)} modules, weights sha256 {spec.sha256[:16]}")
+    print("checked strength: 1.0 (default; runtime checks the configured strength)")
     for m in spec.modules:
         print(f"  {m.name}: rank {m.rank}, alpha {m.alpha:g}, scale {m.scale:g}")
     print(f"float32 tables on a rank of {args.tp}, {args.slots} adapter(s) held: "

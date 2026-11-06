@@ -63,9 +63,11 @@ valid; a configured zero strength remains refused. After factor-finiteness check
 to float32 zero is left out before folding or table allocation. A zero scale cannot run an overflowing product and then
 multiply infinity by zero. A nonzero float32 subnormal scale remains active.
 
-`python3 tools/dsv41/adapter_check.py FOLDER MODEL_DIR --tp 2 --slots 2` runs the same checks offline, with no weights
-loaded: it prints the modules, the table memory a rank would hold, and exits 1 with the reason where the server would
-refuse. `--write-manifest` writes `tensorfold_adapter.json` from the files (keeping an existing `provenance`).
+`python3 tools/dsv41/adapter_check.py FOLDER MODEL_DIR --tp 2 --slots 2` runs file and table-shape checks without loading
+base model weights. It prints the modules and table bytes, and exits 1 with the reason when a check fails.
+`--write-manifest` writes `tensorfold_adapter.json` from the files (keeping an existing `provenance`).
+The checker validates default strength 1.0 and reports that value. Runtime validates the configured strength separately;
+a large module scale can be valid at a compensating strength even if the default-strength checker refuses it.
 
 ## Tensor parallelism
 

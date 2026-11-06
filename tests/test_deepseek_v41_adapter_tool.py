@@ -41,9 +41,19 @@ def test_it_prints_the_modules_and_the_memory_a_rank_would_hold(tmp_path, model,
     assert code == 0 and "ok: 2 modules" in out and "layers.1.attn.wo_b: rank 2" in out
     code, out, _ = run(monkeypatch, capsys, folder, model, "--json", "--tp", "2", "--slots", "1")
     report = json.loads(out)
+    assert report["checked_strength"] == 1.0
     # Two slots in each module: padded factors, one int32 rank and one float32 scale per slot.
     assert report["bytes_per_rank"] == 2 * (4 * (1024 // 2 + 256) + 2) * 4 + 2 * (4 * (512 // 2 + 256) + 2) * 4
     assert set(report["modules"]) == {WO_B.format(1), SHARED.format(2)}
+
+
+@pytest.mark.parametrize("alpha", [1e40, 1e308])
+def test_default_strength_overflow_cannot_print_success_or_write_a_manifest(tmp_path, model, monkeypatch, capsys, alpha):
+    folder = standard(tmp_path / "a", ranks=(1, 1), config={"lora_alpha": alpha})
+    before = sorted((p.name, p.read_bytes()) for p in folder.iterdir())
+    code, out, err = run(monkeypatch, capsys, folder, model, "--write-manifest")
+    assert code == 1 and out == "" and "effective scale must fit finite float32" in err
+    assert sorted((p.name, p.read_bytes()) for p in folder.iterdir()) == before
 
 
 @pytest.mark.parametrize("world,slots", [(0, 1), (-1, 1), (3, 1), (8, 1), (2, 0), (2, -1)])
