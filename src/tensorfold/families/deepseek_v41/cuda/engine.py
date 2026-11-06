@@ -72,7 +72,7 @@ class DsEngine:
 
         from ..ops import compressed_token_map
         from .dspark import Drafter
-        from .model import Comm, Engram, Model
+        from .model import RS, Comm, Engram, Model
         from .weights import load
 
         torch.cuda.set_device(0)
@@ -159,14 +159,14 @@ class DsEngine:
         if nccl is not None:
             from . import markov
 
-            nccl.barrier()                               # the Markov switches set the drafter's gathers (count, size)
-            mine = torch.tensor([int(self.vcfg is not None), int(parallel), int(markov.ON), int(markov.SPLIT)],
+            nccl.barrier()                               # These settings choose collectives before warm-up.
+            mine = torch.tensor([int(self.vcfg is not None), int(parallel), int(markov.ON), int(markov.SPLIT), int(RS)],
                                 dtype=torch.int64, device="cuda")
-            every = torch.empty((world * 4,), dtype=torch.int64, device="cuda")
+            every = torch.empty((world * mine.numel(),), dtype=torch.int64, device="cuda")
             nccl.all_gather(mine, every)
-            flags = every.view(world, 4).tolist()
+            flags = every.view(world, mine.numel()).tolist()
             if any(f != flags[0] for f in flags):
-                raise ValueError("--vision, --parallel, TF_DS_MARKOV and TF_DS_MARKOV_SPLIT must be the same on every "
+                raise ValueError("--vision, --parallel, TF_DS_MARKOV, TF_DS_MARKOV_SPLIT and TF_DS_RS must match on every "
                                  f"rank (rank 0 and the workers run the same steps): {flags}")
         if WARM:
             self.warm()

@@ -55,6 +55,11 @@ def main():
             x = x.contiguous()
             return torch.stack([x, x])
 
+        def reduced(self, x):
+            """Keep the local gather layout; this stand-in has no NCCL reducer."""
+
+            return self.gather(x)
+
     w = load(a.model, 0, 2, n_layers=a.layers, dspark=True)
     m = M.Model(w, Repeat())
     m.rope_cap = 8192
