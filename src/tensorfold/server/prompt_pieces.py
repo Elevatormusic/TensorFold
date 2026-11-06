@@ -91,8 +91,14 @@ def _id_preserving_post_processor(state: Any) -> bool:
 
 def _has_id_preserving_post_processor(tok: Any) -> bool:
     try:
+        from tokenizers.processors import BertProcessing, ByteLevel, RobertaProcessing, Sequence, TemplateProcessing
+
         post = tok.post_processor
-        return post is None or _id_preserving_post_processor(json.loads(post.__getstate__()))
+        if post is None:
+            return True
+        if type(post) not in (BertProcessing, ByteLevel, RobertaProcessing, Sequence, TemplateProcessing):
+            return False
+        return _id_preserving_post_processor(json.loads(post.__getstate__()))
     except Exception:  # noqa: BLE001  unknown processor metadata must keep whole-input encoding
         return False
 

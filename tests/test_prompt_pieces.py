@@ -404,6 +404,7 @@ class UnknownPostState:
 
 @pytest.mark.parametrize("state", [b"not json", b"[]", b'{}', b'{"type":"FutureProcessor"}',
                                     b'{"type":"Sequence"}', b'{"type":"TemplateProcessing"}',
+                                    b'{"type":"ByteLevel"}', b'{"type":"BertProcessing"}',
                                     None, RuntimeError("unknown post-processor")])
 def test_unknown_post_processor_metadata_uses_whole_input(state):
     assert PromptPieces.of(UnknownPostState(tokenizer(), state)) is None
