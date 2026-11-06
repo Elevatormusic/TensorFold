@@ -119,3 +119,10 @@ def test_a_collapsed_optional_manifest_cannot_hide_a_duplicate_writer(tmp_path, 
         "modules": {"layers.1." + kind: {"rank": 1, "alpha": 1, "scale": 1}}}))
     with pytest.raises(lf.AdapterError, match="duplicate normalized target"):
         lf.inspect_folder(folder, DIMS)
+
+
+@pytest.mark.parametrize("prefix", ["base_model.model.base_model.model.", "model.model."])
+def test_repeated_wrappers_are_not_new_supported_writer_paths(tmp_path, prefix):
+    folder = write_adapter(tmp_path / "a", {"layers.1.attn.wo_b": pair()}, prefix=prefix)
+    with pytest.raises(lf.AdapterError, match="not a module this engine can edit"):
+        lf.inspect_folder(folder, DIMS)
