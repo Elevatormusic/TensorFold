@@ -48,6 +48,7 @@ def test_equal_prompt_ids_keep_adapter_and_image_kv_scopes_separate(mods, tmp_pa
     if mode != "text":
         request[0]["content"][-1]["text"] = "x" * 9000
     md, calls = decoder(multi, spill, root)
+    app.engine.limit = md.extents.total
     md.e.adapter_ok = lambda held: held is None or reg.check(held)
     md.e.tower = NS(span_rows=lambda pic: torch.zeros((pic.tokens, 4)))
     md.e._share_rows = lambda rows, count: rows
