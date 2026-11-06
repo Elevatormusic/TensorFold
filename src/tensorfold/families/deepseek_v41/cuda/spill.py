@@ -28,7 +28,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -154,6 +156,39 @@ _FILE = re.compile(r"(seg|snap)-[0-9A-Za-z_-]{1,64}-\d{1,9}\.st")
 
 def _parts(x) -> tuple:
     return x if isinstance(x, tuple) else (x,)
+
+
+@contextmanager
+def _read_safetensors(path: Path):
+    """Close a copied spill file, then ask the OS to release its clean read cache."""
+
+    from safetensors import safe_open
+
+    try:
+        before = path.stat(follow_symlinks=False)
+    except OSError:
+        before = None
+    try:
+        with safe_open(str(path), framework="pt") as reader:
+            yield reader
+    finally:
+        # Spill files are immutable. The caller must copy tensors before this scope ends.
+        if before is not None and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+            fd = -1
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                fd = os.open(path, flags)
+                after = os.fstat(fd)
+                if stat.S_ISREG(after.st_mode) and (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino):
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass                                    # cache advice is optional; read errors still reach the caller
+            finally:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
 
 def _valid(m: dict) -> bool:
@@ -443,9 +478,7 @@ class Spill:
         return end >= cut and all(self._path(ref["file"]).is_file() for b, ref in m["snaps"].items() if int(b) <= cut)
 
     def _read_snap(self, fname: str, device) -> tuple:
-        from safetensors import safe_open
-
-        with safe_open(str(self._path(fname)), framework="pt") as f:  # (copies: its tensors map the file until closed)
+        with _read_safetensors(self._path(fname)) as f:
             meta, names = f.metadata() or {}, set(f.keys())
             ring = f.get_tensor("ring").to(device, copy=True)
             raw = f.get_tensor("raw").to(device, copy=True) if "raw" in names else None
@@ -457,15 +490,13 @@ class Spill:
         """Manifest ``name``'s rows before ``cut`` into pool positions [base, base + cut), segment by segment; returns
         its snapshots to ``cut`` (on ``device``), its host ids to ``cut`` and the lineage a stream continuing it keeps."""
 
-        from safetensors import safe_open
-
         m, cut, base, device = self.manifests[name], int(cut), int(base), device or self.device
         host = []
         for seg in m["segments"]:
             lo, hi, p0 = seg["from"], min(seg["to"], cut), seg["p0"]
             if lo >= hi:
                 continue
-            with safe_open(str(self._path(seg["file"])), framework="pt") as f:
+            with _read_safetensors(self._path(seg["file"])) as f:
                 for kind, planes in (("comp", self.pool.comp), ("index_k", self.pool.index_k)):
                     for i, x in planes.items():
                         r = self.ratios[int(i)]
