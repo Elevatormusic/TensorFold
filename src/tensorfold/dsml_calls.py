@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from collections.abc import Iterable
 from typing import Any, NamedTuple
 
 DSML = "\uff5cDSML\uff5c"
@@ -34,12 +35,16 @@ _TAG_TAGS_ANY = _pair(CALL_OPEN, CALL_CLOSE, re.IGNORECASE)
 
 
 OPEN_TAG, OPEN_DSML, ILL_FORMED = "open_tool_call_tag", "open_dsml_block", "ill_formed_dsml_block"
+# a call block that is complete but does not run: its tool was not offered, it has no usable name or arguments, or the
+# request allows one call and the reply made more; and tool-call markup removed from a request that offered no tools
+UNOFFERED, UNRESOLVED, EXTRA_CALL = "unoffered_tool_call", "unresolved_tool_call", "extra_call_removed"
+NO_TOOLS = "markup_without_tools"
 _suppressed: dict[str, int] = {}
 _suppressed_lock = threading.Lock()
 
 
-def count_suppressed(reasons: set[str]) -> None:
-    """Count one reply for each reason: a block that does not count kept a later tool call as text."""
+def count_suppressed(reasons: Iterable[str]) -> None:
+    """Count one block for each reason in ``reasons``: a block that was removed or kept as text and did not run."""
 
     with _suppressed_lock:
         for reason in reasons:
@@ -47,7 +52,7 @@ def count_suppressed(reasons: set[str]) -> None:
 
 
 def suppressed_counts() -> dict[str, int]:
-    """The replies counted so far, by reason (the /metrics family tool_calls_suppressed_total)."""
+    """The blocks counted so far, by reason (the /metrics family tool_calls_suppressed_total)."""
 
     with _suppressed_lock:
         return dict(_suppressed)

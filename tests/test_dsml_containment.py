@@ -486,7 +486,8 @@ class UnofferedCalls(Flag):
         with contextlib.redirect_stdout(out):
             result = parse_tool_calls("Go.\n" + calls(invoke("apply_patch", param("p", "x"))), TOOLS)
         self.assertEqual(result, ("Go.", None))
-        self.assertIn("apply_patch", out.getvalue())
+        self.assertIn("reason=unoffered_tool_call", out.getvalue())
+        self.assertNotIn("apply_patch", out.getvalue())          # the log has no tool name
 
     def test_the_flag_removes_an_open_block_and_does_not_drop_its_nested_call(self):
         self.drop()
@@ -550,7 +551,8 @@ class UnofferedCalls(Flag):
 
 
 class Suppressed(Flag):
-    """A block that does not count and keeps a later call as text is logged once for the reply and counted."""
+    """A block that is removed from the reply or kept as text, and does not run, is logged and counted: one line and
+    one count for each block."""
 
     def setUp(self):
         super().setUp()
@@ -560,15 +562,27 @@ class Suppressed(Flag):
     def parse(self, text):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            result = parse_tool_calls(text, TOOLS)
+            result = parse_tool_calls(text, TOOLS, request_id="req-abc123def456")
         return result, out.getvalue()
 
-    def test_a_valid_call_and_a_cut_off_block_with_no_later_call_are_silent(self):
-        for text in (VALID, "Go.\n" + OPEN + "\n", "Go. <tool_call> only", f'{OPEN}\n<{D} invoke name="read">\n'):
+    def test_a_valid_call_and_a_lone_tool_call_tag_are_silent(self):
+        for text in (VALID, "Go. <tool_call> only"):
             _, log = self.parse(text)
             self.assertEqual(log, "", text)
         self.assertEqual(suppressed_counts(), {})
         self.assertNotIn("tool_calls_suppressed_total", metrics.render(SimpleNamespace()))
+
+    def test_a_cut_off_dsml_block_with_no_call_in_it_is_logged_and_counted(self):
+        for text in ("Go.\n" + OPEN + "\n", f'{OPEN}\n<{D} invoke name="read">\n'):
+            reset_suppressed()
+            (content, found), log = self.parse(text)
+            self.assertEqual((content, found), (text[:text.index(OPEN)].strip(), None))
+            self.assertEqual(log.count("\n"), 1, text)
+            self.assertIn("WARNING: req-abc123def456 a tool call block was removed from the reply and did not run", log)
+            self.assertIn("reason=open_dsml_block", log)
+            self.assertIn(f"length={len(text) - text.index(OPEN)} characters, at character {text.index(OPEN)}", log)
+            self.assertNotIn("it holds a complete call", log)
+            self.assertEqual(suppressed_counts(), {"open_dsml_block": 1})
 
     def test_a_lone_tool_call_tag_before_a_dsml_call_is_logged_and_counted(self):
         text = "Use <tool_call> tags.\n" + calls(invoke("read", param("path", "SECRET")))
@@ -576,45 +590,193 @@ class Suppressed(Flag):
         self.assertEqual((content, found), (text, None))
         self.assertEqual(log.count("\n"), 1)
         self.assertIn("WARNING", log)
-        self.assertIn("open_tool_call_tag at character 4", log)
+        self.assertIn("was kept in the reply as text and did not run", log)
+        self.assertIn("reason=open_tool_call_tag", log)
+        self.assertIn("at character 4", log)
+        self.assertIn("it holds a complete call", log)
         self.assertNotIn("SECRET", log)
         self.assertNotIn("Use", log)
         self.assertEqual(suppressed_counts(), {"open_tool_call_tag": 1})
 
     def test_a_cut_off_dsml_block_that_holds_a_complete_call_is_logged_and_counted(self):
         text = "Go.\n" + OPEN + f'\n<{D} invoke name="read">\n<{D} parameter name="path">' + NESTED_JSON
-        _, log = self.parse(text)
-        self.assertIn("open_dsml_block at character 4", log)
+        (content, found), log = self.parse(text)
+        self.assertEqual((content, found), ("Go.", None))
+        self.assertIn("reason=open_dsml_block", log)
+        self.assertIn("at character 4", log)
+        self.assertIn("it holds a complete call", log)
         self.assertEqual(suppressed_counts(), {"open_dsml_block": 1})
 
     def test_a_lone_dsml_opener_before_a_dsml_call_is_logged_and_counted(self):
         _, log = self.parse("The opener is " + OPEN + " here.\n" + calls(invoke("read")))
-        self.assertIn("open_dsml_block at character 14", log)
+        self.assertIn("reason=open_dsml_block", log)
+        self.assertIn("at character 14", log)
+
+    def test_a_complete_call_before_a_cut_off_block_runs_and_the_open_block_is_logged(self):
+        text = VALID + "\n" + OPEN + f'\n<{D} invoke name="write">\n<{D} parameter name="path" string="true">x'
+        (content, found), log = self.parse(text)
+        self.assertEqual((content, names(found)), ("Checking.", ["read"]))
+        self.assertEqual(log.count("\n"), 1)
+        self.assertEqual(suppressed_counts(), {"open_dsml_block": 1})
 
     def test_a_block_that_is_not_well_formed_is_logged_and_counted(self):
-        _, log = self.parse("Go.\n" + calls(invoke("read"), "junk\n"))
-        self.assertIn("ill_formed_dsml_block at character 4", log)
+        text = "Go.\n" + calls(invoke("read"), "junk\n")
+        (content, found), log = self.parse(text)
+        self.assertEqual((content, found), (text, None))
+        self.assertIn("was kept in the reply as text and did not run", log)
+        self.assertIn("reason=ill_formed_dsml_block", log)
+        self.assertIn("at character 4", log)
+        self.assertNotIn("junk", log)
         self.assertEqual(suppressed_counts(), {"ill_formed_dsml_block": 1})
 
-    def test_one_line_and_one_count_for_each_reason_in_a_reply(self):
+    def test_the_line_never_holds_the_block_text_or_the_arguments(self):
+        canary = "ARGUMENT-CANARY-VALUE"
+        for text in (calls(invoke("read", param("path", canary)), "junk\n"),
+                     "Go.\n" + OPEN + f'\n<{D} invoke name="read">\n<{D} parameter name="path">{canary}',
+                     calls(invoke("apply_patch", param("path", canary))),
+                     "<tool_call>" + json.dumps({"arguments": {"path": canary}}) + "</tool_call>"):
+            _, log = self.parse(text)
+            self.assertIn("WARNING", log)
+            self.assertNotIn(canary, log)
+            self.assertNotIn("｜", log)
+
+    def test_a_complete_call_to_a_tool_that_is_not_offered_is_kept_as_text_logged_and_counted(self):
+        text = "Go.\n" + calls(invoke("apply_patch", param("p", "x")))
+        (content, found), log = self.parse(text)
+        self.assertIsNone(found)
+        self.assertIn("apply_patch", content)
+        self.assertEqual(log.count("\n"), 1)
+        self.assertIn("was kept in the reply as text and did not run", log)
+        self.assertIn("reason=unoffered_tool_call", log)
+        self.assertEqual(suppressed_counts(), {"unoffered_tool_call": 1})
+
+    def test_a_call_with_no_name_is_kept_as_text_logged_and_counted(self):
+        text = '<tool_call>{"arguments": {"path": "a"}}</tool_call>'
+        (content, found), log = self.parse(text)
+        self.assertEqual((content, found), (text, None))
+        self.assertIn("reason=unresolved_tool_call", log)
+        self.assertEqual(suppressed_counts(), {"unresolved_tool_call": 1})
+
+    def test_a_call_that_does_not_run_is_told_with_the_place_and_the_length_of_its_source_block(self):
+        block = calls(invoke("apply_patch", param("p", "x")), invoke("read"))
+        text = "Go.\n" + block + "\nThen " + '<tool_call>{"arguments": {}}</tool_call>'
+        (_, found), log = self.parse(text)
+        self.assertEqual(names(found), ["read"])
+        first, second = log.splitlines()
+        self.assertIn(f"reason=unoffered_tool_call (the call names a tool that the request did not offer), "
+                      f"length={len(block)} characters, at character 4", first)
+        tag = text.index("<tool_call>")
+        self.assertIn(f"reason=unresolved_tool_call (the call has no usable name or no arguments as a JSON object), "
+                      f"length={len(text) - tag} characters, at character {tag}", second)
+
+    def test_with_one_call_allowed_a_later_malformed_block_is_unresolved_not_extra(self):
+        text = (calls(invoke("read")) + "\n<tool_call>not json</tool_call>\n" + calls(invoke("apply_patch"))
+                + "\n" + calls(invoke("write")))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            content, found = parse_tool_calls(text, TOOLS, max_calls=1, request_id="req-abc123def456")
+        self.assertEqual(names(found), ["read"])
+        self.assertEqual(suppressed_counts(), {"unresolved_tool_call": 1, "unoffered_tool_call": 1,
+                                               "extra_call_removed": 1})
+
+    def test_with_one_call_allowed_the_extra_calls_are_logged_and_counted(self):
+        text = calls(invoke("read", param("path", "a")), invoke("write", param("path", "b")))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            content, found = parse_tool_calls(text, TOOLS, max_calls=1, request_id="req-abc123def456")
+        self.assertEqual((content, names(found)), ("", ["read"]))
+        self.assertEqual(out.getvalue().count("\n"), 1)
+        self.assertIn("a tool call block was removed from the reply and did not run", out.getvalue())
+        self.assertIn("reason=extra_call_removed", out.getvalue())
+        self.assertEqual(suppressed_counts(), {"extra_call_removed": 1})
+
+    def test_each_block_has_its_line_and_its_count(self):
         text = calls("junk\n") + calls("more junk\n") + "<tool_call> " + calls(invoke("read"))
         _, log = self.parse(text)
-        self.assertEqual(log.count("\n"), 1)
-        self.assertIn("ill_formed_dsml_block at character 0", log)
-        self.assertIn("(3 such blocks)", log)
-        self.assertEqual(suppressed_counts(), {"ill_formed_dsml_block": 1, "open_tool_call_tag": 1})
+        self.assertEqual(log.count("\n"), 3)
+        self.assertEqual(log.count("reason=ill_formed_dsml_block"), 2)
+        self.assertEqual(log.count("reason=open_tool_call_tag"), 1)
+        self.assertEqual(suppressed_counts(), {"ill_formed_dsml_block": 2, "open_tool_call_tag": 1})
         self.parse(calls("junk\n"))
-        self.assertEqual(suppressed_counts()["ill_formed_dsml_block"], 2)
+        self.assertEqual(suppressed_counts()["ill_formed_dsml_block"], 3)
+
+    def test_a_reply_with_many_blocks_prints_five_lines_and_counts_every_block(self):
+        _, log = self.parse("".join(calls("junk\n") for _ in range(8)))
+        self.assertEqual(log.count("\n"), 6)
+        self.assertEqual(log.count("reason=ill_formed_dsml_block"), 5)
+        self.assertIn("3 more tool call blocks did not run in this reply", log)
+        self.assertEqual(suppressed_counts(), {"ill_formed_dsml_block": 8})
+
+    def test_the_line_has_the_request_id_or_a_placeholder(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            parse_tool_calls(calls("junk\n"), TOOLS)
+        self.assertIn("WARNING: req-? a tool call block", out.getvalue())
+
+    def test_the_reply_is_the_same_with_and_without_a_request_id(self):
+        for text in ("Go.\n" + OPEN + "\n", VALID, calls("junk\n"), VALID + "\n" + OPEN,
+                     calls(invoke("apply_patch")), "<tool_call>" + calls(invoke("read"))):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with_id = parse_tool_calls(text, TOOLS, request_id="req-abc123def456")
+                without = parse_tool_calls(text, TOOLS)
+            self.assertEqual(with_id[0], without[0], text)
+            self.assertEqual(names(with_id[1]), names(without[1]), text)
+
+    def test_the_markup_removed_from_a_request_with_no_tools_is_counted(self):
+        self.drop()
+        text = "Go.\n" + calls(invoke("read", param("p", "x"))) + " Bye."
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            answer_without_tools(text, finished=False, request_id="req-abc123def456")
+            self.assertEqual(out.getvalue(), "")                  # a stream that is still going says nothing
+            self.assertEqual(answer_without_tools(text, finished=True, request_id="req-abc123def456"), "Go.\n Bye.")
+        self.assertIn("WARNING: req-abc123def456 a tool call block was removed from the reply and did not run",
+                      out.getvalue())
+        self.assertIn("reason=markup_without_tools (the request offered no tools)", out.getvalue())
+        self.assertEqual(suppressed_counts(), {"markup_without_tools": 1})
+
+    def test_each_block_removed_from_a_request_with_no_tools_has_its_line_and_its_count(self):
+        self.drop()
+        text = ("Go.\n" + calls(invoke("read", param("p", "x"))) + " Then " + NESTED_JSON + " and " + OPEN + "\n"
+                + "<tool_call>open")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(answer_without_tools(text, finished=True, request_id="req-abc123def456"),
+                             "Go.\n Then  and ")
+        self.assertEqual(out.getvalue().count("\n"), 3)
+        self.assertEqual(suppressed_counts(), {"markup_without_tools": 3})
+
+    def test_the_flag_caps_the_lines_for_unoffered_calls_and_counts_every_block(self):
+        self.drop()
+        text = "Go." + "".join(calls(invoke("apply_patch")) for _ in range(8))
+        (content, found), log = self.parse(text)
+        self.assertEqual((content, found), ("Go.", None))
+        self.assertEqual(log.count("\n"), 6)
+        self.assertIn("3 more tool call blocks did not run in this reply", log)
+        self.assertEqual(suppressed_counts(), {"unoffered_tool_call": 8})
+
+    def test_the_flag_logs_the_dropped_call_once_with_the_request_id(self):
+        self.drop()
+        text = "Go.\n" + calls(invoke("apply_patch", param("p", "x")))
+        (content, found), log = self.parse(text)
+        self.assertEqual((content, found), ("Go.", None))
+        self.assertEqual(log.count("\n"), 1)
+        self.assertIn("WARNING: req-abc123def456 a tool call block was removed from the reply and did not run", log)
+        self.assertIn("reason=unoffered_tool_call", log)
+        self.assertNotIn("apply_patch", log)
+        self.assertEqual(suppressed_counts(), {"unoffered_tool_call": 1})
 
     def test_the_metrics_text_shows_the_counter_by_reason(self):
         self.parse("Use <tool_call> tags.\n" + calls(invoke("read")))
         self.parse("Go.\n" + calls("junk\n"))
         self.parse("Go.\n" + calls("junk\n"))
+        self.parse("Go.\n" + OPEN + "\n")
         body = metrics.render(SimpleNamespace())
         name = f"{metrics.PREFIX}tool_calls_suppressed_total"
         self.assertIn(f"# TYPE {name} counter", body)
         self.assertIn(f'{name}{{reason="ill_formed_dsml_block"}} 2', body)
         self.assertIn(f'{name}{{reason="open_tool_call_tag"}} 1', body)
+        self.assertIn(f'{name}{{reason="open_dsml_block"}} 1', body)
 
 
 class Blocks(unittest.TestCase):
