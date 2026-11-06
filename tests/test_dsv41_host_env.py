@@ -310,6 +310,28 @@ class PageCacheTests(unittest.TestCase):
             self.assertFalse(hostenv.drop_page_cache(self.path.with_name("none.bin")))
         advise.assert_not_called()
 
+    def test_missing_advice_support_does_not_open_the_file(self):
+        for attribute in ("posix_fadvise", "POSIX_FADV_DONTNEED"):
+            with self.subTest(attribute=attribute), mock.patch.object(os, attribute, None, create=True), \
+                    mock.patch.object(os, "open") as opened:
+                self.assertFalse(hostenv.drop_page_cache(self.path, 4096, 8192))
+                opened.assert_not_called()
+
+    def test_path_range_advice_error_closes_its_descriptor(self):
+        seen = []
+
+        def refused(fd, offset, length, flag):
+            seen.append(fd)
+            self.assertEqual((offset, length, flag), (4096, 8192, FADV_DONTNEED))
+            raise OSError(22, "Invalid argument")
+
+        advise, (a, b) = self.patched(side_effect=refused)
+        with a, b:
+            self.assertFalse(hostenv.drop_page_cache(self.path, 4096, 8192))
+        self.assertEqual(advise.call_count, 1)
+        with self.assertRaises(OSError):
+            os.fstat(seen[0])
+
     @unittest.skipUnless(hasattr(os, "posix_fadvise"), "this system has no posix_fadvise")
     def test_the_real_call_works_on_a_temp_file(self):
         self.assertTrue(hostenv.drop_page_cache(self.path))
@@ -337,6 +359,71 @@ class LoaderReleaseTests(unittest.TestCase):
         from tensorfold.families.deepseek_v41.cuda import weights
 
         self.weights = weights
+
+    def shard(self, shape, payload, offsets):
+        import json
+        import struct
+
+        header = json.dumps({"x": {"dtype": "U8", "shape": shape, "data_offsets": offsets}}).encode()
+        (self.dir / "a.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + payload)
+        shards = self.weights.Shards(self.dir)
+        self.addCleanup(shards.close)
+        return shards, 8 + len(header)
+
+    def test_shard_row_slice_releases_only_its_exact_file_range(self):
+        shards, base = self.shard([4, 2], b"pad" + bytes(range(8)), [3, 11])
+        with mock.patch.object(self.weights, "drop_page_cache") as drop:
+            self.assertEqual(shards.get("x", rows=(1, 3)).tolist(), [[2, 3], [4, 5]])
+        self.assertEqual(drop.call_args.args[1:], (base + 5, 4))
+        drop.assert_called_once()
+
+    def test_empty_shard_read_does_not_advise_to_end_of_file(self):
+        shards, _ = self.shard([0], b"unrelated bytes", [0, 0])
+        with mock.patch.object(self.weights, "drop_page_cache") as drop:
+            self.assertEqual(shards.get("x").tolist(), [])
+        drop.assert_not_called()
+
+    def test_shard_advice_failure_preserves_bytes_and_short_read_error(self):
+        shards, _ = self.shard([4], bytes(range(4)), [0, 4])
+        with mock.patch.object(os, "posix_fadvise", side_effect=OSError(22, "Invalid argument"), create=True):
+            self.assertEqual(shards.get("x").tolist(), list(range(4)))
+        shards.entries["x"][2]["data_offsets"] = [0, 8]
+        with mock.patch.object(self.weights, "drop_page_cache") as drop:
+            with self.assertRaisesRegex(OSError, "short read of x"):
+                shards.get("x")
+        drop.assert_not_called()
+
+    def rank_reader(self):
+        path = self.dir / "rank.bin"
+        path.write_bytes(bytes(range(128)))
+        reader = self.weights.RankCache(path, [])
+        self.addCleanup(reader.close)
+        return reader
+
+    def test_parallel_rank_reads_advise_their_own_ranges(self):
+        reader = self.rank_reader()
+        ranges = [(offset, 16) for offset in range(0, 128, 16)]
+        with mock.patch.object(self.weights, "drop_page_cache") as drop:
+            pending = [reader.pool.submit(reader._read, offset, size) for offset, size in ranges]
+            for result, (offset, size) in zip(pending, ranges):
+                self.assertEqual(result.result(timeout=5).tolist(), list(range(offset, offset + size)))
+        self.assertCountEqual([call.args for call in drop.call_args_list],
+                              [(reader.fd, offset, size) for offset, size in ranges])
+
+    def test_empty_rank_read_does_not_advise_to_end_of_file(self):
+        reader = self.rank_reader()
+        with mock.patch.object(self.weights, "drop_page_cache") as drop:
+            self.assertEqual(reader._read(16, 0).tolist(), [])
+        drop.assert_not_called()
+
+    def test_rank_advice_failure_preserves_bytes_and_short_read_error(self):
+        reader = self.rank_reader()
+        with mock.patch.object(os, "posix_fadvise", side_effect=OSError(22, "Invalid argument"), create=True):
+            self.assertEqual(reader._read(16, 32).tolist(), list(range(16, 48)))
+        with mock.patch.object(self.weights, "drop_page_cache") as drop:
+            with self.assertRaisesRegex(OSError, "short read"):
+                reader._read(120, 16)
+        drop.assert_not_called()
 
     def test_shards_close_drops_every_open_file(self):
         import json
