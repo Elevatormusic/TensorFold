@@ -67,8 +67,8 @@ def test_start_validates_loads_and_warms_and_hands_back_the_registry(tmp_path, m
 def test_ranks_started_with_other_adapters_or_another_order_are_refused_and_the_message_says_so(tmp_path):
     a, b, base = str(standard(tmp_path / "a", 1)), str(standard(tmp_path / "b", 2)), model_dir(tmp_path / "m")
 
-    def flags(*held):                                  # what a rank gathers: vision, parallel, Markov x2, the digest
-        return [0, 4, 0, 0, *lr.AdapterRegistry.load(list(held), CFG, base, ("base",)).words()]
+    def flags(*held):                                  # Vision, parallel, Markov x2, RS, and the adapter digest.
+        return [0, 4, 0, 0, 0, *lr.AdapterRegistry.load(list(held), CFG, base, ("base",)).words()]
 
     both = flags(("x", a, 1.0), ("y", b, 1.0))
     eng._same_on_every_rank([both, flags(("x", a, 1.0), ("y", b, 1.0))] * 2)           # the same flags: nothing raised

@@ -41,6 +41,11 @@ class FakeComm:
         acc += g[1]
         return acc
 
+    def reduced(self, x):
+        """Keep the local gather layout; this stand-in has no NCCL reducer."""
+
+        return self.gather(x)
+
 
 def load_model(model_dir, n_layers, donors, rank=0, world=2):
     from tensorfold.families.deepseek_v41.config import Cfg
