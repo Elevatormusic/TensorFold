@@ -32,7 +32,6 @@ TILE_J = 16     # the kernels' rank tile, fixed: no other adapter's rank can cha
 PAD_J = 4       # tables hold ranks in multiples of this (a 16-byte row of the fp32 factors)
 FLOAT32_MAX = float(np.finfo(np.float32).max)
 
-_PREFIXES = ("base_model.model.model.", "base_model.model.", "model.")
 _KIND_NAMES = ((WO_B, re.compile(r"layers\.(\d+)\.attn\.wo_b")),
                (SHARED_W2, re.compile(r"layers\.(\d+)\.ffn\.shared_experts\.w2")))
 _LORA = re.compile(r"(?P<module>.+)\.lora_(?P<part>[AB])\.weight")
@@ -217,13 +216,6 @@ def read_tensor(path: str | Path | BinaryIO, entry: Mapping[str, Any], base: int
     return out.reshape(shape)
 
 
-def _canonical(key: str) -> str:
-    for prefix in _PREFIXES:
-        if key.startswith(prefix):
-            return key[len(prefix):]
-    return key
-
-
 def _classify(module: str) -> tuple[int, str]:
     for kind, rx in _KIND_NAMES:
         m = rx.fullmatch(module)
@@ -260,8 +252,7 @@ def _pattern(table: Any, module: str, what: str) -> Any:
 
     for key, value in _object(table, CONFIG, what).items():
         try:
-            if re.fullmatch(rf"(?:.*\.)?(?:{key})", module) or re.fullmatch(rf"(?:.*\.)?(?:{key})",
-                                                                            "base_model.model." + module):
+            if re.fullmatch(rf"(?:.*\.)?(?:{key})", module):
                 return value
         except re.error as exc:
             raise AdapterError(f"{CONFIG}: {what} key {key!r} is not a pattern ({exc})") from exc
@@ -354,19 +345,25 @@ def inspect_folder(folder: str | Path, dims: Dims, *, config_sha: str | None = N
         if m is None:
             raise AdapterError(f"{key}: not a LoRA A or B weight ({WEIGHTS} may hold only lora_A.weight and "
                                "lora_B.weight pairs; DoRA magnitudes, biases, embeddings and full weights are refused)")
-        module = _canonical(m["module"])
+        module = m["module"].removeprefix("base_model.model.")
         if m["part"] in pairs.setdefault(module, {}):
             raise AdapterError(f"{module}: two {m['part']} tensors")
         pairs[module][m["part"]] = key
     if not pairs:
         raise AdapterError(f"{weights}: no LoRA tensors")
     modules = []
+    targets: dict[tuple[int, str], str] = {}
     for module, ab in sorted(pairs.items()):
-        layer, kind = _classify(module)
+        layer, kind = _classify(module.removeprefix("model."))
         if layer >= dims.n_layers:
             raise AdapterError(f"{module}: layer {layer} of {dims.n_layers}")
         if set(ab) != {"A", "B"}:
             raise AdapterError(f"{module}: lora_{'B' if 'A' in ab else 'A'} is missing")
+        target = (layer, kind)
+        if target in targets:
+            raise AdapterError(f"{module}: duplicate normalized target {module_name(layer, kind)}: two A tensors "
+                               f"and two B tensors (also {targets[target]})")
+        targets[target] = module
         (a_in, b_out), (a_shape, b_shape) = dims.shape(kind), (header[ab["A"]]["shape"], header[ab["B"]]["shape"])
         if len(a_shape) != 2 or len(b_shape) != 2 or a_shape[1] != a_in or b_shape[0] != b_out or \
                 a_shape[0] != b_shape[1]:
