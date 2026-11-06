@@ -183,12 +183,15 @@ def test_a_rank_refuses_another_adapters_local_manifest_at_admission(mods, adapt
     with pytest.raises(RuntimeError, match="step link closed"):
         follower.follow(SimpleNamespace(receive=lambda: ops.pop(0)))
     (stream,) = follower.filling
-    assert stream.cached == 0 and stream.lineage is None and calls[0] == (0, 0 if chosen is None else 1)
+    assert stream.cached == 0 and stream.lineage is None
     assert not follower.spill.check(saved["name"], cut, adapter="" if chosen is None else KEY_A)
     before = follower.pool.tokens.clone()
     with pytest.raises(ValueError, match="adapter identity differs"):
         follower.spill.load(saved["name"], cut, stream.base, adapter="" if chosen is None else KEY_A)
     assert torch.equal(before, follower.pool.tokens)
+    while stream in follower.filling:
+        follower._fill(stream)
+    assert calls[0] == (0, 0 if chosen is None else 1)
 
 
 def test_a_stock_spilled_prompt_has_no_adapter_in_its_manifest_and_the_hashes_it_always_had(mods):
