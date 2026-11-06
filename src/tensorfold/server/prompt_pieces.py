@@ -1,6 +1,7 @@
 """Token ids of re-sent chat prompts: each piece between added tokens is encoded once, then reused.
 
 Use pieces only for a deterministic model whose pre-tokenizer does not depend on the original input position.
+Post-processing must preserve the token IDs of one input when special tokens are disabled.
 A chat client re-sends its whole conversation every turn; only new pieces need the tokenizer.
 """
 
@@ -12,6 +13,8 @@ import threading
 from array import array
 from collections import OrderedDict
 from typing import Any
+
+from .plain_text import _trie_pattern
 
 BUDGET = 1 << 21        # cache units: token IDs, text characters and 64 units per entry
 
@@ -55,6 +58,45 @@ def _deterministic_model(tok: Any) -> bool:
         return False
 
 
+def _id_preserving_post_processor(state: Any) -> bool:
+    """Allow only processors that keep single-input IDs when special tokens are disabled."""
+
+    if not isinstance(state, dict):
+        return False
+    kind = state.get("type")
+    if kind in ("BertProcessing", "RobertaProcessing", "ByteLevel"):
+        return True                                  # these can change offsets or type IDs, but not token IDs
+    if kind == "Sequence":
+        children = state.get("processors")
+        return isinstance(children, list) and all(_id_preserving_post_processor(child) for child in children)
+    if kind != "TemplateProcessing" or not isinstance(state.get("single"), list):
+        return False
+    sequences = 0
+    for piece in state["single"]:
+        if not isinstance(piece, dict) or len(piece) != 1:
+            return False
+        if "Sequence" in piece:
+            item = piece["Sequence"]
+            if not isinstance(item, dict) or item.get("id") != "A" or not isinstance(item.get("type_id"), int):
+                return False
+            sequences += 1
+        elif "SpecialToken" in piece:
+            item = piece["SpecialToken"]
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not isinstance(item.get("type_id"), int):
+                return False
+        else:
+            return False
+    return sequences == 1                            # special-token pieces are skipped with False; input pieces are not
+
+
+def _has_id_preserving_post_processor(tok: Any) -> bool:
+    try:
+        post = tok.post_processor
+        return post is None or _id_preserving_post_processor(json.loads(post.__getstate__()))
+    except Exception:  # noqa: BLE001  unknown processor metadata must keep whole-input encoding
+        return False
+
+
 class PromptPieces:
     """``ids(text)`` equals ``tok.encode(text, add_special_tokens=False).ids``."""
 
@@ -75,14 +117,15 @@ class PromptPieces:
             return None                              # these options apply to the whole input, not each piece
         if getattr(tok, "encode_special_tokens", False):        # special tokens are encoded as text, not split out
             return None
-        if not _deterministic_model(tok) or not _has_local_pre_tokenizer(tok):
+        if (not _deterministic_model(tok) or not _has_local_pre_tokenizer(tok)
+                or not _has_id_preserving_post_processor(tok)):
             return None
         first = [token for token in tok.get_added_tokens_decoder().values() if not token.normalized]
         # rstrip takes the spaces after a token into its match, and single_word skips a match inside a word
         if not first or any(token.rstrip or token.single_word for token in first):
             return None
         spellings = sorted({token.content for token in first if token.content}, key=len, reverse=True)
-        return cls(tok, re.compile("|".join(map(re.escape, spellings))), budget)     # the longest at the leftmost
+        return cls(tok, _trie_pattern(spellings), budget)           # the longest at the leftmost, with shared prefixes
 
     def ids(self, text: str) -> list[int]:
         pieces, at = [], 0
