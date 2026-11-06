@@ -48,7 +48,8 @@ PEFT's two files, and optionally a manifest:
   holds.
 
 Inspection reads the header and hash from one private temporary copy of the weight file. At load, each rank makes
-verified temporary copies and reads all factors from those copies. A source file change after inspection stops the load.
+verified temporary copies and reads all factors from those copies. Copied bytes must match the inspected hash, or the
+load stops. Later changes to the source path do not change the verified copy.
 Temporary storage must hold all configured adapter weight files during startup. The copy uses a bounded buffer and adds
 a read/write pass. The system can place temporary storage on disk or tmpfs; this is not a total RAM or page-cache bound.
 All copies close after a successful load or an error. A storage or read error stops the load.
