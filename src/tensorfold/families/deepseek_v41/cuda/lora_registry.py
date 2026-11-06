@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .lora_format import FORMAT, AdapterError, AdapterSpec, Dims, inspect_folder
+from .lora_format import FORMAT, AdapterError, AdapterSpec, Dims, effective_scale, inspect_folder
 
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}")
 
@@ -54,7 +54,7 @@ def adapter_key(spec: AdapterSpec, strength: float) -> str:
 
     h = hashlib.sha256(f"{FORMAT}\0{spec.sha256}\0".encode())
     for m in spec.modules:
-        h.update(f"{m.name} {m.rank} {float(m.scale * strength).hex()}\0".encode())
+        h.update(f"{m.name} {m.rank} {effective_scale(m.scale, strength, m.name).hex()}\0".encode())
     return h.hexdigest()[:32]
 
 
@@ -84,6 +84,16 @@ class AdapterRegistry:
         self._by_name = {e.name: e for e in self.entries}
         if len(self._by_name) != len(self.entries):
             raise ValueError("two adapters share a name")
+        self.validate_scales()
+
+    def validate_scales(self) -> None:
+        """Refuse invalid strengths and combined scales before rank agreement or runtime table allocation."""
+
+        for entry in self.entries:
+            if not math.isfinite(entry.strength) or entry.strength == 0.0:
+                raise AdapterError(f"adapter {entry.name!r}: strength must be a finite number other than 0")
+            for module in entry.spec.modules:
+                effective_scale(module.scale, entry.strength, module.name)
 
     @classmethod
     def load(cls, specs: Iterable[tuple[str, str, float]], cfg: Any, model_dir: str | Path,

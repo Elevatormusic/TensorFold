@@ -112,6 +112,27 @@ def test_names_and_strengths_that_cannot_be_served_are_refused(tmp_path, base):
     assert load(base, [("neg", a, -1.0)]).entry(1).strength == -1.0       # an inverted edit is a valid strength
 
 
+@pytest.mark.parametrize("alpha,strength", [(1e308, 1e308), (1e40, 1.0), (1e308, -1e308)])
+def test_effective_scale_overflow_is_refused_before_a_registry_can_be_used(tmp_path, base, alpha, strength):
+    folder = standard(tmp_path / "a", ranks=(1, 1), config={"lora_alpha": alpha})
+    with pytest.raises(lf.AdapterError, match="effective scale must fit finite float32"):
+        load(base, [("a", str(folder), strength)])
+
+
+@pytest.mark.parametrize("alpha,strength", [(lf.FLOAT32_MAX, 1.0), (lf.FLOAT32_MAX, -0.5), (1e308, 1e-308)])
+def test_high_finite_effective_scales_remain_valid(tmp_path, base, alpha, strength):
+    folder = standard(tmp_path / "a", ranks=(1, 1), config={"lora_alpha": alpha})
+    registry = load(base, [("a", str(folder), strength)])
+    assert registry.check(registry.ref("a")) and registry.words()
+
+
+def test_an_explicit_zero_module_alpha_is_valid_with_a_nonzero_strength(tmp_path, base):
+    folder = standard(tmp_path / "a", ranks=(1, 1), config={
+        "alpha_pattern": {r"layers\.1\.attn\.wo_b": 0, r"layers\.2\.ffn\.shared_experts\.w2": 0}})
+    entry = load(base, [("a", str(folder), 2.0)]).entry(1)
+    assert all(m.scale == 0.0 for m in entry.spec.modules)
+
+
 def test_a_stream_or_a_reference_gives_its_slot_and_key():
     ref = lr.AdapterRef(2, "ab" * 16)
     assert (lr.slot_of(ref), lr.key_of(ref)) == (2, "ab" * 16)

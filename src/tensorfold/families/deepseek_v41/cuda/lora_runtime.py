@@ -124,6 +124,7 @@ class LoraRuntime:
         ``room()``: GiB the host can still give, None if unknown; tables that would not leave the floor that remains
         are refused before they are allocated."""
 
+        registry.validate_scales()
         with ExitStack() as snapshots:
             sources = {e.slot: snapshots.enter_context(snapshot_weights(e.spec.weights, e.spec.sha256))[0]
                        for e in registry.entries}

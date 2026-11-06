@@ -2,6 +2,7 @@
 sum over slots, the shared expert's two input forms, and that a stock row keeps its bits."""
 
 from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -66,6 +67,36 @@ def test_changed_weights_are_refused_after_registry_inspection(tmp_path):
     standard(folder, seed=2)
     with pytest.raises(lf.AdapterError, match="changed after inspection"):
         load(registry)
+
+
+def test_an_invalid_registry_scale_stops_before_snapshots_or_table_allocation(registry, monkeypatch):
+    entry = registry.entries[0]
+    modules = tuple(replace(m, scale=1e308) for m in entry.spec.modules)
+    registry.entries = (replace(entry, strength=1e308, spec=replace(entry.spec, modules=modules)),)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("an invalid scale reached snapshot or table allocation")
+
+    monkeypatch.setattr(rt, "snapshot_weights", forbidden)
+    monkeypatch.setattr(Tables, "empty", forbidden)
+    with pytest.raises(lf.AdapterError, match="effective scale must fit finite float32"):
+        load(registry)
+
+
+@pytest.mark.parametrize("scale", [float("inf"), float("nan"), 1e40])
+def test_invalid_table_scales_cannot_publish_partial_factors(scale):
+    table = Tables.empty(2, 1, 128, 128, False, torch.bfloat16, "cpu")
+    with pytest.raises(lf.AdapterError, match="effective scale must fit finite float32"):
+        table.put(1, np.ones((1, 128), np.float32), np.ones((128, 1), np.float32), scale)
+    assert all(torch.count_nonzero(t).item() == 0 for t in (table.a, table.b, table.ranks, table.scales))
+
+
+@pytest.mark.parametrize("scale", [lf.FLOAT32_MAX, -lf.FLOAT32_MAX, 0.0])
+def test_finite_scale_boundaries_keep_zero_input_finite(scale):
+    table = Tables.empty(2, 1, 128, 128, False, torch.bfloat16, "cpu")
+    table.put(1, np.ones((1, 128), np.float32), np.ones((128, 1), np.float32), scale)
+    out = kernel(torch.zeros((1, 128)), torch.zeros((1, 128), dtype=torch.bfloat16), torch.ones(1, dtype=torch.int64), table)
+    assert torch.isfinite(table.scales).all() and torch.equal(out, torch.zeros_like(out))
 
 
 def test_loaded_factors_use_the_verified_snapshot_after_the_source_changes(registry, monkeypatch):

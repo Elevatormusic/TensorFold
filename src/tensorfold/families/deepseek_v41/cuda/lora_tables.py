@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .lora_format import PAD_J, TILE_J, padded_rank
+from .lora_format import PAD_J, TILE_J, effective_scale, padded_rank
 
 __all__ = ["PAD_J", "TILE_J", "Tables", "padded_rank"]
 
@@ -66,6 +66,7 @@ class Tables:
     def put(self, slot: int, a, b, scale: float) -> None:
         """Slot ``slot``'s factors: a [rank, K], b [D, rank] (numpy or torch float32), delta = scale * b @ (a @ x)."""
 
+        scale = effective_scale(scale, 1.0)
         a, b = torch.as_tensor(a, dtype=torch.float32), torch.as_tensor(b, dtype=torch.float32)
         rank = int(a.shape[0])
         if slot < 1 or slot >= self.slots or rank > self.R or tuple(a.shape) != (rank, self.K) \

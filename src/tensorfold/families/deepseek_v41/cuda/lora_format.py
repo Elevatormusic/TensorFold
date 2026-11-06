@@ -30,6 +30,7 @@ MAX_HEADER = 64 << 20
 DTYPES = {"F32": 4, "F16": 2, "BF16": 2}
 TILE_J = 16     # the kernels' rank tile, fixed: no other adapter's rank can change how a row's sums are grouped
 PAD_J = 4       # tables hold ranks in multiples of this (a 16-byte row of the fp32 factors)
+FLOAT32_MAX = float(np.finfo(np.float32).max)
 
 _PREFIXES = ("base_model.model.model.", "base_model.model.", "model.")
 _KIND_NAMES = ((WO_B, re.compile(r"layers\.(\d+)\.attn\.wo_b")),
@@ -111,6 +112,15 @@ def padded_rank(rank: int) -> int:
     """The rank a table holds for a largest rank of ``rank``."""
 
     return -(-max(int(rank), 1) // PAD_J) * PAD_J
+
+
+def effective_scale(scale: float, strength: float, where: str = "adapter") -> float:
+    """The combined scale must fit the finite float32 table before a registry or table can hold it."""
+
+    value = float(scale) * float(strength)
+    if not math.isfinite(value) or abs(value) > FLOAT32_MAX:
+        raise AdapterError(f"{where}: effective scale must fit finite float32")
+    return value
 
 
 def module_name(layer: int, kind: str) -> str:

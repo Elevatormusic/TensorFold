@@ -58,6 +58,22 @@ def test_strength_multiplies_the_scale_and_nothing_else():
     np.testing.assert_array_equal(p.b, q.b)
 
 
+@pytest.mark.parametrize("scale,strength", [(1e308, 1e308), (1e40, 1.0), (float("inf"), 1.0)])
+def test_placement_refuses_a_scale_that_cannot_fit_the_float32_table(scale, strength):
+    factors = make(lf.WO_B, 2)
+    factors = lf.Factors(factors.a, factors.b, scale)
+    with pytest.raises(lf.AdapterError, match="effective scale must fit finite float32"):
+        lp.place(lf.WO_B, factors, DIMS, 0, 2, strength=strength)
+
+
+@pytest.mark.parametrize("scale,strength", [(lf.FLOAT32_MAX, 1.0), (lf.FLOAT32_MAX, -0.5),
+                                          (1e308, 1e-308), (0.0, 2.0), (0.75, 0.0)])
+def test_placement_keeps_valid_large_negative_and_zero_effective_scales(scale, strength):
+    factors = make(lf.WO_B, 2)
+    factors = lf.Factors(factors.a, factors.b, scale)
+    assert lp.place(lf.WO_B, factors, DIMS, 0, 2, strength=strength).scale == scale * strength
+
+
 def rotated_hidden(act, suh):
     """What the expert kernels leave for the down projection: blockwise Hadamard of (act * suh), in fp16."""
 

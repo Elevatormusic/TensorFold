@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .lora_format import SHARED_W2, WO_B, Dims, Factors
+from .lora_format import SHARED_W2, WO_B, Dims, Factors, effective_scale
 
 HAD = 128                                 # the EXL3 rotation's block width
 
@@ -74,6 +74,7 @@ def place(kind: str, factors: Factors, dims: Dims, rank: int, world: int, streng
 
     if kind not in (WO_B, SHARED_W2):
         raise ValueError(f"no placement for {kind!r}")
+    scale = effective_scale(factors.scale, strength)
     width, out = dims.shape(kind)
     if factors.a.shape[1] != width or factors.b.shape[0] != out:
         raise ValueError(f"factors {factors.a.shape} / {factors.b.shape} do not fit a [{out}, {width}] matrix")
@@ -83,4 +84,4 @@ def place(kind: str, factors: Factors, dims: Dims, rank: int, world: int, streng
         if kind != SHARED_W2:
             raise ValueError("only the packed shared expert reads a rotated input")
         a = fold_rotated(a, suh)
-    return Placed(a, np.ascontiguousarray(factors.b), float(factors.scale) * float(strength), suh is not None)
+    return Placed(a, np.ascontiguousarray(factors.b), scale, suh is not None)
