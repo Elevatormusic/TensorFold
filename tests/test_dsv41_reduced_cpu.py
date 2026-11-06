@@ -188,7 +188,7 @@ def test_nccl_wrapper_rejects_bad_count_or_dtype_before_launch(receive):
 def test_startup_agrees_reducer_mode_before_warmup(monkeypatch, switches):
     source = ROOT / "src/tensorfold/families/deepseek_v41/cuda/engine.py"
     tree = ast.parse(source.read_text())
-    engine = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Engine")
+    engine = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DsEngine")
     init = next(node for node in engine.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
     packet = next(node for node in init.body if isinstance(node, ast.If)
                   and ast.unparse(node.test) == "nccl is not None")
