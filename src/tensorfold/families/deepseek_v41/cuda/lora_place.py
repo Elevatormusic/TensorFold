@@ -47,7 +47,11 @@ def fold_rotated(a: np.ndarray, suh: np.ndarray) -> np.ndarray:
     if not np.isfinite(suh).all() or not suh.all():
         raise ValueError("the expert's input scale vector holds zero or a value that is not finite")
     z = (a.astype(np.float64) / suh[None, :]).reshape(a.shape[0], -1, HAD) @ hadamard()
-    return z.reshape(a.shape).astype(np.float32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        folded = z.reshape(a.shape).astype(np.float32)
+    if not np.isfinite(folded).all():
+        raise ValueError("the folded adapter factors exceed the finite float32 range")
+    return folded
 
 
 @dataclass(frozen=True)

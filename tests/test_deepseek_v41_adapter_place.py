@@ -104,6 +104,14 @@ def test_folding_refuses_a_scale_vector_it_cannot_divide_by():
         lp.fold_rotated(np.ones((2, 100), dtype=np.float32), np.ones(100))
 
 
+def test_folding_refuses_finite_input_that_overflows_the_float32_table():
+    a = np.full((1, 128), np.finfo(np.float32).max / 4, dtype=np.float32)
+    suh = np.full(128, float.fromhex("0x1p-24"), dtype=np.float32)
+    assert np.isfinite(a).all() and np.isfinite(suh).all() and (suh != 0).all()
+    with pytest.raises(ValueError, match="finite float32 range"):
+        lp.fold_rotated(a, suh)
+
+
 def test_only_the_shared_expert_reads_a_rotated_input_and_the_factors_must_fit():
     f = make(lf.WO_B, 2)
     with pytest.raises(ValueError, match="only the packed shared expert"):

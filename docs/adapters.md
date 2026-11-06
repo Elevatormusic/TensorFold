@@ -47,8 +47,15 @@ PEFT's two files, and optionally a manifest:
   way. Without it the same checks run on what the files say; either way the normalized manifest is what the server
   holds.
 
+Inspection reads the header and hash from one private temporary copy of the weight file. At load, each rank makes
+verified temporary copies and reads all factors from those copies. A source file change after inspection stops the load.
+Temporary storage must hold all configured adapter weight files during startup. The copy uses a bounded buffer and adds
+a read/write pass. The system can place temporary storage on disk or tmpfs; this is not a total RAM or page-cache bound.
+All copies close after a successful load or an error. A storage or read error stops the load.
+
 At load, a rank component whose A row or B column is all zero is dropped (its product is exactly zero), and a module
-with nothing left is left out; a value that is not finite is refused.
+with nothing left is left out; a value that is not finite is refused. A packed factor that exceeds the finite float32
+range after rotation is refused too.
 
 `python3 tools/dsv41/adapter_check.py FOLDER MODEL_DIR --tp 2 --slots 2` runs the same checks offline, with no weights
 loaded: it prints the modules, the table memory a rank would hold, and exits 1 with the reason where the server would
