@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 tokenizers = pytest.importorskip("tokenizers")
-from tokenizers import AddedToken, Regex, Tokenizer, models, normalizers, pre_tokenizers, trainers
+from tokenizers import AddedToken, Regex, Tokenizer, models, normalizers, pre_tokenizers, processors, trainers
 
 from tensorfold.server.prompt_pieces import PromptPieces
 
@@ -48,6 +48,10 @@ class Counting:
     @property
     def model(self):
         return self.tok.model
+
+    @property
+    def post_processor(self):
+        return self.tok.post_processor
 
     def encode_batch(self, texts, add_special_tokens=False):
         self.encoded += texts
@@ -346,3 +350,77 @@ def test_unknown_model_metadata_keeps_the_normal_server_path(tmp_path, state):
     actual = app.prepare({"messages": messages, "max_tokens": 1}, True).prompt
     assert actual == full(app.tok, "<s>hello")
     assert app._prompt_pieces() is None
+
+
+def test_a_template_that_duplicates_input_cannot_use_pieces():
+    tok = tokenizer()
+    tok.post_processor = processors.TemplateProcessing(single="$A $A", special_tokens=[])
+    text = MARK + " a" + MARK + "b"
+    assert full(tok, text) != full(tok, MARK) + full(tok, " a" + MARK) + full(tok, "b")
+    assert PromptPieces.of(tok) is None
+
+
+def test_server_keeps_whole_input_ids_with_a_repeating_post_processor(tmp_path):
+    tok = tokenizer()
+    tok.add_tokens([AddedToken("<s>", normalized=False)])
+    tok.post_processor = processors.TemplateProcessing(single="$A $A", special_tokens=[])
+    app = server_for_tokenizer(tmp_path, tok)
+    messages = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+    expected = full(app.tok, app.template.render(messages, tools=None, enable_thinking=False))
+    assert app.prepare({"messages": messages, "max_tokens": 1}, True).prompt == expected
+    assert app._prompt_pieces() is None
+
+
+@pytest.mark.parametrize("kind", ["byte", "bert", "roberta", "template", "sequence"])
+def test_id_preserving_post_processors_keep_real_piece_reuse(kind):
+    tok = tokenizer()
+    choices = {
+        "byte": processors.ByteLevel(trim_offsets=True),
+        "bert": processors.BertProcessing(("[SEP]", 0), ("[CLS]", 1)),
+        "roberta": processors.RobertaProcessing(("[SEP]", 0), ("[CLS]", 1)),
+        "template": processors.TemplateProcessing(single="[CLS] $A:1 [SEP]",
+                                                  special_tokens=[("[CLS]", 1), ("[SEP]", 0)]),
+    }
+    choices["sequence"] = processors.Sequence([choices["byte"], choices["template"],
+                                               processors.Sequence([choices["bert"]])])
+    tok.post_processor = choices[kind]
+    counted = Counting(tok)
+    pieces = pieces_of(counted)
+    text = TURN + "a b" + END
+    assert pieces.ids(text) == full(tok, text) and counted.encoded
+    counted.encoded.clear()
+    assert pieces.ids(text) == full(tok, text)
+    assert counted.encoded == []
+
+
+class UnknownPostState:
+    def __init__(self, tok, state):
+        self.tok = tok
+        self.post_processor = UnknownPreTokenizer(state)
+
+    def __getattr__(self, name):
+        return getattr(self.tok, name)
+
+
+@pytest.mark.parametrize("state", [b"not json", b"[]", b'{}', b'{"type":"FutureProcessor"}',
+                                    b'{"type":"Sequence"}', b'{"type":"TemplateProcessing"}',
+                                    None, RuntimeError("unknown post-processor")])
+def test_unknown_post_processor_metadata_uses_whole_input(state):
+    assert PromptPieces.of(UnknownPostState(tokenizer(), state)) is None
+
+
+def test_reserved_token_prefixes_share_the_scan_pattern_and_keep_longest_matches():
+    spellings = [f"<|reserved_special_token_{index:03d}|>" for index in range(256)]
+    prefix = "<|reserved_special_token_000"
+    tok = tokenizer()
+    tok.add_tokens([AddedToken(value, normalized=False) for value in [*spellings, prefix]])
+    counted = Counting(tok)
+    pieces = pieces_of(counted)
+    # Bound repeated prefix work in the pattern, without a machine-speed threshold.
+    assert len(pieces._cut.pattern) < sum(map(len, spellings)) // 2
+    text = "<|reserved_special_token_missing|>" * 1000 + spellings[0] + "tail" + prefix
+    assert [match.group() for match in pieces._cut.finditer(text)] == [spellings[0], prefix]
+    assert pieces.ids(text) == full(tok, text)
+    counted.encoded.clear()
+    assert pieces.ids(text) == full(tok, text)
+    assert counted.encoded == []
