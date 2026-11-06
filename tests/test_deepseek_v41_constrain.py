@@ -126,6 +126,16 @@ def forward(sc, window, position, taps):                             # a model t
     return torch.zeros(len(window), WIDTH), (torch.zeros(len(window), 4) if taps else None)
 
 
+def loop_engine():
+    """One simulated rank with the real engine's token-emission method."""
+
+    this = engine.DsEngine.__new__(engine.DsEngine)
+    this.rank, this.world = 0, 1
+    this.runner = SimpleNamespace(forward=forward)
+    this._sample = first_allowed
+    return this
+
+
 def test_the_serial_loop_ends_at_the_grammars_stop_token_when_eos_is_off():
     c = constraint(Spec("choice", json.dumps(["yes", "no"])))
     head = torch.zeros(1, WIDTH)                                      # the first token, as ``_run`` makes it
@@ -133,7 +143,7 @@ def test_the_serial_loop_ends_at_the_grammars_stop_token_when_eos_is_off():
     first = first_allowed(head, [0], None)[0]
     constrain.advance(c, [first])
     sent = []
-    this = SimpleNamespace(runner=SimpleNamespace(forward=forward), _sample=first_allowed)
+    this = loop_engine()
     out = engine.DsEngine._serial(this, SimpleNamespace(length=7), first, 30, None, (), sent.extend, c)
     assert out == ids("y", "e", "s", "<eos>") and sent == out         # ignore_eos: eos is (), the grammar ends it
 
@@ -146,10 +156,10 @@ def test_the_speculative_loop_ends_at_the_grammars_stop_token_when_eos_is_off(mo
     first = first_allowed(head, [0], None)[0]
     constrain.advance(c, [first])
     proposed = ids("e", "s", "<eos>")                                 # the grammar cuts the stop token from the drafts
-    this = SimpleNamespace(
-        model=None, runner=SimpleNamespace(forward=forward), _sample=first_allowed, drafts=3,
-        drafter=SimpleNamespace(absorb=lambda dc, sc, taps, position: None),
-        _draft_graph=lambda sc, dc, tok, position: SimpleNamespace(run=lambda tok, position: (proposed, [0.0] * 3)))
+    this = loop_engine()
+    this.model, this.drafts = None, 3
+    this.drafter = SimpleNamespace(absorb=lambda dc, sc, taps, position: None)
+    this._draft_graph = lambda sc, dc, tok, position: SimpleNamespace(run=lambda tok, position: (proposed, [0.0] * 3))
     sent = []
     out, stats = engine.DsEngine._spec(this, SimpleNamespace(length=7), None, first, 30, None, (), sent.extend, c)
     assert out == ids("y", "e", "s", "<eos>") and sent == out

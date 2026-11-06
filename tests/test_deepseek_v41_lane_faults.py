@@ -93,6 +93,7 @@ def decoder(multi, sample):
     md.streams, md.filling, md.chunk_s, md.since_fill, md.next_id = {}, [], 0.0, 0.0, 0
     md.link, md.round_end, md.rounds, md.round_log = None, None, 0, []
     md.kept, md.next_kept, md.ticks, md.keep_stats, md.spill = {}, 0, 0, {}, None
+    md.slack0 = None
     md.runner, md.watch = Runner(), Watch()
     return md
 
