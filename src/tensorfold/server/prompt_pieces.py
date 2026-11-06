@@ -131,7 +131,11 @@ class PromptPieces:
         if not first or any(token.rstrip or token.single_word for token in first):
             return None
         spellings = sorted({token.content for token in first if token.content}, key=len, reverse=True)
-        return cls(tok, _trie_pattern(spellings), budget)           # the longest at the leftmost, with shared prefixes
+        try:
+            cut = _trie_pattern(spellings)
+        except RecursionError:                       # an extreme spelling must not break whole-input encoding
+            return None
+        return cls(tok, cut, budget)                  # the longest at the leftmost, with shared prefixes
 
     def ids(self, text: str) -> list[int]:
         pieces, at = [], 0

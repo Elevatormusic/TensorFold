@@ -425,3 +425,13 @@ def test_reserved_token_prefixes_share_the_scan_pattern_and_keep_longest_matches
     counted.encoded.clear()
     assert pieces.ids(text) == full(tok, text)
     assert counted.encoded == []
+
+
+def test_an_extreme_added_token_spelling_preserves_whole_input_encoding():
+    tok = tokenizer()
+    spelling = "<" + "x" * 2000 + ">"
+    tok.add_tokens([AddedToken(spelling, normalized=False)])
+    text = spelling + "a" + spelling + "b"
+    pieces = PromptPieces.of(tok)
+    actual = full(tok, text) if pieces is None else pieces.ids(text)
+    assert actual == full(tok, text)
