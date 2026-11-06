@@ -158,6 +158,39 @@ def test_spilled_prompts_are_read_back_by_their_own_adapter_only(mods):
     assert all(torch.equal(x, y) for x, y in zip(want, _rows(md.pool, s.base, k.top)))
 
 
+@pytest.mark.parametrize("adapter", [None, (1, KEY_A)])
+def test_a_rank_refuses_another_adapters_local_manifest_at_admission(mods, adapter):
+    multi, spill, root = mods
+    writer, _ = decoder(multi, spill, root / "follower")
+    prompt = _prompt(6000, 51)
+    serve(multi, writer, prompt, ref(multi, 2, KEY_B))
+    saved = next(iter(writer.kept.values())).disk
+    follower, calls = decoder(multi, spill, root / "follower", nonce="other-run")
+    cut = max(int(value) for value in saved["snaps"])
+    chosen = None if adapter is None else ref(multi, *adapter)
+    leader_writer, _ = decoder(multi, spill, root / "leader")
+    serve(multi, leader_writer, prompt, chosen)
+    own = next(iter(leader_writer.kept.values())).disk
+    assert own["name"] == saved["name"] and own.get("adapter", "") != saved["adapter"]
+    leader, _ = decoder(multi, spill, root / "leader", nonce="other-run")
+    sent = []
+    leader.link = SimpleNamespace(send=sent.append)
+    request = multi.Stream(prompt + [7, 8, 9], 1, None, draft=False, stop_eos=False, adapter=chosen)
+    request.emit = lambda new: None
+    leader.admit(request)
+    assert request.cached == cut
+    ops = [op for op in sent if op[0] == "admit"] + [None]
+    with pytest.raises(RuntimeError, match="step link closed"):
+        follower.follow(SimpleNamespace(receive=lambda: ops.pop(0)))
+    (stream,) = follower.filling
+    assert stream.cached == 0 and stream.lineage is None and calls[0] == (0, 0 if chosen is None else 1)
+    assert not follower.spill.check(saved["name"], cut, adapter="" if chosen is None else KEY_A)
+    before = follower.pool.tokens.clone()
+    with pytest.raises(ValueError, match="adapter identity differs"):
+        follower.spill.load(saved["name"], cut, stream.base, adapter="" if chosen is None else KEY_A)
+    assert torch.equal(before, follower.pool.tokens)
+
+
 def test_a_stock_spilled_prompt_has_no_adapter_in_its_manifest_and_the_hashes_it_always_had(mods):
     multi, spill, root = mods
     md, _ = decoder(multi, spill, root)

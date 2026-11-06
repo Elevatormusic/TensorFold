@@ -984,7 +984,9 @@ class MultiDecoder:
             self.ticks += 1
             need = self._need(s)
             disk = bool(reuse) and reuse[0] == "disk"
-            if disk and not self._all(self.spill is not None and self.spill.check(str(reuse[1]), int(reuse[2]))):
+            disk_adapter = {} if s.adapter is None else {"adapter": key_of(s)}
+            if disk and not self._all(self.spill is not None and
+                                      self.spill.check(str(reuse[1]), int(reuse[2]), **disk_adapter)):
                 if e.rank == 0:
                     print(f"[tensorfold] spilled prompt {reuse[1]}: not on every rank, the prompt fills fresh",
                           flush=True)
@@ -1006,7 +1008,7 @@ class MultiDecoder:
                 name, at, t0 = str(reuse[1]), int(reuse[2]), time.perf_counter()
                 try:
                     with memtrace.phase("spill-load"):
-                        snaps, host, lineage = self.spill.load(name, at, base)
+                        snaps, host, lineage = self.spill.load(name, at, base, **disk_adapter)
                     loaded = at in snaps
                 except Exception as exc:                 # noqa: BLE001  (every rank agrees on the outcome below)
                     print(f"[tensorfold] rank {e.rank}: spilled prompt {name} did not load ({type(exc).__name__}: "

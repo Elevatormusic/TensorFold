@@ -8,11 +8,12 @@ before the layer's existing cross-rank reduction: no collective is added, and a 
 from __future__ import annotations
 
 import time
+from contextlib import ExitStack
 from typing import Any, Callable
 
 import torch
 
-from .lora_format import SHARED_W2, WO_B, AdapterError, Dims, read_factors, read_header
+from .lora_format import SHARED_W2, WO_B, AdapterError, Dims, read_factors, read_header, snapshot_weights
 from .lora_place import place
 from .lora_registry import AdapterRegistry
 from .lora_tables import Tables
@@ -118,8 +119,20 @@ class LoraRuntime:
              log: Callable[[str], None] = print, kernel: Callable | None = None,
              room: Callable[[], float | None] | None = None) -> LoraRuntime:
         """Read each adapter's factors, place this rank's share and upload it, one (layer, module) at a time (no
-        second copy of an adapter in host memory). ``room()``: GiB the host can still give, None if unknown; tables
-        that would not leave the floor that remains are refused before they are allocated."""
+        complete adapter byte buffer). Private temporary files bind all loaded factors to the inspected hashes.
+        They require storage for all adapter files and one extra read/write pass; TMPDIR can be on tmpfs.
+        ``room()``: GiB the host can still give, None if unknown; tables that would not leave the floor that remains
+        are refused before they are allocated."""
+
+        with ExitStack() as snapshots:
+            sources = {e.slot: snapshots.enter_context(snapshot_weights(e.spec.weights, e.spec.sha256))[0]
+                       for e in registry.entries}
+            return cls._load_verified(registry, weights, rank, world, sources, device=device, log=log,
+                                      kernel=kernel, room=room)
+
+    @classmethod
+    def _load_verified(cls, registry, weights, rank, world, sources, *, device, log, kernel, room):
+        """Build tables from the private files whose copied bytes match the registry hashes."""
 
         t0 = time.perf_counter()
         dims = Dims.of(weights.cfg)
@@ -127,7 +140,7 @@ class LoraRuntime:
         for e in registry.entries:
             for m in e.spec.modules:
                 wanted.setdefault((m.layer, m.kind), []).append((e, m))
-        headers = {e.slot: read_header(e.spec.weights) for e in registry.entries}
+        headers = {e.slot: read_header(sources[e.slot]) for e in registry.entries}
         layers: dict[int, LayerTables] = {}
         total = dropped = 0
         for (layer, kind), items in sorted(wanted.items()):
@@ -136,7 +149,7 @@ class LoraRuntime:
             lay = weights.layers[layer]
             loaded = []
             for entry, module in items:
-                f = read_factors(entry.spec, module, headers[entry.slot])
+                f = read_factors(entry.spec, module, headers[entry.slot], source=sources[entry.slot])
                 if f is None:
                     dropped += 1
                 else:

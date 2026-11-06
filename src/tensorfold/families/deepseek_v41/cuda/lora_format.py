@@ -12,10 +12,12 @@ import json
 import math
 import os
 import re
+import tempfile
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, BinaryIO, Mapping
 
 import numpy as np
 
@@ -123,11 +125,33 @@ def sha256_file(path: str | Path) -> str:
     return h.hexdigest()
 
 
-def read_header(path: str | Path) -> tuple[dict[str, dict], int]:
+@contextmanager
+def snapshot_weights(path: str | Path, expected: str | None = None):
+    """Copy weights to a private temporary file and hash the copied bytes with a bounded buffer.
+
+    All reads use this file until the context closes. Temporary storage must hold the full file; the
+    system can place it on disk or tmpfs. A copy, storage or identity failure stops the load.
+    """
+
+    with tempfile.TemporaryFile() as saved:
+        h = hashlib.sha256()
+        with open(path, "rb") as source:
+            for block in iter(lambda: source.read(1 << 20), b""):
+                saved.write(block)
+                h.update(block)
+        sha = h.hexdigest()
+        if expected is not None and sha != expected:
+            raise AdapterError(f"{path}: weights changed after inspection (hash {sha}, expected {expected})")
+        saved.seek(0)
+        yield saved, sha
+
+
+def read_header(path: str | Path | BinaryIO) -> tuple[dict[str, dict], int]:
     """(tensor entries, data start) of a safetensors file; every offset checked against the file's size."""
 
-    size = os.path.getsize(path)
-    with open(path, "rb") as f:
+    with open(path, "rb") if isinstance(path, (str, Path)) else nullcontext(path) as f:
+        size = os.fstat(f.fileno()).st_size
+        f.seek(0)
         raw = f.read(8)
         n = int.from_bytes(raw, "little") if len(raw) == 8 else 0
         if not 2 <= n <= MAX_HEADER or 8 + n > size:
@@ -158,11 +182,13 @@ def read_header(path: str | Path) -> tuple[dict[str, dict], int]:
     return header, 8 + n
 
 
-def read_tensor(path: str | Path, entry: Mapping[str, Any], base: int) -> np.ndarray:
+def read_tensor(path: str | Path | BinaryIO, entry: Mapping[str, Any], base: int) -> np.ndarray:
     """One tensor as float32 (BF16 and F16 widen exactly), read without the rest of the file."""
 
     lo, hi = entry["data_offsets"]
-    raw = np.fromfile(path, dtype=np.uint8, count=hi - lo, offset=base + lo)
+    with open(path, "rb") if isinstance(path, (str, Path)) else nullcontext(path) as f:
+        f.seek(base + lo)
+        raw = np.fromfile(f, dtype=np.uint8, count=hi - lo)
     if raw.size != hi - lo:
         raise AdapterError(f"{path}: short read")
     shape = [int(v) for v in entry["shape"]]
@@ -304,7 +330,8 @@ def inspect_folder(folder: str | Path, dims: Dims, *, config_sha: str | None = N
     if not weights.is_file():
         raise AdapterError(f"{folder}: {WEIGHTS} is missing")
     manifest = _declared(folder)
-    header, _ = read_header(weights)
+    with snapshot_weights(weights) as (saved, sha):
+        header, _ = read_header(saved)
     pairs: dict[str, dict[str, str]] = {}
     for key in header:
         m = _LORA.fullmatch(key)
@@ -342,20 +369,22 @@ def inspect_folder(folder: str | Path, dims: Dims, *, config_sha: str | None = N
         scale = alpha / math.sqrt(rank) if cfg.get("use_rslora") else alpha / rank
         modules.append(ModuleSpec(layer, kind, rank, alpha, scale, ab["A"], ab["B"]))
     modules.sort(key=lambda m: (m.layer, m.kind))
-    sha = sha256_file(weights)
     spec = tuple(modules)
     _check_manifest(manifest, folder, sha, spec, dims, config_sha)
     return AdapterSpec(str(folder), str(weights), sha, spec, MappingProxyType(manifest))
 
 
-def read_factors(spec: AdapterSpec, module: ModuleSpec, parsed: tuple[dict, int] | None = None) -> Factors | None:
+def read_factors(spec: AdapterSpec, module: ModuleSpec, parsed: tuple[dict, int] | None = None,
+                 *, source: BinaryIO | None = None) -> Factors | None:
     """The module's factors in float32, all-zero components dropped (their product is exactly zero); None when
     nothing is left. A value that is not finite is refused: it would reach every reply. ``parsed``: read_header's
-    result for the weights file, when the caller reads several modules."""
+    result for the weights file, when the caller reads several modules. ``source`` is a verified private snapshot
+    when the caller must bind loaded factors to the adapter identity."""
 
-    header, base = parsed or read_header(spec.weights)
-    a = read_tensor(spec.weights, header[module.a_name], base)
-    b = read_tensor(spec.weights, header[module.b_name], base)
+    weights = spec.weights if source is None else source
+    header, base = parsed or read_header(weights)
+    a = read_tensor(weights, header[module.a_name], base)
+    b = read_tensor(weights, header[module.b_name], base)
     if not (np.isfinite(a).all() and np.isfinite(b).all()):
         raise AdapterError(f"{module.name}: factors hold NaN or infinity")
     live = np.flatnonzero(a.any(axis=1) & b.any(axis=0))

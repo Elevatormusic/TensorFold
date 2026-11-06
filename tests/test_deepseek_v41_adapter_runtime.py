@@ -59,6 +59,105 @@ def file_factors(registry, slot, name):
     return lf.read_factors(e.spec, m)
 
 
+def test_changed_weights_are_refused_after_registry_inspection(tmp_path):
+    base = model_dir(tmp_path / "model")
+    folder = standard(tmp_path / "adapter", seed=1)
+    registry = lr.AdapterRegistry.load([("a", str(folder), 1.0)], CFG, base)
+    standard(folder, seed=2)
+    with pytest.raises(lf.AdapterError, match="changed after inspection"):
+        load(registry)
+
+
+def test_loaded_factors_use_the_verified_snapshot_after_the_source_changes(registry, monkeypatch):
+    expected = load(registry)
+    original = rt.read_header
+
+    def replace_original(source):
+        for entry in registry.entries:
+            with open(entry.spec.weights, "wb") as f:
+                f.write(b"replaced after the snapshots were verified")
+        return original(source)
+
+    monkeypatch.setattr(rt, "read_header", replace_original)
+    actual = load(registry)
+    for layer in expected.layers:
+        for name in ("wo_b", "shared"):
+            a, b = getattr(actual.layers[layer], name), getattr(expected.layers[layer], name)
+            if b is not None:
+                assert torch.equal(a.a, b.a) and torch.equal(a.b, b.b)
+                assert torch.equal(a.ranks, b.ranks) and torch.equal(a.scales, b.scales)
+
+
+def test_all_snapshots_close_when_a_later_adapter_has_changed(registry, monkeypatch):
+    original, opened = lf.tempfile.TemporaryFile, []
+
+    def tracked():
+        saved = original()
+        opened.append(saved)
+        return saved
+
+    monkeypatch.setattr(lf.tempfile, "TemporaryFile", tracked)
+    with open(registry.entries[-1].spec.weights, "wb") as f:
+        f.write(b"changed")
+    with pytest.raises(lf.AdapterError, match="changed after inspection"):
+        load(registry)
+    assert len(opened) == 2 and all(f.closed for f in opened)
+
+
+def test_a_source_change_between_copy_chunks_fails_identity_and_closes_the_snapshot(registry, monkeypatch):
+    entry = registry.entries[0]
+    original_open, original_temp = open, lf.tempfile.TemporaryFile
+    opened = []
+
+    class ChangingSource:
+        def __enter__(self):
+            self.source = original_open(entry.spec.weights, "rb", buffering=0)
+            self.first = True
+            return self
+
+        def __exit__(self, *exc):
+            self.source.close()
+
+        def read(self, n):
+            raw = self.source.read(min(n, 32))
+            if self.first:
+                self.first = False
+                with original_open(entry.spec.weights, "r+b") as writer:
+                    writer.seek(32)
+                    writer.write(b"changed")
+            return raw
+
+    def tracked():
+        saved = original_temp()
+        opened.append(saved)
+        return saved
+
+    monkeypatch.setattr(lf, "open", lambda *a: ChangingSource(), raising=False)
+    monkeypatch.setattr(lf.tempfile, "TemporaryFile", tracked)
+    with pytest.raises(lf.AdapterError, match="changed after inspection"):
+        with lf.snapshot_weights(entry.spec.weights, entry.spec.sha256):
+            pytest.fail("a changed snapshot must not be exposed")
+    assert opened and all(f.closed for f in opened)
+
+
+def test_snapshots_close_when_reading_a_factor_fails(registry, monkeypatch):
+    original, opened = lf.tempfile.TemporaryFile, []
+
+    def tracked():
+        saved = original()
+        opened.append(saved)
+        return saved
+
+    def failed(*args, **kwargs):
+        raise OSError("factor read failed")
+
+    monkeypatch.setattr(lf.tempfile, "TemporaryFile", tracked)
+    monkeypatch.setattr(lf, "read_tensor", failed)
+    with pytest.raises(OSError, match="factor read failed"):
+        load(registry)
+    assert len(opened) == 2 and all(f.closed for f in opened)
+
+
 def test_tables_hold_ranks_in_fours_and_the_kernels_tile_is_one_constant():
     assert [padded_rank(r) for r in (0, 1, 2, 3, 4, 5, 16, 17, 33, 256)] == [4, 4, 4, 4, 4, 8, 16, 20, 36, 256]
     assert TILE_J == 16 and Tables.empty(2, 3, 128, 128, False, torch.float16, "cpu").tile_j == TILE_J

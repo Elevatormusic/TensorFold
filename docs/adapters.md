@@ -67,7 +67,9 @@ The shared expert is usually packed with the routed experts, and its down projec
 after the expert kernels have scaled it by the matrix's input vector and rotated it (a 128-wide Hadamard). At load, A is
 rewritten once to read that form (`A' = H (A / suh)`, float64 arithmetic, stored float32), so no hidden state is
 rebuilt at run time. The delta of a packed shared expert is therefore computed from the fp16 value the expert kernels
-store (relative error at most 2^-11 per element); a shared expert outside the pack reads its bf16 hidden state as is.
+store; a shared expert outside the pack reads its bf16 hidden state as is. The fp16 conversion has no uniform relative
+error bound near zero, and values outside its finite range can overflow. The reference and hardware checks must use
+the actual stored input and test the resulting delta; they must not assume that it equals a delta from unrounded input.
 
 On start every rank gathers a digest of the base config and each adapter's slot, name and identity key, and refuses to
 serve if they differ. Slots follow the order of the `--adapter` flags, so every rank needs the same flags in the same

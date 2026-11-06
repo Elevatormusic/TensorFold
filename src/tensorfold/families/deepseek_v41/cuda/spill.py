@@ -445,11 +445,11 @@ class Spill:
                     best = (name, b, t)
         return None if best is None else (best[0], best[1])
 
-    def check(self, name: str, cut: int) -> bool:
-        """Whether this rank holds manifest ``name`` with a snapshot at ``cut`` and every row before it."""
+    def check(self, name: str, cut: int, *, adapter: str = "") -> bool:
+        """Whether this rank holds this adapter's manifest, a snapshot at ``cut`` and every row before it."""
 
         m = self.manifests.get(name)
-        if m is None or str(int(cut)) not in m["snaps"]:
+        if m is None or str(m.get("adapter", "")) != adapter or str(int(cut)) not in m["snaps"]:
             return False
         end = 0
         for seg in m["segments"]:
@@ -471,13 +471,15 @@ class Spill:
                 return (ring, raw, f.get_tensor("draft").to(device, copy=True) if "draft" in names else None)
             return (ring, raw)
 
-    def load(self, name: str, cut: int, base: int, device=None) -> tuple[dict, np.ndarray, dict]:
+    def load(self, name: str, cut: int, base: int, device=None, *, adapter: str = "") -> tuple[dict, np.ndarray, dict]:
         """Manifest ``name``'s rows before ``cut`` into pool positions [base, base + cut), segment by segment; returns
         its snapshots to ``cut`` (on ``device``), its host ids to ``cut`` and the lineage a stream continuing it keeps."""
 
         from safetensors import safe_open
 
         m, cut, base, device = self.manifests[name], int(cut), int(base), device or self.device
+        if str(m.get("adapter", "")) != adapter:
+            raise ValueError(f"spilled prompt {name}: adapter identity differs")
         host = []
         for seg in m["segments"]:
             lo, hi, p0 = seg["from"], min(seg["to"], cut), seg["p0"]
