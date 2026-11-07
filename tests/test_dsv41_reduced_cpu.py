@@ -205,10 +205,15 @@ def test_startup_agrees_reducer_mode_before_warmup(monkeypatch, switches):
         tensor=lambda values, **kwargs: torch.tensor(values, dtype=kwargs["dtype"]),
         empty=lambda shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"]))
     link, errors, warmed = Link(), [], []
+    gathered = [False, False]
 
     class Flags(Rank):
         def barrier(self):
             self.link.barrier.wait()
+
+        def all_gather(self, send, recv):
+            super().all_gather(send, recv)
+            gathered[self.rank] = True
 
     def start(rank):
         namespace = {"__package__": "tensorfold.families.deepseek_v41.cuda", "torch": cpu_torch,
@@ -220,7 +225,9 @@ def test_startup_agrees_reducer_mode_before_warmup(monkeypatch, switches):
             warmed.append(rank)
         except BaseException as error:
             errors.append(error)
-            link.barrier.abort()
+            if not (gathered[rank] and switches[0] != switches[1]
+                    and isinstance(error, ValueError) and "TF_DS_RS" in str(error)):
+                link.barrier.abort()
 
     threads = [threading.Thread(target=start, args=(rank,), daemon=True) for rank in range(2)]
     for thread in threads:
