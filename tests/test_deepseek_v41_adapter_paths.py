@@ -115,7 +115,7 @@ def test_single_numeric_alias_and_distinct_writer_targets_remain_valid(tmp_path)
 def test_a_collapsed_optional_manifest_cannot_hide_a_duplicate_writer(tmp_path, kind):
     folder = write_adapter(tmp_path / "a", {"layers.1." + kind: pair(kind), "layers.01." + kind: pair(kind)}, prefix="")
     (folder / lf.MANIFEST).write_text(json.dumps({"format": lf.FORMAT,
-        "weights_sha256": lf.sha256_file(folder / lf.WEIGHTS),
+        "files": {lf.WEIGHTS: {"sha256": lf.sha256_file(folder / lf.WEIGHTS)}},
         "modules": {"layers.1." + kind: {"rank": 1, "alpha": 1, "scale": 1}}}))
     with pytest.raises(lf.AdapterError, match="duplicate normalized target"):
         lf.inspect_folder(folder, DIMS)
