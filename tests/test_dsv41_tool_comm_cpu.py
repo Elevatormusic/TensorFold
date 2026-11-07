@@ -77,7 +77,7 @@ def test_actual_prefill_dispatch_accepts_tool_communicators(tool_comm, monkeypat
     layer = SimpleNamespace(hc_attn=(None, None, None), hc_ffn=(None, None, None), attn_norm=None,
                             ffn_norm=None, comp_wkv=None, idx_wq_b=None)
     cfg = SimpleNamespace(dim=8, hc=1, eps=1e-6, hc_eps=1e-6, hc_iters=1)
-    model = SimpleNamespace(cfg=cfg, w=SimpleNamespace(layers=[layer], norm=None, head=None), comm=comm,
+    model = SimpleNamespace(cfg=cfg, w=SimpleNamespace(layers=[layer], norm=None, head=None), comm=comm, lora=None,
                             attention_k=lambda *args, **kwargs: partials[0], moe=lambda *args, **kwargs: partials[1])
     cache = SimpleNamespace(length=0)
     output = namespace["_forward_k"](model, cache, torch.arange(4), 0, True, None,

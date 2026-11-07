@@ -35,6 +35,9 @@ class DsApp(App):
             raise ValueError("TF_DS_VISION_TEMPLATE must be placeholder or native")
         self.native_image_template = image_template == "native"
         super().__init__(*args, **kwargs)
+        registry = getattr(self.engine, "adapters", None)
+        if registry is not None:                        # --adapter: each adapter is a model id of its own
+            self.adapter_models = registry.model_map()
         # --vision-max-images: images take DsVision.split's path, not the shared image limits, so its own count
         # check gets the server's value (DsVision's default is 8)
         vision, images = getattr(self.engine, "vision", None), kwargs.get("vision_max_images")

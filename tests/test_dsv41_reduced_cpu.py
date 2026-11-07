@@ -196,6 +196,8 @@ def test_startup_agrees_reducer_mode_before_warmup(monkeypatch, switches):
     assert init.body.index(packet) < init.body.index(warm)
     wrapper = ast.parse("def agree(self, nccl, parallel, world):\n    pass\n")
     wrapper.body[0].body = [packet]
+    compare = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                   and node.name == "_same_on_every_rank")
     markov = ModuleType("tensorfold.families.deepseek_v41.cuda.markov")
     markov.ON, markov.SPLIT = True, True
     monkeypatch.setitem(sys.modules, markov.__name__, markov)
@@ -218,7 +220,8 @@ def test_startup_agrees_reducer_mode_before_warmup(monkeypatch, switches):
                      "RS": switches[rank]}
         try:
             exec(compile(wrapper, str(source), "exec"), namespace)
-            namespace["agree"](SimpleNamespace(vcfg=None), Flags(link, rank), 4, 2)
+            exec(compile(ast.Module(body=[compare], type_ignores=[]), str(source), "exec"), namespace)
+            namespace["agree"](SimpleNamespace(vcfg=None, adapters=None), Flags(link, rank), 4, 2)
             warmed.append(rank)
         except BaseException as error:
             errors.append(error)

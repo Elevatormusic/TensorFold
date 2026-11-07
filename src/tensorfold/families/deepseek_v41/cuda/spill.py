@@ -151,6 +151,7 @@ def _write_all(fd: int, data: memoryview) -> None:
 
 
 _NAME = re.compile(r"[0-9A-Za-z_-]{1,64}")
+_ADAPTER = re.compile(r"[0-9a-f]{0,64}")           # an adapter's identity key; '' is the stock model
 _FILE = re.compile(r"(seg|snap)-[0-9A-Za-z_-]{1,64}-\d{1,9}\.st")
 
 
@@ -195,7 +196,8 @@ def _valid(m: dict) -> bool:
     """A manifest names only files of this directory's own shapes (a tampered one could name a path elsewhere)."""
 
     files = [seg.get("file", "") for seg in m.get("segments", [])] + [r.get("file", "") for r in m["snaps"].values()]
-    return bool(_NAME.fullmatch(str(m.get("name", "")))) and all(_FILE.fullmatch(str(f)) for f in files)
+    return (bool(_NAME.fullmatch(str(m.get("name", "")))) and all(_FILE.fullmatch(str(f)) for f in files)
+            and _ADAPTER.fullmatch(str(m.get("adapter", ""))) is not None)
 
 
 def engine_id(model_dir, *, world: int, pool, dpool=None) -> str:
@@ -343,11 +345,21 @@ class Spill:
         self._save(fname, tensors, {"n": len(snap), "engine": self.engine})
 
     @staticmethod
-    def _hashes(keys, boundaries) -> dict:
+    def _seed(adapter: str = ""):
+        """A prefix hash's start: empty for the stock model, so its hashes are what they always were; an adapter's
+        identity key first, so no prefix of one adapter can equal a prefix of another."""
+
+        h = hashlib.sha256()
+        if adapter:
+            h.update(b"adapter\0" + adapter.encode() + b"\0")
+        return h
+
+    @classmethod
+    def _hashes(cls, keys, boundaries, adapter: str = "") -> dict:
         """Each boundary's prefix hash: sha256 of the prompt's ids (int64, image spans keyed by picture) to it."""
 
         k64 = np.ascontiguousarray(keys, dtype=np.int64)
-        h, prev, out = hashlib.sha256(), 0, {}
+        h, prev, out = cls._seed(adapter), 0, {}
         for b in sorted(int(x) for x in boundaries):
             if b > len(k64):
                 break
@@ -357,11 +369,12 @@ class Spill:
         return out
 
     def persist(self, name: str, *, base: int, top: int, replay: bool, snaps: dict, host, lineage: dict | None,
-                keys=None) -> dict | None:
+                keys=None, adapter: str = "") -> dict | None:
         """Write a kept prompt at pool positions [base, base + top): the rows past what ``lineage`` (the kept or
         spilled prompt it continued, to where it continued) already holds on this disk, the snapshots not already
         there, then its manifest. Returns the manifest, None when the prompt is too short or a write failed (the
-        prompt stays in the window either way)."""
+        prompt stays in the window either way). ``adapter``: the identity key of the adapter that made the rows
+        ('' for the stock model); the manifest names it, and only a prompt of the same adapter reads it back."""
 
         top = int(top)
         if top < self.min_top or not snaps:
@@ -387,8 +400,10 @@ class Spill:
                 wrote += self._path(fname).stat().st_size
             m = {"format": FORMAT, "engine": self.engine, "name": name, "top": top, "replay": bool(replay),
                  "segments": segs, "snaps": refs, "created": time.time()}
+            if adapter:
+                m["adapter"] = str(adapter)
             if keys is not None:
-                m["hashes"] = self._hashes(keys, [int(b) for b in refs])
+                m["hashes"] = self._hashes(keys, [int(b) for b in refs], adapter)
             self._write_json(self._entry(name), m)
             self.manifests[name] = m
             self._index_add(m)
@@ -434,10 +449,11 @@ class Spill:
             if ref is not None:
                 self.index.setdefault(hx, []).append((m["name"], int(b), bool(ref["full"])))
 
-    def best(self, keys, plen: int, *, window: int, replay: bool, above: int = 0) -> tuple[str, int] | None:
+    def best(self, keys, plen: int, *, window: int, replay: bool, above: int = 0,
+             adapter: str = "") -> tuple[str, int] | None:
         """Rank 0: (manifest, boundary) of the furthest spilled boundary this prompt shares, past ``above``: a
         boundary snapshot below the prompt's last row (with replay prefill, a window below), a full one anywhere below
-        its last row; the most recently used of equals."""
+        its last row; the most recently used of equals. Only manifests of the same ``adapter`` key count."""
 
         if not self.index:
             return None
@@ -447,7 +463,7 @@ class Spill:
         if not cands:
             return None
         k64 = np.ascontiguousarray(keys, dtype=np.int64)
-        h, prev, best = hashlib.sha256(), 0, None
+        h, prev, best = self._seed(adapter), 0, None
         for b in cands:
             if b > len(k64):
                 break
@@ -457,16 +473,18 @@ class Spill:
                 m = self.manifests.get(name)
                 if bb != b or m is None or bool(m.get("replay")) != bool(replay) or b > (lim_f if full else lim_b):
                     continue
+                if str(m.get("adapter", "")) != adapter:        # (the hashes are seeded by it too: belt and braces)
+                    continue
                 t = self._mtime(name)
                 if best is None or (b, t) > (best[1], best[2]):
                     best = (name, b, t)
         return None if best is None else (best[0], best[1])
 
-    def check(self, name: str, cut: int) -> bool:
-        """Whether this rank holds manifest ``name`` with a snapshot at ``cut`` and every row before it."""
+    def check(self, name: str, cut: int, *, adapter: str = "") -> bool:
+        """Whether this rank holds this adapter's manifest, a snapshot at ``cut`` and every row before it."""
 
         m = self.manifests.get(name)
-        if m is None or str(int(cut)) not in m["snaps"]:
+        if m is None or str(m.get("adapter", "")) != adapter or str(int(cut)) not in m["snaps"]:
             return False
         end = 0
         for seg in m["segments"]:
@@ -486,11 +504,13 @@ class Spill:
                 return (ring, raw, f.get_tensor("draft").to(device, copy=True) if "draft" in names else None)
             return (ring, raw)
 
-    def load(self, name: str, cut: int, base: int, device=None) -> tuple[dict, np.ndarray, dict]:
+    def load(self, name: str, cut: int, base: int, device=None, *, adapter: str = "") -> tuple[dict, np.ndarray, dict]:
         """Manifest ``name``'s rows before ``cut`` into pool positions [base, base + cut), segment by segment; returns
         its snapshots to ``cut`` (on ``device``), its host ids to ``cut`` and the lineage a stream continuing it keeps."""
 
         m, cut, base, device = self.manifests[name], int(cut), int(base), device or self.device
+        if str(m.get("adapter", "")) != adapter:
+            raise ValueError(f"spilled prompt {name}: adapter identity differs")
         host = []
         for seg in m["segments"]:
             lo, hi, p0 = seg["from"], min(seg["to"], cut), seg["p0"]
