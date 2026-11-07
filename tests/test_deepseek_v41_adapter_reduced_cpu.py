@@ -34,10 +34,15 @@ def test_nine_startup_words_agree_before_real_warm_call(monkeypatch, enabled, wo
     markov.ON, markov.SPLIT = True, False
     monkeypatch.setitem(sys.modules, markov.__name__, markov)
     link, errors, warmed, buffers = Link(), [], [], [[], []]
+    completed = [False, False]
 
     class Flags(Rank):
         def barrier(self):
             self.link.barrier.wait()
+
+        def all_gather(self, send, receive):
+            super().all_gather(send, receive)
+            completed[self.rank] = True
 
     def start(rank):
         held = list(words or (0, 0, 0, 0))
@@ -60,7 +65,11 @@ def test_nine_startup_words_agree_before_real_warm_call(monkeypatch, enabled, wo
                                Flags(link, rank), 4, 2)
         except BaseException as error:
             errors.append(error)
-            link.barrier.abort()
+            expected_refusal = (difference is not None and completed[rank] and isinstance(error, ValueError)
+                                and "TF_DS_RS" in str(error)
+                                and "--adapter files, names, strengths and order" in str(error))
+            if not expected_refusal:
+                link.barrier.abort()
 
     threads = [threading.Thread(target=start, args=(rank,), daemon=True) for rank in range(2)]
     for thread in threads:
